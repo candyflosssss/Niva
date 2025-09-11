@@ -1,0 +1,37 @@
+# Unreal Engine - Plugins folder .gitignore
+# Keep content files (uasset, uplugin, etc.) while ignoring build artifacts and temp files
+
+# Build, intermediate and generated
+Binaries/
+Build/
+Intermediate/
+Saved/
+DerivedDataCache/
+
+# Visual Studio / IDE
+.vs/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# CodeMap (if present)
+.codemap/
+
+# Logs and temp
+*.log
+
+# Unreal/thirdparty
+*.opensdf
+*.sdf
+
+# Offline models or large prebuilt libraries (optional)
+OfflineModel/
+
+# End of .gitignore

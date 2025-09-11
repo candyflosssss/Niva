@@ -1,0 +1,31 @@
+{
+	"FileVersion": 3,
+	"Version": 5,
+	"VersionName": "4.0",
+	"FriendlyName": "SocketHelper",
+	"Description": "Handle socket TCP client-server and UDP peer network communications",
+	"Category": "Networking",
+	"CreatedBy": "RLoris",
+	"CreatedByURL": "https://rloris.github.io/",
+	"DocsURL": "https://github.com/RLoris/SocketHelperDoc/blob/master/README.md",
+	"MarketplaceURL": "com.epicgames.launcher://ue/marketplace/product/a10b185845ee42daa3a76c0c5a9b2ad8",
+	"SupportURL": "https://forms.gle/CpekZfTewGZrUVen7",
+	"EngineVersion": "5.5.0",
+	"CanContainContent": true,
+	"Installed": true,
+	"Modules": [
+		{
+			"Name": "SocketHelper",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64",
+				"Mac",
+				"IOS",
+				"Android",
+				"Linux",
+				"TVOS"
+			]
+		}
+	]
+}

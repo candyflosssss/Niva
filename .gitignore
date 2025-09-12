@@ -34,20 +34,15 @@ Thumbs.db
 # Offline models or large prebuilt libraries (optional)
 OfflineModel/
 
-# Unreal large content (excluded in slim branch)
-ArtContent/Content/Characters/
-ArtContent/Content/Maps/
-ArtContent/Content/Material/
-ArtContent/Content/Mesh/
-ArtContent/Content/OtherContent/
-ArtContent/Content/Anim_*/
+# Exclude entire ArtContent directory from Git (assets managed outside or via packages)
+ArtContent/
+
+# Typical Unreal build/temp directories (keep ignoring)
 */Saved/
 */Intermediate/
 */DerivedDataCache/
 */Binaries/
 
-# Ignore all uasset/umap by default in slim code-only branch (comment out if you need to version specific ones)
-*.uasset
-*.umap
+# (We now allow tracking of .uasset/.umap again when outside ArtContent)
 
 # End of .gitignore

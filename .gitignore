@@ -34,8 +34,8 @@ Thumbs.db
 # Offline models or large prebuilt libraries (optional)
 OfflineModel/
 
-# Exclude entire ArtContent directory from Git (assets managed outside or via packages)
-ArtContent/
+## (Re-enabled) Track ArtContent directory
+# (Be aware: pushing large binary assets may fail without Git LFS quota.)
 
 # Typical Unreal build/temp directories (keep ignoring)
 */Saved/

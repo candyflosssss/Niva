@@ -45,6 +45,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Audio", meta=(ClampMin="0", ClampMax="20"))
 	int32 FadeMs = 3; // 2~5ms 足够抹掉“呲啦”；关闭时忽略
 
+	// 可配置：压缩阈值（字节）。到达阈值且未读数据较少时进行内存压缩
+	UFUNCTION(BlueprintCallable, Category="Audio")
+	void SetCompactThreshold(int32 InBytes) { CompactThreshold = FMath::Max(4096, InBytes); }
+
+	UFUNCTION(BlueprintPure, Category="Audio")
+	int32 GetCompactThreshold() const { return CompactThreshold; }
+
 private:
 	std::atomic<int64> ConsumedBytes{0};
 	std::atomic<bool> bInGenerate{false};

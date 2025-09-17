@@ -1,9 +1,10 @@
 ﻿#include "AudioStreamHttpWsComponent.h"
 #include "AudioStreamHttpWsSubsystem.h"
+#include "AudioStreamSettings.h"
 
 #include "Engine/GameInstance.h"
 #include "GameFramework/Actor.h"
-#include "StreamProcSoundWave.h" // 改为包含自定义派生类
+#include "StreamProcSoundWave.h"
 #include "Components/AudioComponent.h"
 #include "TimerManager.h"
 #include "Async/Async.h"
@@ -11,24 +12,53 @@
 
 UAudioStreamHttpWsComponent::UAudioStreamHttpWsComponent()
 {
-    PrimaryComponentTick.bCanEverTick = true; // 启用Tick用于按播放进度出队
+    PrimaryComponentTick.bCanEverTick = true;
     PrimaryComponentTick.bStartWithTickEnabled = true;
+
+    if (const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>())
+    {
+        this->DefaultSampleRate = S->DefaultSampleRate;
+        this->DefaultChannels = S->DefaultChannels;
+        this->bPopVisemeByAudioProgress = S->bPopVisemeByAudioProgress;
+        this->bAutoPopViseme = S->bAutoPopViseme;
+        this->VisemeStepMs = (float)S->VisemeStepMs;
+        this->WarmupMs = S->WarmupMs;
+        this->bPadSilenceOnUnderflow = S->bPadSilenceOnUnderflow;
+        this->UnderflowLowWaterSteps = S->UnderflowLowWaterSteps;
+        this->UnderflowPadSteps = S->UnderflowPadSteps;
+        this->NeutralVisemeIndex = S->NeutralVisemeIndex;
+        this->bDebugLogs = S->bComponentDebugLogsDefault;
+        this->VisemeFloatCount = S->VisemeFloatCount;
+        this->FormatSwitchLowWaterMs = S->FormatSwitchLowWaterMs;
+    }
+
     SampleRate = DefaultSampleRate;
     NumChannels = DefaultChannels;
-    // 固定长度为15
-    VisemeFloat14.Init(0.f, 15);
+    VisemeFloat14.Init(0.f, FMath::Clamp(VisemeFloatCount, 1, 64));
     UpdateTimingParams();
 }
 
 void UAudioStreamHttpWsComponent::BeginPlay()
 {
     Super::BeginPlay();
+
     SampleRate = DefaultSampleRate;
     NumChannels = DefaultChannels;
     UpdateTimingParams();
+
+    if (UWorld* W = GetWorld())
+    {
+        if (UGameInstance* GI = W->GetGameInstance())
+        {
+            if (UAudioStreamHttpWsSubsystem* Subsys = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>())
+            {
+                Subsys->AutoRegisterClient();
+            }
+        }
+    }
+
     RegisterToSubsystem();
 
-    // Start the viseme auto-pop timer if enabled
     if (bAutoPopViseme)
     {
         StartVisemeAutoPop();
@@ -64,49 +94,36 @@ void UAudioStreamHttpWsComponent::StopStreaming()
 
 void UAudioStreamHttpWsComponent::PushPcmData(const TArray<uint8>& Data, int32 InSampleRate, int32 InChannels)
 {
-    // 若收到与现有不同的格式，根据策略决定挂起或立即切换
     const bool bIncomingHasFormat = (InSampleRate > 0 && InChannels > 0);
     const bool bFormatDiffers = bIncomingHasFormat && (InSampleRate != SampleRate || InChannels != NumChannels);
-    
+
     if (bFormatDiffers)
     {
-        // 若已开播或缓冲高于格式切换低水位，则挂起新格式并延迟切换
         const float BufMs = GetBufferedMilliseconds();
         if (bPlayStarted || BufMs > FormatSwitchLowWaterMs)
         {
             bHasPendingFormatChange = true;
             PendingSampleRate = InSampleRate;
             PendingChannels = InChannels;
-            // 直接累加挂起字节，实际对齐在切换时执行
             PendingPcmBuffer.Append(Data);
             UE_LOG(LogTemp, Log, TEXT("[AudioStream] Pending format SR=%d CH=%d, queued %d bytes (buffer=%.1fms)"), InSampleRate, InChannels, PendingPcmBuffer.Num(), BufMs);
             return;
         }
-        // 否则允许立即切换
     }
-    
+
     bool bParamsChanged = false;
-    if (bIncomingHasFormat && InSampleRate != SampleRate)
-    {
-        SampleRate = InSampleRate;
-        bParamsChanged = true;
-    }
-    if (bIncomingHasFormat && InChannels != NumChannels)
-    {
-        NumChannels = InChannels;
-        bParamsChanged = true;
-    }
-    
+    if (bIncomingHasFormat && InSampleRate != SampleRate) { SampleRate = InSampleRate; bParamsChanged = true; }
+    if (bIncomingHasFormat && InChannels   != NumChannels) { NumChannels = InChannels;   bParamsChanged = true; }
+
     EnsureAudioObjects();
-    
+
     if (ProcSound && bParamsChanged)
     {
         ProcSound->SetParams(SampleRate, NumChannels);
         UpdateTimingParams();
-        // 采样参数变化，重置消费估计以避免跳变
         LastConsumedBytes = 0;
         AccumConsumedForVisemeBytes = 0;
-        TotalQueuedBytes = 0; // 重新累计，避免估计偏差
+        TotalQueuedBytes = 0;
         ConsumedBaseBytes = 0;
         LastRawConsumedBytes = 0;
         LastSmoothedConsumedBytes = 0;
@@ -114,13 +131,12 @@ void UAudioStreamHttpWsComponent::PushPcmData(const TArray<uint8>& Data, int32 I
         LastConsumeProgressTimeSec = 0.0;
         ProcSound->ResetCounters();
     }
-    
-    // 计算当前BytesPerSec（用于统计毫秒）
-    const int64 StatBytesPerSec = (int64)FMath::Max(1, SampleRate) * (int64)FMath::Max(1, NumChannels) * 2; // S16LE
+
+    const int64 StatBytesPerSec = (int64)FMath::Max(1, SampleRate) * (int64)FMath::Max(1, NumChannels) * 2;
 
     if (ProcSound && Data.Num() > 0)
     {
-        const int32 FrameBytes = FMath::Max(1, NumChannels) * 2; // S16LE 每样本2字节
+        const int32 FrameBytes = FMath::Max(1, NumChannels) * 2;
         int32 AlignedBytes = Data.Num() - (Data.Num() % FrameBytes);
         if (AlignedBytes <= 0)
         {
@@ -132,36 +148,27 @@ void UAudioStreamHttpWsComponent::PushPcmData(const TArray<uint8>& Data, int32 I
             {
                 UE_LOG(LogTemp, Verbose, TEXT("[AudioStream] Trim PCM %d->%d to align frames"), Data.Num(), AlignedBytes);
             }
-            // 将要入队的数据拷入临时数组并投递到音频线程，避免与渲染线程锁竞争
             TArray<uint8> Bytes; Bytes.Append(Data.GetData(), AlignedBytes);
             QueueAudioOnAudioThread(MoveTemp(Bytes));
             UE_LOG(LogTemp, Verbose, TEXT("[AudioStream] Queued PCM bytes=%d (ch=%d sr=%d)"), AlignedBytes, NumChannels, SampleRate);
             TotalQueuedBytes += (int64)AlignedBytes;
-            // 统计：接收音频毫秒（不含补零）
             TotalAudioMsReceived += (double)AlignedBytes * 1000.0 / (double)StatBytesPerSec;
         }
     }
 
-    // 仅当累计达到预热阈值才开始播放，降低起始噪音
     if (AudioComp && !AudioComp->IsPlaying())
     {
         if (TotalQueuedBytes >= WarmupBytes)
         {
             AudioComp->Play();
             bPlayStarted = true;
-            // 若启用了定时出队，开始播放后就停用定时器，避免与按进度出队冲突
-            if (bAutoPopViseme && GetWorld())
-            {
-                GetWorld()->GetTimerManager().ClearTimer(VisemePopTimer);
-            }
-            // 初始化合成消费基线
+            if (bAutoPopViseme && GetWorld()) { GetWorld()->GetTimerManager().ClearTimer(VisemePopTimer); }
             LastSmoothedConsumedBytes = GetSmoothedConsumedBytes();
             SynthConsumedBytes = LastSmoothedConsumedBytes;
             LastConsumeProgressTimeSec = FPlatformTime::Seconds();
         }
         else
         {
-            // 未开播保持中性嘴型
             SetNeutralVisemeFloat();
         }
     }
@@ -176,6 +183,13 @@ void UAudioStreamHttpWsComponent::EnsureAudioObjects()
         ProcSound->bProcedural = true;
         ProcSound->SetParams(SampleRate, NumChannels);
         ProcSound->SoundGroup = SOUNDGROUP_Voice;
+
+        if (const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>())
+        {
+            ProcSound->bEnableUnderRunFade = S->bEnableUnderRunFadeDefault;
+            ProcSound->FadeMs = S->FadeMsDefault;
+            ProcSound->SetCompactThreshold(S->ProcCompactThresholdBytes);
+        }
     }
 
     if (!AudioComp)
@@ -211,20 +225,11 @@ void UAudioStreamHttpWsComponent::ResetAudio()
 
 void UAudioStreamHttpWsComponent::RegisterToSubsystem()
 {
-    if (bRegistered)
-    {
-        return;
-    }
+    if (bRegistered) return;
     UGameInstance* GI = GetWorld() ? GetWorld()->GetGameInstance() : nullptr;
-    if (!GI)
-    {
-        return;
-    }
+    if (!GI) return;
     UAudioStreamHttpWsSubsystem* Subsys = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>();
-    if (!Subsys)
-    {
-        return;
-    }
+    if (!Subsys) return;
 
     FString OutKey;
     if (Subsys->RegisterComponent(this, OutKey, PreferredKey))
@@ -237,20 +242,11 @@ void UAudioStreamHttpWsComponent::RegisterToSubsystem()
 
 void UAudioStreamHttpWsComponent::UnregisterFromSubsystem()
 {
-    if (!bRegistered)
-    {
-        return;
-    }
+    if (!bRegistered) return;
     UGameInstance* GI = GetWorld() ? GetWorld()->GetGameInstance() : nullptr;
-    if (!GI)
-    {
-        return;
-    }
+    if (!GI) return;
     UAudioStreamHttpWsSubsystem* Subsys = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>();
-    if (!Subsys)
-    {
-        return;
-    }
+    if (!Subsys) return;
 
     Subsys->UnregisterComponent(this);
     bRegistered = false;
@@ -266,7 +262,6 @@ void UAudioStreamHttpWsComponent::PushText(const FString& InText)
 
 void UAudioStreamHttpWsComponent::PushVisemeConfidence(const TArray<float>& InConfidence)
 {
-    // 兼容旧流程：仅缓存；真正入队请使用 PushVisemeEx
     LastVisemeConfidence = InConfidence;
 }
 
@@ -274,7 +269,6 @@ void UAudioStreamHttpWsComponent::PushViseme(const TArray<int32>& InViseme)
 {
     if (InViseme.Num() <= 0) return;
 
-    // 兼容：原有仅索引的接口。将索引入旧历史用于外部调试；同时将 (idx, weight) 入配对队列
     VisemeHistory.Append(InViseme);
 
     int32 CountAdded = 0;
@@ -282,15 +276,11 @@ void UAudioStreamHttpWsComponent::PushViseme(const TArray<int32>& InViseme)
     {
         const int32 idx = FMath::Clamp(InViseme[i], 0, 14);
         float Weight = 1.0f;
-        if (LastVisemeConfidence.IsValidIndex(idx))
-        {
-            Weight = FMath::Clamp(LastVisemeConfidence[idx], 0.0f, 1.0f);
-        }
+        if (LastVisemeConfidence.IsValidIndex(idx)) { Weight = FMath::Clamp(LastVisemeConfidence[idx], 0.0f, 1.0f); }
         VisemePairQueue.Add(TPair<int32, float>(idx, Weight));
         ++CountAdded;
     }
 
-    // 统计：接收的viseme步数
     TotalVisemeStepsReceived += CountAdded;
     UpdateVisemeFloatFromHead();
 
@@ -307,18 +297,13 @@ void UAudioStreamHttpWsComponent::PushViseme(const TArray<int32>& InViseme)
 void UAudioStreamHttpWsComponent::PushVisemeEx(const TArray<int32>& InViseme, const TArray<float>& InConfidence)
 {
     const int32 N = InViseme.Num();
-    if (N <= 0)
-    {
-        return;
-    }
+    if (N <= 0) return;
 
-    // 对外保留旧历史索引
     VisemeHistory.Append(InViseme);
 
     int32 Pushed = 0;
     if (InConfidence.Num() == N)
     {
-        // 情况A：逐步权重一一对应
         for (int32 i = 0; i < N; ++i)
         {
             const int32 idx = FMath::Clamp(InViseme[i], 0, 14);
@@ -329,7 +314,6 @@ void UAudioStreamHttpWsComponent::PushVisemeEx(const TArray<int32>& InViseme, co
     }
     else if (InConfidence.Num() == VisemeFloatCount)
     {
-        // 情况B：confidence 为按标签的权重表（长度=15），每步取对应索引权重
         for (int32 i = 0; i < N; ++i)
         {
             const int32 idx = FMath::Clamp(InViseme[i], 0, VisemeFloatCount - 1);
@@ -340,7 +324,6 @@ void UAudioStreamHttpWsComponent::PushVisemeEx(const TArray<int32>& InViseme, co
     }
     else
     {
-        // 情况C：无权重或长度不匹配，回退为1.0
         for (int32 i = 0; i < N; ++i)
         {
             const int32 idx = FMath::Clamp(InViseme[i], 0, 14);
@@ -375,31 +358,19 @@ void UAudioStreamHttpWsComponent::StopVisemeAutoPop()
 
 void UAudioStreamHttpWsComponent::VisemePopTick()
 {
-    // 若已开始播放，改由按音频进度出队，这里不处理
-    if (bPlayStarted)
-    {
-        return;
-    }
-    if (VisemeHistory.Num() > 0)
-    {
-        VisemeHistory.RemoveAt(0);
-    }
-    if (VisemePairQueue.Num() > 0)
-    {
-        VisemePairQueue.RemoveAt(0);
-    }
+    if (bPlayStarted) return;
+    if (VisemeHistory.Num() > 0) { VisemeHistory.RemoveAt(0); }
+    if (VisemePairQueue.Num() > 0) { VisemePairQueue.RemoveAt(0); }
     UpdateVisemeFloatFromHead();
 }
 
 void UAudioStreamHttpWsComponent::UpdateVisemeFloatFromHead()
 {
-    // 固定长度为15
-    const int32 Count = 15;
+    const int32 Count = FMath::Clamp(VisemeFloatCount, 1, 64);
     if (VisemeFloat14.Num() != Count) VisemeFloat14.Init(0.f, Count);
-    
-    // 清零所有位
+
     for (int32 i = 0; i < VisemeFloat14.Num(); ++i) VisemeFloat14[i] = 0.f;
-    
+
     if (!bPlayStarted || VisemePairQueue.Num() == 0)
     {
         SetNeutralVisemeFloat();
@@ -409,13 +380,12 @@ void UAudioStreamHttpWsComponent::UpdateVisemeFloatFromHead()
         }
         return;
     }
-    
-    // 读取配对队首 (idx, weight)
-    const int32 MaxIndex = Count - 1; // 0..14
+
+    const int32 MaxIndex = Count - 1;
     const int32 idx = FMath::Clamp(VisemePairQueue[0].Key, 0, MaxIndex);
     const float Weight = FMath::Clamp(VisemePairQueue[0].Value, 0.0f, 1.0f);
     VisemeFloat14[idx] = Weight;
-    
+
     if (bDebugLogs)
     {
         UE_LOG(LogTemp, Verbose, TEXT("[AudioStream][%s] Viseme active: idx=%d weight=%.3f (pairQ=%d)"), *RegisteredKey, idx, Weight, VisemePairQueue.Num());
@@ -424,20 +394,19 @@ void UAudioStreamHttpWsComponent::UpdateVisemeFloatFromHead()
 
 void UAudioStreamHttpWsComponent::SetNeutralVisemeFloat()
 {
-    // 固定长度为15
-    const int32 Count = 15;
+    const int32 Count = FMath::Clamp(VisemeFloatCount, 1, 64);
     if (VisemeFloat14.Num() != Count) VisemeFloat14.Init(0.f, Count);
     for (int32 i = 0; i < VisemeFloat14.Num(); ++i) VisemeFloat14[i] = 0.f;
-    const int32 MaxIndex = Count - 1; // 0..14
+    const int32 MaxIndex = Count - 1;
     const int32 idx = FMath::Clamp(NeutralVisemeIndex, 0, MaxIndex);
     VisemeFloat14[idx] = 1.f;
 }
 
 void UAudioStreamHttpWsComponent::UpdateTimingParams()
 {
-    const int64 BytesPerSec = (int64)FMath::Max(1, SampleRate) * (int64)FMath::Max(1, NumChannels) * 2; // S16
+    const int64 BytesPerSec = (int64)FMath::Max(1, SampleRate) * (int64)FMath::Max(1, NumChannels) * 2;
     BytesPerStep = (int32)FMath::Max<int64>(1, (int64)((double)BytesPerSec * (VisemeStepMs / 1000.0)));
-    WarmupBytes   = (int64)FMath::Max<int64>(0,   (int64)((double)BytesPerSec * (WarmupMs   / 1000.0)));
+    WarmupBytes  = (int64)FMath::Max<int64>(0,  (int64)((double)BytesPerSec * (WarmupMs   / 1000.0)));
     UE_LOG(LogTemp, Log, TEXT("[AudioStream] Timing updated SR=%d Ch=%d -> BytesPerStep=%d WarmupBytes=%lld (stepMs=%.2f, warmMs=%.2f)"), SampleRate, NumChannels, BytesPerStep, (long long)WarmupBytes, VisemeStepMs, WarmupMs);
 }
 
@@ -450,12 +419,10 @@ float UAudioStreamHttpWsComponent::GetBufferedMilliseconds()
     return (float)Ms;
 }
 
-// 平滑累计：将渲染层读取到的原始 ConsumedBytes 聚合成单调不减的总量
 int64 UAudioStreamHttpWsComponent::GetSmoothedConsumedBytes()
 {
     if (!ProcSound) return 0;
     const int64 Raw = ProcSound->GetConsumedBytes();
-    // 若原始值较上次变小，认为底层做了复位：把上次的原始累计并入基线
     if (Raw < LastRawConsumedBytes)
     {
         ConsumedBaseBytes += LastRawConsumedBytes;
@@ -468,17 +435,11 @@ void UAudioStreamHttpWsComponent::TickComponent(float DeltaTime, enum ELevelTick
 {
     Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
-    if (!ProcSound)
-    {
-        // 打印中性或空状态日志（可选）
-        return;
-    }
+    if (!ProcSound) return;
 
-    // 读取平滑后的已消费字节
     const int64 Smoothed = GetSmoothedConsumedBytes();
     const double NowSec = FPlatformTime::Seconds();
 
-    // 若真实进度前进，刷新基线与时间戳；否则用 DeltaTime 合成推进
     if (Smoothed > LastSmoothedConsumedBytes)
     {
         SynthConsumedBytes = Smoothed;
@@ -486,18 +447,16 @@ void UAudioStreamHttpWsComponent::TickComponent(float DeltaTime, enum ELevelTick
     }
     else if (bPlayStarted)
     {
-        const int64 BytesPerSec = (int64)FMath::Max(1, SampleRate) * (int64)FMath::Max(1, NumChannels) * 2; // S16
+        const int64 BytesPerSec = (int64)FMath::Max(1, SampleRate) * (int64)FMath::Max(1, NumChannels) * 2;
         const int64 Add = (int64)((double)BytesPerSec * FMath::Max(0.f, DeltaTime));
-        const int64 MaxAllowed = TotalQueuedBytes; // 不超过已入队
+        const int64 MaxAllowed = TotalQueuedBytes;
         SynthConsumedBytes = FMath::Min<int64>(SynthConsumedBytes + Add, MaxAllowed);
     }
     LastSmoothedConsumedBytes = Smoothed;
 
-    // 估算消费采用 max(真实平滑, 合成)
     int64 EstimatedConsumed = FMath::Max<int64>(Smoothed, SynthConsumedBytes);
     EstimatedConsumed = FMath::Min<int64>(EstimatedConsumed, TotalQueuedBytes);
 
-    // 缓冲状态调试（每2秒打印一次）
     if (bDebugLogs)
     {
         const double CurrentTime = NowSec;
@@ -512,7 +471,6 @@ void UAudioStreamHttpWsComponent::TickComponent(float DeltaTime, enum ELevelTick
         }
     }
 
-    // 按音频消费出队
     if (bPopVisemeByAudioProgress && BytesPerStep > 0)
     {
         int64 Delta = EstimatedConsumed - LastConsumedBytes;
@@ -534,27 +492,17 @@ void UAudioStreamHttpWsComponent::TickComponent(float DeltaTime, enum ELevelTick
         LastConsumedBytes = EstimatedConsumed;
     }
 
-    // 若存在待切换的新格式，且缓冲低于低水位或尚未开播，则执行切换
     if (bHasPendingFormatChange)
     {
         const float BufMs = GetBufferedMilliseconds();
         if (!bPlayStarted || BufMs <= FormatSwitchLowWaterMs)
         {
-            // 停止播放，切新参数，接管挂起缓冲
-            if (AudioComp && AudioComp->IsPlaying())
-            {
-                AudioComp->Stop();
-            }
-            if (ProcSound)
-            {
-                ProcSound->ResetCounters();
-                ProcSound->SetParams(PendingSampleRate, PendingChannels);
-            }
+            if (AudioComp && AudioComp->IsPlaying()) { AudioComp->Stop(); }
+            if (ProcSound) { ProcSound->ResetCounters(); ProcSound->SetParams(PendingSampleRate, PendingChannels); }
             SampleRate = PendingSampleRate;
             NumChannels = PendingChannels;
             UpdateTimingParams();
 
-            // 清空统计与已入队字节，重新以新格式累计
             TotalQueuedBytes = 0;
             LastConsumedBytes = 0;
             AccumConsumedForVisemeBytes = 0;
@@ -564,7 +512,6 @@ void UAudioStreamHttpWsComponent::TickComponent(float DeltaTime, enum ELevelTick
             SynthConsumedBytes = 0;
             LastConsumeProgressTimeSec = 0.0;
 
-            // 对齐并入队挂起的PCM
             if (PendingPcmBuffer.Num() > 0)
             {
                 const int32 FrameBytes = FMath::Max(1, NumChannels) * 2;
@@ -574,14 +521,12 @@ void UAudioStreamHttpWsComponent::TickComponent(float DeltaTime, enum ELevelTick
                     TArray<uint8> Bytes; Bytes.Append(PendingPcmBuffer.GetData(), AlignedBytes);
                     QueueAudioOnAudioThread(MoveTemp(Bytes));
                     TotalQueuedBytes += (int64)AlignedBytes;
-                    // 统计：将挂起PCM视为接收音频
                     const int64 StatBytesPerSec = (int64)FMath::Max(1, SampleRate) * (int64)FMath::Max(1, NumChannels) * 2;
                     TotalAudioMsReceived += (double)AlignedBytes * 1000.0 / (double)StatBytesPerSec;
                 }
                 PendingPcmBuffer.Reset();
             }
 
-            // 重新判断播放/预热
             if (AudioComp)
             {
                 if (TotalQueuedBytes >= WarmupBytes)
@@ -607,7 +552,6 @@ void UAudioStreamHttpWsComponent::TickComponent(float DeltaTime, enum ELevelTick
         }
     }
 
-    // 欠载保护：���缓冲过低，自动补零静音，避免 under-run 爆音
     if (bPadSilenceOnUnderflow && BytesPerStep > 0)
     {
         const int64 InBuffer = FMath::Max<int64>(0, TotalQueuedBytes - EstimatedConsumed);
@@ -616,38 +560,33 @@ void UAudioStreamHttpWsComponent::TickComponent(float DeltaTime, enum ELevelTick
         if (InBuffer < LowWaterBytes)
         {
             int64 PadBytes = (int64)UnderflowPadSteps * (int64)BytesPerStep;
-            // 对齐到样本帧，至少补一帧
             PadBytes -= (PadBytes % FrameBytes);
             if (PadBytes < FrameBytes) PadBytes = FrameBytes;
             TArray<uint8> Zeros; Zeros.AddZeroed((int32)PadBytes);
             QueueAudioOnAudioThread(MoveTemp(Zeros));
             TotalQueuedBytes += PadBytes;
-            // 为保持A/V步数一致，补充等量中性viseme
+
             if (UnderflowPadSteps > 0)
             {
-                // 固定索引范围为 0..14
                 TArray<int32> NeutralBatch; NeutralBatch.Init(FMath::Clamp(NeutralVisemeIndex, 0, 14), UnderflowPadSteps);
                 VisemeHistory.Append(NeutralBatch);
                 for (int32 i = 0; i < UnderflowPadSteps; ++i)
                 {
                     VisemePairQueue.Add(TPair<int32, float>(FMath::Clamp(NeutralVisemeIndex, 0, 14), 1.0f));
                 }
-                // 统计：补零与补viseme步数
                 const int64 StatBytesPerSec = (int64)FMath::Max(1, SampleRate) * (int64)FMath::Max(1, NumChannels) * 2;
                 TotalAudioMsPadded += (double)PadBytes * 1000.0 / (double)StatBytesPerSec;
                 TotalVisemeStepsPadded += UnderflowPadSteps;
-                // 清空置信度缓存（兼容旧流程）
                 LastVisemeConfidence.Reset();
                 if (!bPlayStarted) { SetNeutralVisemeFloat(); }
             }
+
             if (bDebugLogs)
             {
                 UE_LOG(LogTemp, Warning, TEXT("[AudioStream][%s] Underflow pad %lld bytes (buffer=%lld, step=%d, lowSteps=%d, padSteps=%d)"), *RegisteredKey, (long long)PadBytes, (long long)InBuffer, BytesPerStep, UnderflowLowWaterSteps, UnderflowPadSteps);
             }
         }
     }
-
-    // Viseme pop is handled by auto timer or audio progress
 }
 
 void UAudioStreamHttpWsComponent::ResetAudioVisemeStats()
@@ -684,7 +623,7 @@ bool UAudioStreamHttpWsComponent::IsDurationConsistent(bool bUseTotal, float Tol
     const int32 Steps = bUseTotal ? (TotalVisemeStepsReceived + TotalVisemeStepsPadded) : TotalVisemeStepsReceived;
     const double VisemeMs = (double)Steps * StepMs;
     const double AudioMs  = bUseTotal ? (TotalAudioMsReceived + TotalAudioMsPadded) : TotalAudioMsReceived;
-    const double Delta = VisemeMs - AudioMs; // >0 表示viseme更长
+    const double Delta = VisemeMs - AudioMs;
     OutDeltaMs = (float)Delta;
     return FMath::Abs(Delta) <= (double)ToleranceMs;
 }
@@ -692,12 +631,8 @@ bool UAudioStreamHttpWsComponent::IsDurationConsistent(bool bUseTotal, float Tol
 void UAudioStreamHttpWsComponent::QueueAudioOnAudioThread(TArray<uint8>&& Bytes)
 {
     UStreamProcSoundWave* LocalProc = ProcSound;
-    if (!LocalProc || Bytes.Num() == 0)
-    {
-        return;
-    }
-    
-    // 投递到音频线程执行，避免与渲染回调在不同线程上竞争自管队列的锁
+    if (!LocalProc || Bytes.Num() == 0) return;
+
     TArray<uint8> LocalData = MoveTemp(Bytes);
     FAudioThread::RunCommandOnAudioThread([PS=LocalProc, Data=MoveTemp(LocalData)]() mutable
     {

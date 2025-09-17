@@ -4,6 +4,7 @@
 #include "UUDPHandler.h"
 #include "SocketSubsystem.h"
 #include "IPAddress.h"
+#include "AudioStreamSettings.h"
 
 
 
@@ -42,6 +43,24 @@ bool UUDPHandler::StartUDPReceiver(int32 Port)
         return false;
     }
 
+    // 微调：允许端口复用、增大接收缓冲区，提升抗抖动能力
+    {
+        ListenSocket->SetReuseAddr(true);
+        int32 DesiredSize = 4 * 1024 * 1024; // 4MB default
+        if (const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>())
+        {
+            DesiredSize = FMath::Max(65536, S->UdpRecvBufferBytes);
+        }
+        int32 AppliedSize = 0;
+        if (!ListenSocket->SetReceiveBufferSize(DesiredSize, AppliedSize))
+        {
+            UE_LOG(LogTemp, Warning, TEXT("SetReceiveBufferSize failed, requested=%d applied=%d"), DesiredSize, AppliedSize);
+        }
+        else
+        {
+            UE_LOG(LogTemp, Log, TEXT("UDP recv buffer set to %d bytes (requested=%d)"), AppliedSize, DesiredSize);
+        }
+    }
     
     // 绑定端口
     FIPv4Address Addr = FIPv4Address::Any;
@@ -57,7 +76,7 @@ bool UUDPHandler::StartUDPReceiver(int32 Port)
     }
 
     // 创建UDP接收器（降低Wait时间，提升Stop响应）
-    UDPReceiver = new FUdpSocketReceiver(ListenSocket, FTimespan::FromMilliseconds(100), TEXT("UDP_Receiver"));
+    UDPReceiver = new FUdpSocketReceiver(ListenSocket, FTimespan::FromMilliseconds(3), TEXT("UDP_Receiver"));
     UDPReceiver->OnDataReceived().BindUObject(this, &UUDPHandler::OnUDPMessageReceived);
     UDPReceiver->Start();
 
@@ -108,41 +127,39 @@ void UUDPHandler::OnUDPMessageReceived(const FArrayReaderPtr& ArrayReaderPtr, co
         return;
     }
 
-    FString ReceivedString;
-    
-    // 获取原始字节数据
-    TArray<uint8> ReceivedData;
+    // 先复制原始字节（用于二进制媒体包）
+    TArray<uint8> Raw;
     const int32 DataSize = ArrayReaderPtr->TotalSize();
-    
+
+    // 调试：逐包日志（来源与长度）
+    UE_LOG(LogTemp, Verbose, TEXT("[UDP] packet from %s, bytes=%d"), *EndPt.ToString(), DataSize);
+
     if (DataSize > 0)
     {
-        // 从ArrayReader读取原始字节
-        ReceivedData.SetNum(DataSize);
-        ArrayReaderPtr->Serialize(ReceivedData.GetData(), DataSize);
-        
-        // 确保数据以null结尾（如果还没有的话）
-        if (ReceivedData.Last() != 0)
+        Raw.SetNum(DataSize);
+        ArrayReaderPtr->Serialize(Raw.GetData(), DataSize);
+
+        // 广播二进制（C++）
+        if (OnBinaryReceived.IsBound())
         {
-            ReceivedData.Add(0);
+            OnBinaryReceived.Broadcast(Raw, EndPt);
         }
-        
-        // 将UTF-8字节转换为FString
-        const char* CharData = reinterpret_cast<const char*>(ReceivedData.GetData());
-        ReceivedString = FString(UTF8_TO_TCHAR(CharData));
-        
-        // 调试输出
-        // UE_LOG(LogTemp, Log, TEXT("UDP接收到 %d 字节数据，转换后字符串长度: %d"), 
-        //        DataSize, ReceivedString.Len());
     }
-    
-    // 将广播切到GameThread，避免在接收线程中调用蓝图动态委托
+
+    // 兼容旧路径：尝试按UTF-8转字符串
+    FString ReceivedString;
+    if (Raw.Num() > 0)
+    {
+        if (Raw.Last() != 0) { Raw.Add(0); }
+        ReceivedString = FString(UTF8_TO_TCHAR(reinterpret_cast<const char*>(Raw.GetData())));
+    }
+
     AsyncTask(ENamedThreads::GameThread, [this, Msg = MoveTemp(ReceivedString)]()
     {
         if (OnDataReceived.IsBound())
         {
             OnDataReceived.Broadcast(Msg);
         }
-        
         if (OnDataReceivedDynamic.IsBound())
         {
             OnDataReceivedDynamic.Broadcast(Msg);

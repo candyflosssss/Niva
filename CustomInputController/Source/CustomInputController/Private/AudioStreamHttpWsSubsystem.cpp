@@ -388,6 +388,39 @@ void UAudioStreamHttpWsSubsystem::InitMediaUdp()
     }
 }
 
+void UAudioStreamHttpWsSubsystem::HandleHelloUdp(const TArray<uint8>& Data, const FIPv4Endpoint& Remote)
+{
+    // 只处理控制包
+    FMediaPacketHeader H;
+    if (!MSP_ParseHeader(Data, H)) return;
+    if ((EMediaPacketType)H.MediaType != EMediaPacketType::Control) return;
+
+    // 解析 JSON
+    const uint8* Payload = Data.GetData() + sizeof(FMediaPacketHeader);
+    const int32 Len = (int32)H.PayloadLen;
+    FString JsonStr = (Len > 0) ? FString(FUTF8ToTCHAR(reinterpret_cast<const ANSICHAR*>(Payload), Len)) : FString();
+    TSharedPtr<FJsonObject> Obj; TSharedRef<TJsonReader<>> R = TJsonReaderFactory<>::Create(JsonStr);
+    if (!FJsonSerializer::Deserialize(R, Obj) || !Obj.IsValid()) return;
+
+    FString Op; Obj->TryGetStringField(TEXT("op"), Op);
+    if (Op != TEXT("hello")) return;      // 兼容端口只认 hello
+    if (!IsServer()) return;              // 只有服务器需要登记客户端
+
+    int32 PortFromClient = 0;
+    if (Obj->TryGetNumberField(TEXT("port"), PortFromClient) && PortFromClient > 0)
+    {
+        MediaClients.Add(FIPv4Endpoint(Remote.Address, (uint16)PortFromClient));
+        UE_LOG(LogTemp, Log, TEXT("[MediaSync] HELLO(compat) from %s (port=%d)"),
+               *Remote.Address.ToString(), PortFromClient);
+    }
+    else
+    {
+        MediaClients.Add(Remote);
+        UE_LOG(LogTemp, Log, TEXT("[MediaSync] HELLO(compat) from %s"), *Remote.ToString());
+    }
+}
+
+
 void UAudioStreamHttpWsSubsystem::ShutdownMediaUdp()
 {
     if (MediaUdpHandler)
@@ -878,6 +911,33 @@ bool UAudioStreamHttpWsSubsystem::TickSync(float DeltaTime)
 {
     const double NowSec = FPlatformTime::Seconds();
 
+    // 服务器兜底：若初始化时未识别为服务器，确保此时已在 18500 开启兼容 HELLO 监听
+    if (IsServer() && MediaUdpPort != 18500 && HelloCompatUdpHandler == nullptr)
+    {
+        HelloCompatUdpHandler = NewObject<UUDPHandler>(this);
+        HelloCompatUdpHandler->OnBinaryReceived.AddUObject(this, &UAudioStreamHttpWsSubsystem::HandleHelloUdp);
+        HelloCompatUdpHandler->StartUDPReceiver(18500);
+        UE_LOG(LogTemp, Log, TEXT("[AudioStream] HelloCompat listen(on-tick) on 18500 (main=%d)"), MediaUdpPort);
+    }
+
+    // 新增：成为服务器后自动绑定HTTP端点（初始化过早处于大厅/Standalone会跳过，此处补绑定）
+    if (IsServer() && !bHttpStarted)
+    {
+        const bool bOk = StartHttpListener(0);
+        UE_LOG(LogTemp, Log, TEXT("[AudioStream] Tick ensure HTTP listener: %s"), bOk?TEXT("started/bound"):TEXT("not available (will retry)"));
+    }
+
+    // 新增：服务器每tick确保本机回环在收件人列表中，统一走UDP/mediaClients回放
+    if (IsServer())
+    {
+        const FIPv4Endpoint Loop(FIPv4Address(127,0,0,1), MediaUdpPort);
+        if (!MediaClients.Contains(Loop))
+        {
+            MediaClients.Add(Loop);
+            UE_LOG(LogTemp, Log, TEXT("[MediaSync] Ensure loopback client %s (tick)"), *Loop.ToString());
+        }
+    }
+
     // 客户端侧：若尚未完成 hello，尝试重试
     if (!bAutoHelloDone)
     {
@@ -1095,8 +1155,15 @@ void UAudioStreamHttpWsSubsystem::ConnectWebSocket(const FString& Url)
             FString Base64; RootObj->TryGetStringField(TEXT("data"), Base64);
 
             if (Key.IsEmpty()) { UE_LOG(LogTemp, Warning, TEXT("WS audio JSON dropped: empty key")); return; }
-            auto Found = P->ComponentMap.Find(Key);
-            if (!Found || !Found->IsValid()) { UE_LOG(LogTemp, Warning, TEXT("WS audio JSON dropped: component not found for key=%s"), *Key); return; }
+
+            // 注意：服务器分发无需本地组件存在；客户端本地播放才需要组件
+            TWeakObjectPtr<UAudioStreamHttpWsComponent>* Found = P->ComponentMap.Find(Key);
+            const bool bNeedLocalPlay = !P->IsServer();
+            if (bNeedLocalPlay && (!Found || !Found->IsValid()))
+            {
+                UE_LOG(LogTemp, Warning, TEXT("WS audio JSON dropped (client mode): component not found for key=%s"), *Key);
+                return;
+            }
             if (Base64.IsEmpty()) { UE_LOG(LogTemp, Warning, TEXT("WS audio JSON dropped: empty base64")); return; }
 
             TArray<uint8> Decoded; if (!FBase64::Decode(Base64, Decoded)) { UE_LOG(LogTemp, Warning, TEXT("WS audio JSON base64 decode failed (len=%d)"), Base64.Len()); return; }
@@ -1112,11 +1179,11 @@ void UAudioStreamHttpWsSubsystem::ConnectWebSocket(const FString& Url)
                 UE_LOG(LogTemp, Log, TEXT("WS audio JSON (RAW) -> bytes=%d key=%s sr=%d ch=%d"), Pcm.Num(), *Key, UseSR, UseCH);
             }
 
-            // 服务器：切片并经UDP广播给客户端
             if (P->IsServer())
             {
-                TArray<uint8> DataToSend = Pcm; // 保留本地播放副本
-                AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [P, Key, Data=DataToSend, UseSR, UseCH]() mutable
+                // 服务器：仅切片并经UDP广播给客户端（包括本机回环），不直接本地播放；无需组件存在
+                TArray<uint8> DataToSend = Pcm;
+                AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [P, Key, Data=MoveTemp(DataToSend), UseSR, UseCH]() mutable
                 {
                     if (P)
                     {
@@ -1124,18 +1191,20 @@ void UAudioStreamHttpWsSubsystem::ConnectWebSocket(const FString& Url)
                     }
                 });
             }
-
-            // 本机组件播放（无论服务端还是客户端都允许）
-            UAudioStreamHttpWsComponent* Target = Found->Get();
-            AsyncTask(ENamedThreads::GameThread, [P, Key, Target, Data = MoveTemp(Pcm), UseSR, UseCH]() mutable
+            else
             {
-                if (!IsValid(Target)) return;
-                TArray<uint8> Bytes = MoveTemp(Data);
-                AppendWithCarry_GT(Key, Bytes, UseCH);
-                P->UpdateStats(Bytes.Num(), UseSR, UseCH);
-                P->LogCurrentStats(TEXT("WSAudio"));
-                Target->PushPcmData(Bytes, UseSR, UseCH);
-            });
+                // 客户端：本机组件播放
+                UAudioStreamHttpWsComponent* Target = Found->Get();
+                AsyncTask(ENamedThreads::GameThread, [P, Key, Target, Data = MoveTemp(Pcm), UseSR, UseCH]() mutable
+                {
+                    if (!IsValid(Target)) return;
+                    TArray<uint8> Bytes = MoveTemp(Data);
+                    AppendWithCarry_GT(Key, Bytes, UseCH);
+                    P->UpdateStats(Bytes.Num(), UseSR, UseCH);
+                    P->LogCurrentStats(TEXT("WSAudio"));
+                    Target->PushPcmData(Bytes, UseSR, UseCH);
+                });
+            }
         }
         else if (Type.Equals(TEXT("text"), ESearchCase::IgnoreCase))
         {
@@ -1372,6 +1441,7 @@ FNivaHttpResponse UAudioStreamHttpWsSubsystem::HandleAudioPush_NCP(FNivaHttpRequ
         Pcm = MoveTemp(Decoded);
     }
 
+
     UE_LOG(LogTemp, Log, TEXT("[/audio/push] key=%s bytes=%d sr=%d ch=%d (server=%d)"), *Key, Pcm.Num(), UseSR, UseCH, IsServer()?1:0);
 
     // 仅服务器：切帧并经UDP分发；客户端直接忽略
@@ -1382,7 +1452,25 @@ FNivaHttpResponse UAudioStreamHttpWsSubsystem::HandleAudioPush_NCP(FNivaHttpRequ
             ServerDistributeAudio(Key, Pcm, UseSR, UseCH);
         });
     }
-
+    //
+    // // 本地播放（主线程）
+    // if (TWeakObjectPtr<UAudioStreamHttpWsComponent>* Found = ComponentMap.Find(Key))
+    // {
+    //     if (Found->IsValid())
+    //     {
+    //         UAudioStreamHttpWsComponent* Target = Found->Get();
+    //         TArray<uint8> LocalBytes = Pcm; // 拷贝一份用于本地播放
+    //         AsyncTask(ENamedThreads::GameThread, [this, Target, Key, Data=MoveTemp(LocalBytes), UseSR, UseCH]() mutable
+    //         {
+    //             if (!IsValid(Target)) return;
+    //             TArray<uint8> Bytes = MoveTemp(Data);
+    //             AppendWithCarry_GT(Key, Bytes, UseCH);
+    //             UpdateStats(Bytes.Num(), UseSR, UseCH);
+    //             LogCurrentStats(TEXT("HTTPPushLocal"));
+    //             Target->PushPcmData(Bytes, UseSR, UseCH);
+    //         });
+    //     }
+    // }
     // 返回结果（不代表本地播放）
     TSharedRef<FJsonObject> OkObj = MakeShared<FJsonObject>();
     OkObj->SetStringField(TEXT("status"), TEXT("ok"));
@@ -1484,10 +1572,11 @@ FNivaHttpResponse UAudioStreamHttpWsSubsystem::HandleTaskStart_NCP(FNivaHttpRequ
         return UNetworkCoreSubsystem::MakeResponse(TEXT("Missing key (or role_id)"), TEXT("text/plain"), 400);
     }
 
+    // 放宽：组件不存在也允许启动WS，用于服务器仅分发/回环自播
     TWeakObjectPtr<UAudioStreamHttpWsComponent>* Found = ComponentMap.Find(TargetKey);
     if (!Found || !Found->IsValid())
     {
-        return UNetworkCoreSubsystem::MakeResponse(TEXT("Component not found"), TEXT("text/plain"), 404);
+        UE_LOG(LogTemp, Warning, TEXT("/task/start: Component not found for key=%s, will still start WS for UDP-only distribution"), *TargetKey);
     }
 
     ActiveWsTargetKey = TargetKey;
@@ -1629,25 +1718,11 @@ void UAudioStreamHttpWsSubsystem::PushTestAudioChunk(const FString& TargetKey, i
 
     if (IsServer())
     {
-        int32 ClientCount = MediaClients.Num();
+        // 服务器：统一经UDP分发（包含本机回环），不做直接本地播放兜底
         AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [this, K=TargetKey, Data=AudioData, SampleRate, Channels]() mutable
         {
             ServerDistributeAudio(K, Data, SampleRate, Channels);
         });
-        // 若尚无任何客户端注册，直接在服务器本地也推一份，确保自测有声
-        if (ClientCount == 0)
-        {
-            UAudioStreamHttpWsComponent* Target = Found->Get();
-            TArray<uint8> LocalCopy = MoveTemp(AudioData);
-            AsyncTask(ENamedThreads::GameThread, [Target, Data=MoveTemp(LocalCopy), SampleRate, Channels]() mutable
-            {
-                if (IsValid(Target))
-                {
-                    Target->PushPcmData(Data, SampleRate, Channels);
-                }
-            });
-            UE_LOG(LogTemp, Warning, TEXT("PushTestAudioChunk: no clients yet -> also local play on server key=%s, dur=%.1fms"), *TargetKey, ChunkDurationMs);
-        }
     }
     else
     {

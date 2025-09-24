@@ -617,6 +617,9 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
 		FString ToolName = Params->GetStringField(TEXT("name"));
 
 
+    	
+		// print 一下时间
+    	UE_LOG(LogTemp, Log, TEXT("SSE: tools/call: time: %s"), *FDateTime::Now().ToString());
         // 直接print一下
 		UE_LOG(LogTemp, Log, TEXT("SSE: tools/call: %s"), *ToolName);
 		// 调用绑定的函数

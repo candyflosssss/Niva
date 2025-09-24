@@ -89,7 +89,7 @@ bool UMicAudioCaptureComponent::StartCapture(int32 DeviceIndex)
 		StopCapture();
 	}
 
-	// 检查设备索引是否有效
+	// 检查设备列表
 	if (AvailableMicDevices.Num() <= 0)
 	{
 		UE_LOG(LogMicAudioCapture, Error, TEXT("没有可用的麦克风设备"));
@@ -99,28 +99,52 @@ bool UMicAudioCaptureComponent::StartCapture(int32 DeviceIndex)
 	DeviceIndex = FMath::Clamp(DeviceIndex, 0, AvailableMicDevices.Num() - 1);
 	CurrentDeviceIndex = DeviceIndex;
 
-	// 计算缓冲区大小
-	int32 BufferSize = (SampleRate * NumChannels * sizeof(float) * BufferSizeMs) / 1000;
+	// 计算期望帧数
+	const int32 TargetSampleRate = SampleRate > 0 ? SampleRate : 48000;
+	const uint32 NumFramesDesired = FMath::Max(1, (TargetSampleRate * BufferSizeMs) / 1000);
 
 	// 初始化音频捕获参数
-	FAudioCaptureDeviceParams CaptureParams;
+	Audio::FAudioCaptureDeviceParams CaptureParams;
 	CaptureParams.DeviceIndex = DeviceIndex;
 	CaptureParams.bUseHardwareAEC = false; // 如果需要回声消除，可以设置为true
+	CaptureParams.NumInputChannels = NumChannels > 0 ? NumChannels : Audio::InvalidDeviceChannelCount;
+	CaptureParams.SampleRate = SampleRate > 0 ? SampleRate : Audio::InvalidDeviceSampleRate;
 
-	// 打开音频捕获设备
-	if (!AudioCapture.OpenCaptureDevice(CaptureParams))
+	// 打开音频捕获流
+	// 确保延迟创建音频捕获实例
+	if (!AudioCapture)
 	{
-		UE_LOG(LogMicAudioCapture, Error, TEXT("无法打开音频捕获设备: %s"), *AvailableMicDevices[DeviceIndex]);
+		AudioCapture = MakeUnique<Audio::FAudioCapture>();
+	}
+
+	bool bOpened = AudioCapture->OpenAudioCaptureStream(
+		CaptureParams,
+		[this](const void* InAudio, int32 InNumFrames, int32 InNumChannels, int32 /*InSampleRate*/, double InStreamTime, bool /*bOverflow*/)
+		{
+			const float* AudioData = static_cast<const float*>(InAudio);
+			this->OnAudioCaptured(AudioData, InNumFrames, InNumChannels, InStreamTime);
+		},
+		NumFramesDesired);
+
+	if (!bOpened)
+	{
+		UE_LOG(LogMicAudioCapture, Error, TEXT("无法打开音频捕获流: %s"), *AvailableMicDevices[DeviceIndex]);
 		return false;
 	}
 
 	// 获取设备信息
-	AudioCapture.GetCaptureDeviceInfo(AudioCaptureDeviceInfo);
+	AudioCapture->GetCaptureDeviceInfo(AudioCaptureDeviceInfo, DeviceIndex);
 
-	// 设置捕获参数
-	AudioCapture.StartCapture([this](const float* AudioData, int32 NumFrames, int32 NumChannels, double StreamTime) {
-		this->OnAudioCaptured(AudioData, NumFrames, NumChannels, StreamTime);
-	}, SampleRate, NumChannels);
+	// 启动采集
+	if (!AudioCapture || !AudioCapture->StartStream())
+	{
+		UE_LOG(LogMicAudioCapture, Error, TEXT("无法启动音频捕获流: %s"), *AvailableMicDevices[DeviceIndex]);
+		if (AudioCapture)
+		{
+			AudioCapture->CloseStream();
+		}
+		return false;
+	}
 
 	bIsCapturing = true;
 
@@ -145,8 +169,11 @@ void UMicAudioCaptureComponent::StopCapture()
 		return;
 	}
 
-	AudioCapture.StopCapture();
-	AudioCapture.CloseCaptureDevice();
+	if (AudioCapture)
+	{
+		AudioCapture->StopStream();
+		AudioCapture->CloseStream();
+	}
 
 	bIsCapturing = false;
 	CurrentAudioLevel = 0.0f;
@@ -165,25 +192,25 @@ void UMicAudioCaptureComponent::RefreshMicDevices()
 	// 清空当前设备列表
 	AvailableMicDevices.Empty();
 
-	// 获取可用设备数量
-	int32 NumDevices = FAudioCapture::GetCaptureDeviceCount();
-	if (NumDevices <= 0)
+	// 获取可用输入设备
+	TArray<Audio::FCaptureDeviceInfo> InputDevices;
+	Audio::FAudioCapture TempCapture;
+	TempCapture.GetCaptureDevicesAvailable(InputDevices);
+
+	if (InputDevices.Num() == 0)
 	{
 		UE_LOG(LogMicAudioCapture, Warning, TEXT("未检测到麦克风设备"));
 		OnMicDevicesUpdated.Broadcast(AvailableMicDevices);
 		return;
 	}
 
-	// 获取所有设备信息
-	for (int32 DeviceIndex = 0; DeviceIndex < NumDevices; ++DeviceIndex)
+	for (int32 Idx = 0; Idx < InputDevices.Num(); ++Idx)
 	{
-		FString DeviceName;
-		FAudioCapture::GetCaptureDeviceInfo(DeviceIndex, DeviceName);
-		AvailableMicDevices.Add(DeviceName);
+		AvailableMicDevices.Add(InputDevices[Idx].DeviceName);
 
 		if (bEnableDebugLogs)
 		{
-			UE_LOG(LogMicAudioCapture, Display, TEXT("检测到麦克风设备 %d: %s"), DeviceIndex, *DeviceName);
+			UE_LOG(LogMicAudioCapture, Display, TEXT("检测到麦克风设备 %d: %s"), Idx, *InputDevices[Idx].DeviceName);
 		}
 	}
 
@@ -219,7 +246,7 @@ bool UMicAudioCaptureComponent::ConnectToServer(const FString& ServerUrl)
 	WebSocket = FWebSocketsModule::Get().CreateWebSocket(ServerUrl, TEXT(""));
 
 	// 绑定WebSocket事件
-	WebSocket->OnConnected().AddUObject(this, &UMicAudioCaptureComponent::OnWebSocketConnected);
+	WebSocket->OnConnected().AddUObject(this, &UMicAudioCaptureComponent::HandleWebSocketConnected);
 	WebSocket->OnConnectionError().AddUObject(this, &UMicAudioCaptureComponent::OnWebSocketConnectionError);
 	WebSocket->OnClosed().AddUObject(this, &UMicAudioCaptureComponent::OnWebSocketClosed);
 	WebSocket->OnMessage().AddUObject(this, &UMicAudioCaptureComponent::OnWebSocketMessageReceived);
@@ -270,10 +297,10 @@ bool UMicAudioCaptureComponent::IsConnectedToServer() const
 	return WebSocket.IsValid() && WebSocket->IsConnected();
 }
 
-void UMicAudioCaptureComponent::OnAudioCaptured(const float* AudioData, int32 NumFrames, int32 NumChannels, double StreamTime)
+void UMicAudioCaptureComponent::OnAudioCaptured(const float* AudioData, int32 NumFrames, int32 InNumChannels, double StreamTime)
 {
 	// 计算音频级别
-	CurrentAudioLevel = CalculateAudioLevel(AudioData, NumFrames, NumChannels);
+	CurrentAudioLevel = CalculateAudioLevel(AudioData, NumFrames, InNumChannels);
 
 	// 在游戏线程上广播音频级别更新事件
 	AsyncTask(ENamedThreads::GameThread, [this]() {
@@ -281,7 +308,7 @@ void UMicAudioCaptureComponent::OnAudioCaptured(const float* AudioData, int32 Nu
 	});
 
 	// 处理音频数据
-	TArray<uint8> ProcessedData = ProcessAudioData(AudioData, NumFrames, NumChannels);
+	TArray<uint8> ProcessedData = ProcessAudioData(AudioData, NumFrames, InNumChannels);
 
 	// 如果WebSocket已连接，发送音频数据
 	if (WebSocket.IsValid() && WebSocket->IsConnected() && ProcessedData.Num() > 0)
@@ -323,16 +350,16 @@ void UMicAudioCaptureComponent::OnAudioCaptured(const float* AudioData, int32 Nu
 	}
 }
 
-float UMicAudioCaptureComponent::CalculateAudioLevel(const float* AudioData, int32 NumFrames, int32 NumChannels)
+float UMicAudioCaptureComponent::CalculateAudioLevel(const float* AudioData, int32 NumFrames, int32 InNumChannels)
 {
-	if (!AudioData || NumFrames <= 0 || NumChannels <= 0)
+	if (!AudioData || NumFrames <= 0 || InNumChannels <= 0)
 	{
 		return 0.0f;
 	}
 
 	// 计算RMS音量
 	float SumSquared = 0.0f;
-	int32 TotalSamples = NumFrames * NumChannels;
+	int32 TotalSamples = NumFrames * InNumChannels;
 
 	for (int32 i = 0; i < TotalSamples; ++i)
 	{
@@ -353,22 +380,22 @@ float UMicAudioCaptureComponent::CalculateAudioLevel(const float* AudioData, int
 	return FMath::Clamp(Level, 0.0f, 1.0f);
 }
 
-TArray<uint8> UMicAudioCaptureComponent::ProcessAudioData(const float* AudioData, int32 NumFrames, int32 NumChannels)
+TArray<uint8> UMicAudioCaptureComponent::ProcessAudioData(const float* AudioData, int32 NumFrames, int32 InNumChannels)
 {
-	if (!AudioData || NumFrames <= 0 || NumChannels <= 0)
+	if (!AudioData || NumFrames <= 0 || InNumChannels <= 0)
 	{
 		return TArray<uint8>();
 	}
 
 	// 创建PCM数据缓冲区(16位有符号整数格式)
 	int32 BytesPerSample = 2; // 16-bit PCM = 2 bytes per sample
-	int32 TotalBytes = NumFrames * NumChannels * BytesPerSample;
+	int32 TotalBytes = NumFrames * InNumChannels * BytesPerSample;
 	TArray<uint8> PcmData;
 	PcmData.SetNumUninitialized(TotalBytes);
 
 	// 将浮点音频数据(范围为-1.0到1.0)转换为16位有符号整数(-32768到32767)
 	int16* PcmSamples = reinterpret_cast<int16*>(PcmData.GetData());
-	int32 TotalSamples = NumFrames * NumChannels;
+	int32 TotalSamples = NumFrames * InNumChannels;
 
 	for (int32 i = 0; i < TotalSamples; ++i)
 	{
@@ -406,7 +433,7 @@ void UMicAudioCaptureComponent::TryReconnect()
 		WebSocket = FWebSocketsModule::Get().CreateWebSocket(CurrentServerUrl, TEXT(""));
 
 		// 重新绑定事件
-		WebSocket->OnConnected().AddUObject(this, &UMicAudioCaptureComponent::OnWebSocketConnected);
+		WebSocket->OnConnected().AddUObject(this, &UMicAudioCaptureComponent::HandleWebSocketConnected);
 		WebSocket->OnConnectionError().AddUObject(this, &UMicAudioCaptureComponent::OnWebSocketConnectionError);
 		WebSocket->OnClosed().AddUObject(this, &UMicAudioCaptureComponent::OnWebSocketClosed);
 		WebSocket->OnMessage().AddUObject(this, &UMicAudioCaptureComponent::OnWebSocketMessageReceived);
@@ -427,7 +454,7 @@ void UMicAudioCaptureComponent::TryReconnect()
 	}
 }
 
-void UMicAudioCaptureComponent::OnWebSocketConnected()
+void UMicAudioCaptureComponent::HandleWebSocketConnected()
 {
 	CurrentReconnectAttempts = 0;
 

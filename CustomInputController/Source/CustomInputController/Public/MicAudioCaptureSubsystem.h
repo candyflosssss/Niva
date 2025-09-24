@@ -119,4 +119,17 @@ private:
 
 	// 初始化内部组件
 	void InitializeCaptureComponent();
+
+	// 事件转发处理函数（用于绑定动态委托）
+	UFUNCTION()
+	void HandleMicDevicesUpdated(const TArray<FString>& DeviceNames);
+
+	UFUNCTION()
+	void HandleAudioLevelUpdated(float Level);
+
+	UFUNCTION()
+	void HandleWebSocketConnected(const FString& ServerAddress);
+
+	UFUNCTION()
+	void HandleWebSocketError(const FString& ErrorMsg, int32 ErrorCode);
 };

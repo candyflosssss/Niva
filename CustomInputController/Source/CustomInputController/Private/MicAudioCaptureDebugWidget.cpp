@@ -13,7 +13,7 @@ UMicAudioCaptureDebugWidget::UMicAudioCaptureDebugWidget(const FObjectInitialize
 	: Super(ObjectInitializer)
 {
 	// 启用Tick以定期更新UI
-	bIsFocusable = true;
+	SetIsFocusable(true);
 }
 
 void UMicAudioCaptureDebugWidget::NativeConstruct()

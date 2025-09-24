@@ -4,12 +4,14 @@
 #include "MicAudioCaptureSubsystem.h"
 #include "MicAudioCaptureSettings.h"
 #include "Styling/SlateStyleRegistry.h"
+#include "Styling/AppStyle.h"
 #include "Framework/Commands/UICommandList.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "Engine/GameInstance.h"
 #include "LevelEditor.h"
 #include "ISettingsModule.h"
 #include "ISettingsSection.h"
+#include "Modules/ModuleManager.h"
 
 #define LOCTEXT_NAMESPACE "FMicAudioCaptureModule"
 
@@ -110,7 +112,7 @@ void FMicAudioCaptureModule::AddToolbarExtension(FToolBarBuilder& Builder)
 			NAME_None,
 			LOCTEXT("麦克风设置", "MicAudioCapture"),
 			LOCTEXT("打开麦克风音频捕获设置", "MicAudioCapture"),
-			FSlateIcon(FEditorStyle::GetStyleSetName(), "LevelEditor.GameSettings"));
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "LevelEditor.GameSettings"));
 
 		// 添加分隔符
 		Builder.AddSeparator();
@@ -120,14 +122,14 @@ void FMicAudioCaptureModule::AddToolbarExtension(FToolBarBuilder& Builder)
 			NAME_None,
 			LOCTEXT("开始捕获", "MicAudioCapture"),
 			LOCTEXT("开始麦克风音频捕获", "MicAudioCapture"),
-			FSlateIcon(FEditorStyle::GetStyleSetName(), "Icons.Record"));
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Record"));
 
 		Builder.AddToolBarButton(
 			FMicAudioCaptureCommands::Get().StopMicCapture,
 			NAME_None,
 			LOCTEXT("停止捕获", "MicAudioCapture"),
 			LOCTEXT("停止麦克风音频捕获", "MicAudioCapture"),
-			FSlateIcon(FEditorStyle::GetStyleSetName(), "Icons.Stop"));
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Stop"));
 
 		// 添加分隔符
 		Builder.AddSeparator();
@@ -137,14 +139,14 @@ void FMicAudioCaptureModule::AddToolbarExtension(FToolBarBuilder& Builder)
 			NAME_None,
 			LOCTEXT("连接服务器", "MicAudioCapture"),
 			LOCTEXT("连接到WebSocket服务器", "MicAudioCapture"),
-			FSlateIcon(FEditorStyle::GetStyleSetName(), "Icons.Connect"));
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Connect"));
 
 		Builder.AddToolBarButton(
 			FMicAudioCaptureCommands::Get().DisconnectFromServer,
 			NAME_None,
 			LOCTEXT("断开连接", "MicAudioCapture"),
 			LOCTEXT("断开与WebSocket服务器的连接", "MicAudioCapture"),
-			FSlateIcon(FEditorStyle::GetStyleSetName(), "Icons.Disconnect"));
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Disconnect"));
 
 		// 添加分隔符
 		Builder.AddSeparator();
@@ -154,7 +156,7 @@ void FMicAudioCaptureModule::AddToolbarExtension(FToolBarBuilder& Builder)
 			NAME_None,
 			LOCTEXT("刷新设备", "MicAudioCapture"),
 			LOCTEXT("刷新可用的麦克风设备列表", "MicAudioCapture"),
-			FSlateIcon(FEditorStyle::GetStyleSetName(), "Icons.Refresh"));
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Refresh"));
 	}
 	Builder.EndSection();
 }
@@ -260,5 +262,3 @@ UMicAudioCaptureSubsystem* FMicAudioCaptureModule::GetMicAudioCaptureSubsystem()
 }
 
 #undef LOCTEXT_NAMESPACE
-
-IMODULE_INTERFACE_IMPL(FMicAudioCaptureModule, CustomInputController);

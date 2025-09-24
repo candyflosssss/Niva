@@ -1,4 +1,7 @@
-﻿#include "MicAudioCaptureCommands.h"
+﻿#if WITH_EDITOR
+#include "MicAudioCaptureCommands.h"
+
+#define LOCTEXT_NAMESPACE "FMicAudioCaptureCommands"
 
 void FMicAudioCaptureCommands::RegisterCommands()
 {
@@ -50,3 +53,6 @@ void FMicAudioCaptureCommands::RegisterCommands()
 		FInputChord()
 	);
 }
+
+#undef LOCTEXT_NAMESPACE
+#endif // WITH_EDITOR

@@ -50,10 +50,10 @@ void UMicAudioCaptureSubsystem::InitializeCaptureComponent()
 		MicCapture->SetActive(true);
 
 		// 将事件转发给子系统的代理
-		MicCapture->OnMicDevicesUpdated.AddDynamic(this, &UMicAudioCaptureSubsystem::RefreshMicDevices);
-		MicCapture->OnAudioLevelUpdated.AddUObject(this, &UMicAudioCaptureSubsystem::OnAudioLevelUpdated.Broadcast);
-		MicCapture->OnWebSocketConnected.AddUObject(this, &UMicAudioCaptureSubsystem::OnWebSocketConnected.Broadcast);
-		MicCapture->OnWebSocketError.AddUObject(this, &UMicAudioCaptureSubsystem::OnWebSocketError.Broadcast);
+		MicCapture->OnMicDevicesUpdated.AddDynamic(this, &UMicAudioCaptureSubsystem::HandleMicDevicesUpdated);
+		MicCapture->OnAudioLevelUpdated.AddDynamic(this, &UMicAudioCaptureSubsystem::HandleAudioLevelUpdated);
+		MicCapture->OnWebSocketConnected.AddDynamic(this, &UMicAudioCaptureSubsystem::HandleWebSocketConnected);
+		MicCapture->OnWebSocketError.AddDynamic(this, &UMicAudioCaptureSubsystem::HandleWebSocketError);
 
 		// 初始化完成后刷新设备列表
 		RefreshMicDevices();
@@ -130,7 +130,7 @@ bool UMicAudioCaptureSubsystem::IsCapturing() const
 {
 	if (MicCapture)
 	{
-		return MicCapture->bIsCapturing;
+		return MicCapture->IsCapturing();
 	}
 	return false;
 }
@@ -174,8 +174,8 @@ void UMicAudioCaptureSubsystem::SetSampleRate(int32 InSampleRate)
 {
 	if (MicCapture)
 	{
-		bool bWasCapturing = MicCapture->bIsCapturing;
-		int32 DeviceIndex = MicCapture->CurrentDeviceIndex;
+		bool bWasCapturing = MicCapture->IsCapturing();
+		int32 DeviceIndex = MicCapture->GetCurrentDeviceIndex();
 
 		// 如果正在捕获，需要先停止
 		if (bWasCapturing)
@@ -206,8 +206,8 @@ void UMicAudioCaptureSubsystem::SetNumChannels(int32 InNumChannels)
 {
 	if (MicCapture)
 	{
-		bool bWasCapturing = MicCapture->bIsCapturing;
-		int32 DeviceIndex = MicCapture->CurrentDeviceIndex;
+		bool bWasCapturing = MicCapture->IsCapturing();
+		int32 DeviceIndex = MicCapture->GetCurrentDeviceIndex();
 
 		// 如果正在捕获，需要先停止
 		if (bWasCapturing)
@@ -266,4 +266,25 @@ bool UMicAudioCaptureSubsystem::GetEnableDebugLogs() const
 		return MicCapture->bEnableDebugLogs;
 	}
 	return false;
+}
+
+
+void UMicAudioCaptureSubsystem::HandleMicDevicesUpdated(const TArray<FString>& DeviceNames)
+{
+	OnMicDevicesUpdated.Broadcast(DeviceNames);
+}
+
+void UMicAudioCaptureSubsystem::HandleAudioLevelUpdated(float Level)
+{
+	OnAudioLevelUpdated.Broadcast(Level);
+}
+
+void UMicAudioCaptureSubsystem::HandleWebSocketConnected(const FString& ServerAddress)
+{
+	OnWebSocketConnected.Broadcast(ServerAddress);
+}
+
+void UMicAudioCaptureSubsystem::HandleWebSocketError(const FString& ErrorMsg, int32 ErrorCode)
+{
+	OnWebSocketError.Broadcast(ErrorMsg, ErrorCode);
 }

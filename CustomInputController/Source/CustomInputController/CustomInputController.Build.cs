@@ -33,10 +33,15 @@ public class CustomInputController : ModuleRules
 				"ApplicationCore",
 				"Networking",
 				"Sockets", 
-				"NetworkCorePlugin"
+				"NetworkCorePlugin",
+				"AudioCaptureCore",
+				"AudioCapture",
+				"WebSockets",
+				"UMG",
 				// ... add other public dependencies that you statically link with here ...
 			}
 			);
+
 
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
@@ -45,16 +50,32 @@ public class CustomInputController : ModuleRules
 				"Engine",
 				"Slate",
 				"SlateCore",
-				"OpenColorIOLib", 
-				"WebSockets",
+				"DeveloperSettings",
+				"InputCore",
 				"Json",
 				"JsonUtilities",
+				"Projects",
+				"Settings",
+				"OpenColorIOLib", 
+				"WebSockets",
 				"AudioExtensions",
 				"AudioMixer",
-				"DeveloperSettings",
+				"DeveloperSettings"
 				// ... add private dependencies that you statically link with here ...	
 			}
 			);
+
+		if (Target.bBuildEditor)
+		{
+			PrivateDependencyModuleNames.AddRange(
+				new string[]
+				{
+					"UnrealEd",
+					"EditorStyle", // keep for compatibility if referenced indirectly
+					"LevelEditor"
+				}
+			);
+		}
 		
 		
 		DynamicallyLoadedModuleNames.AddRange(

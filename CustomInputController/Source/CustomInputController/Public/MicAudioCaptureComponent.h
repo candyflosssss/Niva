@@ -2,7 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
-#include "AudioCapture.h"
+#include "AudioCaptureCore.h"
 #include "AudioCaptureDeviceInterface.h"
 #include "WebSocketsModule.h"
 #include "IWebSocket.h"
@@ -64,6 +64,14 @@ public:
 	/** 检查WebSocket连接状态 */
 	UFUNCTION(BlueprintPure, Category="MicAudioCapture")
 	bool IsConnectedToServer() const;
+
+	/** 是否正在捕获 */
+	UFUNCTION(BlueprintPure, Category="MicAudioCapture")
+	bool IsCapturing() const { return bIsCapturing; }
+
+	/** 当前设备索引 */
+	UFUNCTION(BlueprintPure, Category="MicAudioCapture")
+	int32 GetCurrentDeviceIndex() const { return CurrentDeviceIndex; }
 
 	/** 当麦克风捕获开始时触发 */
 	UPROPERTY(BlueprintAssignable, Category="MicAudioCapture|Events")
@@ -130,10 +138,10 @@ public:
 	int32 ChunkSizeBytes = 4096;
 
 private:
-	// 音频捕获对象
-	FAudioCapture AudioCapture;
+	// 音频捕获对象（延迟创建以避免在CDO阶段初始化底层音频）
+	TUniquePtr<Audio::FAudioCapture> AudioCapture;
 	// 音频捕获设备信息
-	FAudioCaptureDeviceInfo AudioCaptureDeviceInfo;
+	Audio::FCaptureDeviceInfo AudioCaptureDeviceInfo;
 	// 可用麦克风设备列表
 	TArray<FString> AvailableMicDevices;
 	// 当前使用的麦克风设备索引
@@ -153,15 +161,15 @@ private:
 	// 重连定时器句柄
 	FTimerHandle ReconnectTimerHandle;
 	// 音频捕获回调函数
-	void OnAudioCaptured(const float* AudioData, int32 NumFrames, int32 NumChannels, double StreamTime);
+	void OnAudioCaptured(const float* AudioData, int32 NumFrames, int32 InNumChannels, double StreamTime);
 	// 计算当前音频级别
-	float CalculateAudioLevel(const float* AudioData, int32 NumFrames, int32 NumChannels);
+	float CalculateAudioLevel(const float* AudioData, int32 NumFrames, int32 InNumChannels);
 	// PCM数据处理(可能需要转换格式)
-	TArray<uint8> ProcessAudioData(const float* AudioData, int32 NumFrames, int32 NumChannels);
+	TArray<uint8> ProcessAudioData(const float* AudioData, int32 NumFrames, int32 InNumChannels);
 	// 尝试重新连接WebSocket
 	void TryReconnect();
 	// WebSocket事件处理函数
-	void OnWebSocketConnected();
+	void HandleWebSocketConnected();
 	void OnWebSocketConnectionError(const FString& Error);
 	void OnWebSocketClosed(int32 StatusCode, const FString& Reason, bool bWasClean);
 	void OnWebSocketMessageReceived(const FString& Message);

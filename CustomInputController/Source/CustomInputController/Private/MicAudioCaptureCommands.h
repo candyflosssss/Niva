@@ -1,8 +1,9 @@
 ﻿#pragma once
 
+#if WITH_EDITOR
 #include "CoreMinimal.h"
 #include "Framework/Commands/Commands.h"
-#include "EditorStyleSet.h"
+#include "Styling/AppStyle.h"
 
 /**
  * 麦克风音频捕获编辑器命令
@@ -15,7 +16,7 @@ public:
 			FName(TEXT("MicAudioCapture")),
 			FText::FromString(TEXT("麦克风音频捕获")),
 			FName(TEXT("MicAudioCaptureCategory")),
-			FEditorStyle::GetStyleSetName())
+			FAppStyle::GetAppStyleSetName())
 	{
 	}
 
@@ -30,3 +31,4 @@ public:
 	TSharedPtr<FUICommandInfo> DisconnectFromServer;
 	TSharedPtr<FUICommandInfo> RefreshMicDevices;
 };
+#endif // WITH_EDITOR

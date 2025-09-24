@@ -46,3 +46,8 @@ OfflineModel/
 # (We now allow tracking of .uasset/.umap again when outside ArtContent)
 
 # End of .gitignore
+ 
+# Unreal asset binaries (exclude from this repo)
+# If you need to keep specific assets, add an exception like:
+# !path/to/keep/SpecificAsset.uasset
+*.uasset

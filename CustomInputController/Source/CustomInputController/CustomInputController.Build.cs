@@ -58,6 +58,7 @@ public class CustomInputController : ModuleRules
 				"Settings",
 				"OpenColorIOLib", 
 				"WebSockets",
+				"HTTP",
 				"AudioExtensions",
 				"AudioMixer",
 				"DeveloperSettings"

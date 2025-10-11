@@ -437,7 +437,7 @@ class NETWORKCOREPLUGIN_API UMCPToolPropertyActorPtr: public UMCPToolProperty
 
 public:
 	// 所需的静态类
-	UPROPERTY(BlueprintReadOnly, Category = "NetworkCore|MCP|Tool")
+	UPROPERTY(BlueprintReadOnly, Category = "NetworkCore|MCP|Tool", meta=(MetaClass="Actor", AllowAbstract="false"))
 	TSubclassOf<AActor> ActorClass;
 
 	// 根据静态类，查找场景中所有符合条件的对象
@@ -449,7 +449,7 @@ public:
 	TMap<FString, TWeakObjectPtr<AActor>> ActorMap;
 
 	//创建一个本类的实例
-	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NetworkCore|MCP|Tool")
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NetworkCore|MCP|Tool", meta=(MetaClass="Actor", AllowAbstract="false"))
 	static UMCPToolProperty* CreateActorPtrProperty(FString InName, FString InDescription, TSubclassOf<AActor> InActorClass);
 	
 
@@ -597,6 +597,10 @@ public:
 	UPROPERTY(BlueprintReadWrite, Category = "NetworkCore|MCP|Tool")
 	FMCPTool MCPTool;
 
+	// 存储同名工具的多个变体定义（与 RouteDelegates 按注册顺序一一对应）
+	UPROPERTY(BlueprintReadWrite, Category = "NetworkCore|MCP|Tool")
+	TArray<FMCPTool> MCPToolVariants;
+
 	/**
 	 * @brief 表示系统或应用程序中的工具数量。
 	 *
@@ -667,7 +671,11 @@ public:
     *
     * @return UMCP工具句柄的指针或引用。
     */
-   UMCPToolHandle() : MCPid(-1), SessionId("none"), MCPTransportSubsystem(nullptr) {}
+   // 进度回报用的 progressToken（来自请求 params._meta.progressToken）
+   UPROPERTY(BlueprintReadOnly, Category = "NetworkCore|MCP|Tool")
+   FString ProgressToken;
+
+   UMCPToolHandle() : MCPid(-1), SessionId("none"), MCPTransportSubsystem(nullptr), ProgressToken("") {}
 
    /**
     * @brief 初始化工具句柄以供使用。
@@ -678,7 +686,7 @@ public:
     * @return 返回指示成功或失败的状态码。非零值
     * 通常表示初始化期间发生了错误。
     */
-   static UMCPToolHandle* initToolHandle(int id, const FString& _SessionID, UMCPTransportSubsystem* _subsystem);
+   static UMCPToolHandle* initToolHandle(int id, const FString& _SessionID, UMCPTransportSubsystem* _subsystem, const FString& InProgressToken = TEXT(""));
 
 public:
    /**
@@ -688,8 +696,17 @@ public:
     * 它通常被分配来调用特定于某个工具或进程的功能。
     *
     */
+	
 	UFUNCTION(BlueprintCallable, Category = "NetworkCore|MCP", meta = (HidePin = "json"))
-	void ToolCallback(bool isError, /*处理结果*/FString text);
+	void ToolCallbackRaw(bool isError, const FString& text, bool bFinal, int32 Completed=-1, int32 Total=-1);
+
+	// 旧签名保持不动，内部转调为“最终结果”
+	
+	UFUNCTION(BlueprintCallable, Category = "NetworkCore|MCP", meta = (HidePin = "json"))
+	inline void ToolCallback(bool isError, FString text) {
+		ToolCallbackRaw(isError, text, /*bFinal=*/true);
+	}
+
 
 	void ToolCallback(bool isError, TSharedPtr<FJsonObject> json);
 };

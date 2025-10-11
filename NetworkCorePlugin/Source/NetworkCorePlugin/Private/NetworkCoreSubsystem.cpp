@@ -229,36 +229,85 @@ void UMCPTransportSubsystem::ParseJsonRPC(const FString& JsonString, FString& Me
 
 void UMCPTransportSubsystem::RegisterToolProperties(FMCPTool tool, FMCPRouteDelegate MCPRouteDelegate)
 {
-    FMCPToolStorage* ptr_toolStorage = nullptr;
-    bool isfind = false;
-	// 检查是否已经注册过该工具
-	if (MCPTools.Contains(tool.Name))
+	// 允许同名工具重复注册：将同名的路由累计在一起进行广播
+	FMCPToolStorage& Storage = MCPTools.FindOrAdd(tool.Name);
+
+	// 1) 记录路由与注册计数（不覆盖）
+	Storage.RouteDelegates.Add(MCPRouteDelegate);
+	Storage.ToolNum += 1;
+
+	// 2) 保存本次注册的完整变体定义（与路由索引对齐）
+	Storage.MCPToolVariants.Add(tool);
+
+	// 3) 维护“规范展示定义”（Canonical Tool）：
+	//    - 对 Owner 参数的 ActorClass 采用“父类优先”进行合并；
+	//    - 其他字段保持首次已存在的定义，除非首次注册。
+	auto GetOwnerClassFromTool = [](const FMCPTool& T) -> UClass*
 	{
-		// 如果已经注册过，则更新工具信息
-		ptr_toolStorage = &MCPTools[tool.Name];
-		isfind = true;
-	}
-	if (!isfind ) {
-        FMCPToolStorage toolStorage;
-		// 如果没有找到，创建一个新的工具存储
-		toolStorage.MCPTool = tool;
-        toolStorage.ToolNum = 1;
-		// 注册工具委托
-		toolStorage.RouteDelegates.Add(MCPRouteDelegate);
-        //　加入工具列表
-        MCPTools.Add(tool.Name,toolStorage);
-		ptr_toolStorage = &toolStorage;
-	}
-	else {
-		// 如果找到了，更新工具信息
-		ptr_toolStorage->MCPTool = tool;
-		ptr_toolStorage->ToolNum++;
-		//　注册工具委托
-		ptr_toolStorage->RouteDelegates.Add(MCPRouteDelegate);
-	}
-	UE_LOG(LogTemp, Log, TEXT("RegisterToolProperties: %s"), *tool.Name);
+		for (UMCPToolProperty* Prop : T.Properties)
+		{
+			if (Prop && Prop->Name == TEXT("Owner"))
+			{
+				if (UMCPToolPropertyActorPtr* ActorProp = Cast<UMCPToolPropertyActorPtr>(Prop))
+				{
+					return ActorProp->ActorClass;
+				}
+			}
+		}
+		return nullptr;
+	};
+	auto SetOwnerClassInTool = [](FMCPTool& T, UClass* NewClass)
+	{
+		if (!NewClass) return;
+		for (UMCPToolProperty* Prop : T.Properties)
+		{
+			if (Prop && Prop->Name == TEXT("Owner"))
+			{
+				if (UMCPToolPropertyActorPtr* ActorProp = Cast<UMCPToolPropertyActorPtr>(Prop))
+				{
+					ActorProp->ActorClass = NewClass;
+					return;
+				}
+			}
+		}
+	};
+	auto IsSameOrParent = [](UClass* MaybeParent, UClass* MaybeChild) -> bool
+	{
+		if (!MaybeParent || !MaybeChild) return false;
+		return MaybeChild->IsChildOf(MaybeParent);
+	};
 
+	if (Storage.MCPTool.Properties.Num() == 0)
+	{
+		// 首次注册：直接采用该定义作为规范定义
+		Storage.MCPTool = tool;
+	}
+	else
+	{
+		// 后续注册：如新注册的 OwnerClass 是现有规范 OwnerClass 的父类，则提升规范到父类
+		UClass* IncomingOwnerClass = GetOwnerClassFromTool(tool);
+		UClass* CanonOwnerClass = GetOwnerClassFromTool(Storage.MCPTool);
+		if (IncomingOwnerClass && CanonOwnerClass)
+		{
+			if (IsSameOrParent(IncomingOwnerClass, CanonOwnerClass) && IncomingOwnerClass != CanonOwnerClass)
+			{
+				SetOwnerClassInTool(Storage.MCPTool, IncomingOwnerClass);
+			}
+		}
+		else if (IncomingOwnerClass && !CanonOwnerClass)
+		{
+			SetOwnerClassInTool(Storage.MCPTool, IncomingOwnerClass);
+		}
+		// 若两者都没有 OwnerClass，保持现有规范定义不变
+	}
 
+	UE_LOG(LogTemp, Log, TEXT("RegisterToolProperties: %s (TotalRoutes=%d, TotalRegs=%d, Variants=%d, CanonOwner=%s, IncomingOwner=%s)"),
+		*tool.Name,
+		Storage.RouteDelegates.Num(),
+		Storage.ToolNum,
+		Storage.MCPToolVariants.Num(),
+		*GetNameSafe(GetOwnerClassFromTool(Storage.MCPTool)),
+		*GetNameSafe(GetOwnerClassFromTool(tool)));
 }
 
 TSharedPtr<FJsonObject> UMCPTransportSubsystem::GetToolbyTarget(FString ActorName)
@@ -354,10 +403,17 @@ URefreshMCPClientAsyncAction* URefreshMCPClientAsyncAction::RefreshMCPClient(UOb
 void URefreshMCPClientAsyncAction::Activate()
 {
     TSharedRef<IHttpRequest> Request = FHttpModule::Get().CreateRequest();
-    Request->SetURL(TEXT("http://192.168.10.201:8081/api/servers/refresh"));
+    const UNivaNetworkCoreSettings* SettingsLocal = GetDefault<UNivaNetworkCoreSettings>();
+    FString BaseURL = SettingsLocal ? SettingsLocal->MCPBaseURL : TEXT("");
+    if (BaseURL.IsEmpty())
+    {
+        BaseURL = TEXT("http://192.168.10.201:8081");
+    }
+    const FString RefreshURL = BaseURL + TEXT("/api/servers/refresh");
+    Request->SetURL(RefreshURL);
     Request->SetVerb(TEXT("POST"));
     Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-    Request->SetContentAsString(TEXT("{\"config_path\":\"http://192.168.10.201:8081/static/test_api_agent_simple.py\",\"request_id\":\"17516252572787568552130849533\"}"));
+    Request->SetContentAsString(FString::Printf(TEXT("{\"config_path\":\"%s\",\"request_id\":\"%s\"}"), *RefreshURL, TEXT("17516252572787568552130849533")));
     
     Request->OnProcessRequestComplete().BindUObject(this, &URefreshMCPClientAsyncAction::HandleRequestComplete);
     Request->ProcessRequest();
@@ -620,22 +676,179 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
     	
 		// print 一下时间
     	UE_LOG(LogTemp, Log, TEXT("SSE: tools/call: time: %s"), *FDateTime::Now().ToString());
-        // 直接print一下
+      		// 直接print一下
 		UE_LOG(LogTemp, Log, TEXT("SSE: tools/call: %s"), *ToolName);
+
+		// 提取 _meta.progressToken（字符串或数字），用于进度回报
+		FString ProgressToken;
+		if (Params.IsValid() && Params->HasField(TEXT("_meta")))
+		{
+			TSharedPtr<FJsonObject> MetaObj = Params->GetObjectField(TEXT("_meta"));
+			if (MetaObj.IsValid())
+			{
+				if (MetaObj->HasTypedField<EJson::String>(TEXT("progressToken")))
+				{
+					ProgressToken = MetaObj->GetStringField(TEXT("progressToken"));
+				}
+				else if (MetaObj->HasField(TEXT("progressToken")))
+				{
+					// 兼容数字类型的 token
+					const double NumToken = MetaObj->GetNumberField(TEXT("progressToken"));
+					ProgressToken = FString::SanitizeFloat(NumToken);
+				}
+			}
+		}
+
 		// 调用绑定的函数
         if (MCPTools.Contains(ToolName)){
         	// 计数器
         	int Num = 0 ;
-            // 如果找到了，就执行
-            for (auto i : MCPTools[ToolName].RouteDelegates){
-            	// 检查是否有有效绑定
-            	if (i.IsBound())
-            	{
-            		UMCPToolHandle* MCPToolHandle = UMCPToolHandle::initToolHandle(id, SessionId, this);
-					i.ExecuteIfBound(Request.Json, MCPToolHandle, MCPTools[ToolName].MCPTool);
-            		Num++;
-            	}
+            FMCPToolStorage& Storage = MCPTools[ToolName];
+
+            // 参数校验：验证变体中的 Actor 指针参数是否有效
+            auto ValidateVariant = [&](const FMCPTool& Variant, TArray<FString>& BadParams) -> bool
+            {
+                BadParams.Reset();
+                for (UMCPToolProperty* Prop : Variant.Properties)
+                {
+                    if (!Prop) continue;
+                    if (UMCPToolPropertyActorPtr* ActorProp = Cast<UMCPToolPropertyActorPtr>(Prop))
+                    {
+                        AActor* Resolved = nullptr;
+                        const bool bHasValue = UMCPToolBlueprintLibrary::GetActorValue(Variant, Prop->Name, Request.Json, Resolved);
+                        const bool bClassOk = (Resolved != nullptr) && (!ActorProp->ActorClass || Resolved->IsA(ActorProp->ActorClass));
+                        if (!bHasValue || !bClassOk)
+                        {
+                            BadParams.Add(Prop->Name);
+                        }
+                    }
+                }
+                return BadParams.Num() == 0;
+            };
+
+            // 优先：尝试根据调用参数中的 Owner 选择“最匹配”的变体（子类优先，子类缺失则回退到父类）
+            AActor* ProvidedOwner = nullptr;
+            int32 BestIdx = INDEX_NONE;
+            int32 BestDepth = MAX_int32; // 越小越具体（0=完全相同）
+
+            auto GetOwnerClassFromVariant = [](const FMCPTool& Variant) -> UClass*
+            {
+                for (UMCPToolProperty* Prop : Variant.Properties)
+                {
+                    if (Prop && Prop->Name == TEXT("Owner"))
+                    {
+                        if (UMCPToolPropertyActorPtr* ActorProp = Cast<UMCPToolPropertyActorPtr>(Prop))
+                        {
+                            return ActorProp->ActorClass;
+                        }
+                    }
+                }
+                return nullptr;
+            };
+
+            auto ComputeDepth = [](UClass* Child, UClass* Parent) -> int32
+            {
+                if (!Child || !Parent) return MAX_int32;
+                if (!Child->IsChildOf(Parent)) return MAX_int32;
+                int32 Depth = 0;
+                UClass* C = Child;
+                while (C && C != Parent)
+                {
+                    C = C->GetSuperClass();
+                    ++Depth;
+                }
+                return Depth; // 0 表示完全相同，越小越具体
+            };
+
+            // 先尽力解析出 ProvidedOwner（用任一变体的定义尝试解析）
+            for (int32 idx = 0; idx < Storage.MCPToolVariants.Num() && ProvidedOwner == nullptr; ++idx)
+            {
+                const FMCPTool& Variant = Storage.MCPToolVariants[idx];
+                AActor* TryOwner = nullptr;
+                if (UMCPToolBlueprintLibrary::GetActorValue(Variant, TEXT("Owner"), Request.Json, TryOwner) && TryOwner)
+                {
+                    ProvidedOwner = TryOwner;
+                }
             }
+
+            if (ProvidedOwner)
+            {
+                UClass* ProvidedOwnerClass = ProvidedOwner->GetClass();
+                // 选择与 ProvidedOwnerClass 最接近的父类/本类定义
+                for (int32 idx = 0; idx < Storage.RouteDelegates.Num(); ++idx)
+                {
+                    const FMCPTool& Variant = Storage.MCPToolVariants.IsValidIndex(idx) ? Storage.MCPToolVariants[idx] : Storage.MCPTool;
+                    UClass* OwnerClassInVariant = GetOwnerClassFromVariant(Variant);
+                    const int32 Depth = ComputeDepth(ProvidedOwnerClass, OwnerClassInVariant);
+                    if (Depth < BestDepth)
+                    {
+                        BestDepth = Depth;
+                        BestIdx = idx;
+                    }
+                }
+
+                if (BestIdx != INDEX_NONE)
+                {
+                    FMCPRouteDelegate& Delegate = Storage.RouteDelegates[BestIdx];
+                    if (Delegate.IsBound())
+                    {
+                        UMCPToolHandle* MCPToolHandle = UMCPToolHandle::initToolHandle(id, SessionId, this, ProgressToken);
+                        const FMCPTool& ToolVariant = Storage.MCPToolVariants.IsValidIndex(BestIdx) ? Storage.MCPToolVariants[BestIdx] : Storage.MCPTool;
+                        UE_LOG(LogTemp, Verbose, TEXT("tools/call: Selected variant %d for tool %s (Owner=%s, Depth=%d)"), BestIdx, *ToolName, *GetNameSafe(ProvidedOwner), BestDepth);
+                        // 校验 Actor 参数
+                        TArray<FString> BadParams;
+                        if (!ValidateVariant(ToolVariant, BadParams))
+                        {
+                            const FString Msg = FString::Printf(TEXT("工具参数错误：以下 Actor 参数无效或类型不匹配：%s"), *FString::Join(BadParams, TEXT(", ")));
+                            UE_LOG(LogTemp, Warning, TEXT("tools/call validation failed: %s"), *Msg);
+                            if (MCPToolHandle)
+                            {
+                                MCPToolHandle->ToolCallbackRaw(true, Msg, true, -1, -1);
+                            }
+                            Num = 1; // 已处理（错误回调），不再进入后续委托
+                        }
+                        else
+                        {
+                            Delegate.ExecuteIfBound(Request.Json, MCPToolHandle, ToolVariant);
+                            Num = 1;
+                        }
+                    }
+                }
+            }
+
+            // 如果无法解析 Owner 或未找到任何匹配项，则回退：
+            if (Num == 0)
+            {
+                // 1) 优先回退到“父类”定义（无法判断时取第一个可用委托）
+                for (int32 idx = 0; idx < Storage.RouteDelegates.Num() && Num == 0; ++idx)
+                {
+                    FMCPRouteDelegate& Delegate = Storage.RouteDelegates[idx];
+                    if (Delegate.IsBound())
+                    {
+                        UMCPToolHandle* MCPToolHandle = UMCPToolHandle::initToolHandle(id, SessionId, this, ProgressToken);
+                        const FMCPTool& ToolVariant = Storage.MCPToolVariants.IsValidIndex(idx) ? Storage.MCPToolVariants[idx] : Storage.MCPTool;
+                        UE_LOG(LogTemp, Verbose, TEXT("tools/call: Fallback to variant %d for tool %s"), idx, *ToolName);
+                        // 校验 Actor 参数
+                        TArray<FString> BadParams;
+                        if (!ValidateVariant(ToolVariant, BadParams))
+                        {
+                            const FString Msg = FString::Printf(TEXT("工具参数错误：以下 Actor 参数无效或类型不匹配：%s"), *FString::Join(BadParams, TEXT(", ")));
+                            UE_LOG(LogTemp, Warning, TEXT("tools/call validation failed (fallback): %s"), *Msg);
+                            if (MCPToolHandle)
+                            {
+                                MCPToolHandle->ToolCallbackRaw(true, Msg, true, -1, -1);
+                            }
+                            Num = 1; // 已处理错误
+                        }
+                        else
+                        {
+                            Delegate.ExecuteIfBound(Request.Json, MCPToolHandle, ToolVariant);
+                            Num = 1;
+                        }
+                    }
+                }
+            }
+
         	if (Num == 0)
         	{	// TODO::这里需要逐个检测有效性并删除
         		// 说明没有有效工具绑定，删除mcptools中的数据，并返回一个错误响应
@@ -745,7 +958,7 @@ void UMCPTransportSubsystem::StartMCPServer()
 	FMCPTool Tool2;
 	Tool2.Name = TEXT("QueryTool");
 	Tool2.Description = TEXT("根据工具查询所有可用对象");
-	UMCPToolProperty *Property2 = UMCPToolPropertyString::CreateStringProperty(TEXT("ToolName"), TEXT("要查询的工具名称"));
+	UMCPToolProperty *Property2 = UMCPToolPropertyString::CreateStringProperty(TEXT("ToolName"), TEXT("要查询的mcp工具名称"));
 	Tool2.Properties.Add(Property2);
 	// 创建调用回调的动态委托
 	FMCPRouteDelegate MCPRouteDelegate2;
@@ -1137,7 +1350,8 @@ TArray<AActor*> UMCPToolPropertyActorPtr::FindActors()
     {
         if (IsValid(Actor))
         {
-            ActorMap.Add(Actor->GetName(), Actor);
+        	//应该存actor在场景中的用户设置的名字，可读可理解的名字
+        	ActorMap.Add(Actor->GetName(), Actor);
             UE_LOG(LogTemp, Verbose, TEXT("FindActors: Found actor %s"), *Actor->GetName());
         }
     }
@@ -1151,11 +1365,13 @@ TArray<AActor*> UMCPToolPropertyActorPtr::FindActors()
 UMCPToolProperty* UMCPToolPropertyActorPtr::CreateActorPtrProperty(FString InName, FString InDescription,
 	TSubclassOf<AActor> InActorClass)
 {
+	UE_LOG(LogTemp, Log, TEXT("CreateActorPtrProperty: InActorClass=%s"), InActorClass ? *InActorClass->GetName() : TEXT("<null>"));
 	UMCPToolPropertyActorPtr* Property = NewObject<UMCPToolPropertyActorPtr>();
 	Property->Name = InName;
 	Property->Type = EMCPJsonType::String;
 	Property->Description = InDescription;
 	Property->ActorClass = InActorClass;
+	UE_LOG(LogTemp, Log, TEXT("CreateActorPtrProperty: Stored ActorClass=%s"), Property->ActorClass ? *Property->ActorClass->GetName() : TEXT("<null>"));
 	Property->FindActors();
 	
 	return Property;
@@ -1342,7 +1558,7 @@ void UMCPToolBlueprintLibrary::AddProperty(FMCPTool& MCPTool, UMCPToolProperty* 
 	}
 }
 
-UMCPToolHandle* UMCPToolHandle::initToolHandle(int _id, const FString& _SessionID ,UMCPTransportSubsystem* _subsystem)
+UMCPToolHandle* UMCPToolHandle::initToolHandle(int _id, const FString& _SessionID ,UMCPTransportSubsystem* _subsystem, const FString& InProgressToken)
 {
     if (_id >= 1 && _subsystem != nullptr) {
 
@@ -1355,54 +1571,98 @@ UMCPToolHandle* UMCPToolHandle::initToolHandle(int _id, const FString& _SessionI
         Handle->MCPTransportSubsystem = _subsystem;
 
         Handle->SessionId = _SessionID;
+        Handle->ProgressToken = InProgressToken;
 
         return Handle;
     }
     return nullptr;
 }
 
-void UMCPToolHandle::ToolCallback(bool isError, FString text)
+// void UMCPToolHandle::ToolCallback(bool isError, FString text)
+// {
+// 	// 触发工具回调
+// 	if (MCPTransportSubsystem != nullptr && MCPid >= 0 && SessionId != "none") {
+//         // 构建通用部分
+// 		FString JsonMessage;
+// 		TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
+// 		// 设置基本字段
+// 		RootObject->SetStringField("jsonrpc", "2.0");
+// 		RootObject->SetNumberField("id", MCPid);
+// 		// 构建 result 对象
+// 		TSharedPtr<FJsonObject> ResultObject = MakeShareable(new FJsonObject);
+// 		// 构建 content 数组
+// 		TArray<TSharedPtr<FJsonValue>> ContentArray;
+// 		// 构建 content 对象
+// 		TSharedPtr<FJsonObject> ContentObject = MakeShareable(new FJsonObject);
+// 		// 构建 text 对象
+// 		TSharedPtr<FJsonObject> TextObject = MakeShareable(new FJsonObject);
+// 		TextObject->SetStringField("type", "text");
+// 		TextObject->SetStringField("text", text);
+// 		// 将 text 对象添加到 content 数组
+// 		ContentArray.Add(MakeShareable(new FJsonValueObject(TextObject)));
+// 		// 将 content 数组添加到 result 对象
+// 		ResultObject->SetArrayField("content", ContentArray);
+// 		// 设置 isError
+// 		ResultObject->SetBoolField("isError", isError);
+// 		// 将 result 添加到根对象
+// 		RootObject->SetObjectField("result", ResultObject);
+// 		// 序列化为字符串
+// 		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonMessage);
+// 		FJsonSerializer::Serialize(RootObject.ToSharedRef(), Writer);
+// 		// 先剔除所有的换行符
+// 		JsonMessage.ReplaceInline(TEXT("\n"), TEXT(""));
+// 		JsonMessage.ReplaceInline(TEXT("\r"), TEXT(""));
+// 		JsonMessage.ReplaceInline(TEXT("\t"), TEXT(""));
+// 		//JsonMessage += "\n\n";
+//
+//         // 通��子系统发送消息
+// 		MCPTransportSubsystem->SendSSE(SessionId, TEXT("message"), JsonMessage);
+//
+// 	}
+// }
+
+void UMCPToolHandle::ToolCallbackRaw(bool isError, const FString& text, bool bFinal, int32 Completed, int32 Total)
 {
-	// 触发工具回调
-	if (MCPTransportSubsystem != nullptr && MCPid >= 0 && SessionId != "none") {
-        // 构建通用部分
-		FString JsonMessage;
-		TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
-		// 设置基本字段
-		RootObject->SetStringField("jsonrpc", "2.0");
-		RootObject->SetNumberField("id", MCPid);
-		// 构建 result 对象
-		TSharedPtr<FJsonObject> ResultObject = MakeShareable(new FJsonObject);
-		// 构建 content 数组
-		TArray<TSharedPtr<FJsonValue>> ContentArray;
-		// 构建 content 对象
-		TSharedPtr<FJsonObject> ContentObject = MakeShareable(new FJsonObject);
-		// 构建 text 对象
-		TSharedPtr<FJsonObject> TextObject = MakeShareable(new FJsonObject);
-		TextObject->SetStringField("type", "text");
-		TextObject->SetStringField("text", text);
-		// 将 text 对象添加到 content 数组
-		ContentArray.Add(MakeShareable(new FJsonValueObject(TextObject)));
-		// 将 content 数组添加到 result 对象
-		ResultObject->SetArrayField("content", ContentArray);
-		// 设置 isError
-		ResultObject->SetBoolField("isError", isError);
-		// 将 result 添加到根对象
-		RootObject->SetObjectField("result", ResultObject);
-		// 序列化为字符串
-		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonMessage);
-		FJsonSerializer::Serialize(RootObject.ToSharedRef(), Writer);
-		// 先剔除所有的换行符
-		JsonMessage.ReplaceInline(TEXT("\n"), TEXT(""));
-		JsonMessage.ReplaceInline(TEXT("\r"), TEXT(""));
-		JsonMessage.ReplaceInline(TEXT("\t"), TEXT(""));
-		//JsonMessage += "\n\n";
+	if (!MCPTransportSubsystem || MCPid < 0 || SessionId == "none") return;
 
-        // 通��子系统发送消息
-		MCPTransportSubsystem->SendSSE(SessionId, TEXT("message"), JsonMessage);
+	FString JsonMessage;
+	TSharedPtr<FJsonObject> Root = MakeShareable(new FJsonObject);
+	Root->SetStringField("jsonrpc", "2.0");
 
+	if (bFinal) {
+		// == 原来的 result 路径 ==
+		Root->SetNumberField("id", MCPid);
+		TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject);
+		TArray<TSharedPtr<FJsonValue>> Content;
+		TSharedPtr<FJsonObject> TextObj = MakeShareable(new FJsonObject);
+		TextObj->SetStringField("type", "text");
+		TextObj->SetStringField("text", text);
+		Content.Add(MakeShareable(new FJsonValueObject(TextObj)));
+		Result->SetArrayField("content", Content);
+		Result->SetBoolField("isError", isError);
+		Root->SetObjectField("result", Result);
+	} else {
+		// == 进度通知（符合 MCP notifications/progress 规范）==
+		Root->SetStringField("method", "notifications/progress");
+		TSharedPtr<FJsonObject> Params = MakeShareable(new FJsonObject);
+		if (!ProgressToken.IsEmpty())
+		{
+			Params->SetStringField("progressToken", ProgressToken);
+		}
+		// 按规范：顶层包含 progress、total（可选）与 message（可选）
+		if (Completed >= 0) { Params->SetNumberField("progress", Completed); }
+		if (Total >= 0)     { Params->SetNumberField("total", Total); }
+		Params->SetStringField("message", text);
+		Root->SetObjectField("params", Params);
 	}
+
+	TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&JsonMessage);
+	FJsonSerializer::Serialize(Root.ToSharedRef(), W);
+	JsonMessage.ReplaceInline(TEXT("\n"), TEXT("")); JsonMessage.ReplaceInline(TEXT("\r"), TEXT("")); JsonMessage.ReplaceInline(TEXT("\t"), TEXT(""));
+
+	MCPTransportSubsystem->SendSSE(SessionId, TEXT("message"), JsonMessage); 
 }
+
 
 void UMCPToolHandle::ToolCallback(bool isError, TSharedPtr<FJsonObject> json)
 {

@@ -74,7 +74,7 @@ public:
 
     // 组件调试日志默认开关
     UPROPERTY(EditAnywhere, Config, Category="Debug")
-    bool bComponentDebugLogsDefault = true;
+    bool bComponentDebugLogsDefault = false;
 
     // ========== 新增：流程音频（UStreamProcSoundWave）默认配置 ==========
     UPROPERTY(EditAnywhere, Config, Category="Audio")

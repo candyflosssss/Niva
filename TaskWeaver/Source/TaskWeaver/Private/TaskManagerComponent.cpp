@@ -7,7 +7,7 @@
 
 UTaskManagerComponent::UTaskManagerComponent(){ PrimaryComponentTick.bCanEverTick = true; }
 void UTaskManagerComponent::BeginPlay(){ Super::BeginPlay(); RegisterMcpTools(); }
-void UTaskManagerComponent::EndPlay(const EEndPlayReason::Type Reason){ ClearTasks(); Super::EndPlay(Reason); }
+void UTaskManagerComponent::EndPlay(const EEndPlayReason::Type Reason){ ClearTasks(); bMcpToolsRegistered = false; RegisteredToolNames.Empty(); McpTaskTools.Empty(); Super::EndPlay(Reason); }
 
 void UTaskManagerComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
@@ -30,12 +30,13 @@ void UTaskManagerComponent::AddTask(UTaskBase* Task)
 
 void UTaskManagerComponent::ClearTasks()
 {
+	// 发起对当前任务的取消，但等待其在 Tick 中完成善后后再切换
 	if (CurrentTask && !CurrentTask->IsFinished())
 	{
 		CurrentTask->Cancel(this);
-		CurrentTask = nullptr;
 	}
 
+	// 取消并清空队列中未开始的任务
 	for (TObjectPtr<UTaskBase>& T : TaskQueue)
 	{
 		if (T && !T->IsFinished())
@@ -43,9 +44,87 @@ void UTaskManagerComponent::ClearTasks()
 			T->Cancel(this);
 		}
 	}
-
 	TaskQueue.Empty();
 }
+
+void UTaskManagerComponent::CancelCurrentTask()
+{
+	if (CurrentTask && !CurrentTask->IsFinished())
+	{
+		CurrentTask->Cancel(this);
+	}
+}
+
+// 本地辅助：将键值对序列化为 JSON 风格对象字符串（值做转义）
+static FString TW_KvToJsonObject(const TMap<FString, FString>& KVs)
+{
+	FString Out(TEXT("{")); bool bFirst = true;
+	for (const auto& It : KVs)
+	{
+		if (!bFirst) Out += TEXT(", "); bFirst = false;
+		const FString KeyEsc = It.Key.ReplaceCharWithEscapedChar();
+		const FString ValEsc = It.Value.ReplaceCharWithEscapedChar();
+		Out += FString::Printf(TEXT("\"%s\":\"%s\""), *KeyEsc, *ValEsc);
+	}
+	Out += TEXT("}");
+	return Out;
+}
+
+// 将任务转为 JSON 风格文本（调用任务的可视化导出钩子）
+static FString TW_TaskToText(const UTaskBase* Task)
+{
+	if (!Task) return TEXT("{}");
+	TMap<FString, FString> KVs;
+	const_cast<UTaskBase*>(Task)->BuildVisualizationPairs(KVs);
+	if (!KVs.Contains(TEXT("name")))
+	{
+		KVs.Add(TEXT("name"), Task->GetClass()->GetName());
+	}
+	return TW_KvToJsonObject(KVs);
+}
+
+void UTaskManagerComponent::AddTaskImmediate(UTaskBase* Task, bool bHardAbort /*= false*/)
+{
+	if (!Task) return;
+
+	const bool bHasRunning = (CurrentTask && !CurrentTask->IsFinished());
+	if (bHasRunning)
+	{
+		// 默认仅发起取消，等待优雅结束
+		CurrentTask->Cancel(this);
+	}
+
+	// 插到队列最前
+	TaskQueue.Insert(Task, 0);
+
+	if (!CurrentTask)
+	{
+		// 空闲则立即启动
+		PopAndStartNext();
+		return;
+	}
+
+	if (bHardAbort)
+	{
+		// 警告：硬中断会违背“善后”约束，仅在确需时使用
+		UE_LOG(LogTemp, Warning, TEXT("[TaskWeaver] HARD ABORT current task to start immediate task: %s"), *Task->GetName());
+		CurrentTask = nullptr;
+		PopAndStartNext();
+	}
+}
+
+FString UTaskManagerComponent::GetQueueText() const
+{
+	FString Out(TEXT("[")); bool bFirst = true;
+	for (const TObjectPtr<UTaskBase>& T : TaskQueue)
+	{
+		if (!bFirst) Out += TEXT(", "); bFirst = false;
+		Out += TW_TaskToText(T.Get());
+	}
+	Out += TEXT("]");
+	return Out;
+}
+
 void UTaskManagerComponent::PopAndStartNext()
 {
 	if (TaskQueue.Num()==0) return;
@@ -60,6 +139,7 @@ void UTaskManagerComponent::PopAndStartNext()
 
 void UTaskManagerComponent::RegisterMcpTools()
 {
+
 	UWorld* World = GetWorld();
 	if (!World) return;
 	UGameInstance* GI = World->GetGameInstance();
@@ -83,19 +163,31 @@ void UTaskManagerComponent::RegisterMcpTools()
 		if (!CDO->ShouldCreateMcpTool(this)) continue;
 
 		const FString ToolName = Cls->GetName();
-		if (RegisteredToolNames.Contains(ToolName))
-		{
-			continue; // 本组件已注册过同名工具，跳过
-		}
+		// if (RegisteredToolNames.Contains(ToolName))
+		// {
+		// 	continue; // 本组件已注册过同名工具，跳过
+		// }
 
 		FMCPTool Tool;
 		Tool.Name = ToolName;
 		Tool.Description = FString::Printf(TEXT("TaskWeaver task: %s"), *Tool.Name);
 
 		// 添加 Owner 参数（Actor 指针类型），用于调用时指定本组件的拥有者
+		UClass* OwnerClass = GetOwner() ? GetOwner()->GetClass() : AActor::StaticClass();
+		UE_LOG(LogTemp, Verbose, TEXT("[TaskWeaver] Register tool '%s' with OwnerClass=%s"), *ToolName, *GetNameSafe(OwnerClass));
 		UMCPToolProperty* OwnerProp = UMCPToolPropertyActorPtr::CreateActorPtrProperty(
-			TEXT("Owner"), TEXT("UTaskManagerComponent Owner Actor"), AActor::StaticClass()
+			TEXT("Owner"), TEXT("UTaskManagerComponent Owner Actor"), OwnerClass
 		);
+		// // Restrict Owner selection to this exact owner to prevent mismatches when multiple actors share the same class
+		// if (AActor* OwnerActor = GetOwner())
+		// {
+		// 	if (UMCPToolPropertyActorPtr* OwnerPropC = Cast<UMCPToolPropertyActorPtr>(OwnerProp))
+		// 	{
+		// 		OwnerPropC->ActorClass = OwnerActor->GetClass();
+		// 		OwnerPropC->ActorMap.Empty();
+		// 		OwnerPropC->ActorMap.Add(OwnerActor->GetName(), OwnerActor);
+		// 	}
+		// }
 		Tool.Properties.Add(OwnerProp);
 
 		// 由任务声明自身所需的 MCP 参数（只添加必要的参数）
@@ -116,6 +208,8 @@ void UTaskManagerComponent::RegisterMcpTools()
 	{
 		URefreshMCPClientAsyncAction::RefreshMCPClient(this);
 	}
+	// 标记本组件已完成一次注册尝试，避免重复注册
+	bMcpToolsRegistered = true;
 }
 
 void UTaskManagerComponent::OnMcpToolCalled(const FString& Result, UMCPToolHandle* MCPToolHandle, const FMCPTool& MCPTool)
@@ -124,20 +218,29 @@ void UTaskManagerComponent::OnMcpToolCalled(const FString& Result, UMCPToolHandl
 	AActor* ProvidedOwner = nullptr;
 	if (!UMCPToolBlueprintLibrary::GetActorValue(MCPTool, TEXT("Owner"), Result, ProvidedOwner) || ProvidedOwner == nullptr)
 	{
-		if (MCPToolHandle) MCPToolHandle->ToolCallback(true, TEXT("Missing or invalid Owner parameter"));
+		// 静默忽略：不是本组件的调用，不做回调
+		UE_LOG(LogTemp, Verbose, TEXT("[TaskWeaver] Ignore MCP call: missing/invalid Owner (tool=%s, comp=%s)"), *MCPTool.Name, *GetName());
 		return;
 	}
+	UE_LOG(LogTemp, Verbose, TEXT("[TaskWeaver] OnMcpToolCalled Owner check: ProvidedOwner=%s (%s), ThisOwner=%s (%s)"),
+		*GetNameSafe(ProvidedOwner),
+		ProvidedOwner ? *ProvidedOwner->GetClass()->GetName() : TEXT("<null>"),
+		*GetNameSafe(GetOwner()),
+		GetOwner() ? *GetOwner()->GetClass()->GetName() : TEXT("<null>"));
 	if (ProvidedOwner != GetOwner())
 	{
-		if (MCPToolHandle) MCPToolHandle->ToolCallback(true, TEXT("Owner mismatch for this TaskManagerComponent"));
-		return;
+		// 仅接受指针严格相等的 Owner，避免多组件/重名误命中
+		UE_LOG(LogTemp, Verbose, TEXT("[TaskWeaver] Ignore MCP call: owner mismatch (Provided=%s, Expected=%s, tool=%s)"),
+			*GetNameSafe(ProvidedOwner), *GetNameSafe(GetOwner()), *MCPTool.Name);
+		return; // 静默忽略
 	}
 
 	// 根据工具名称找到 Task 子类，并创建实例入队
 	TSubclassOf<UTaskBase>* Found = McpTaskTools.Find(MCPTool.Name);
 	if (!Found || !(*Found))
 	{
-		if (MCPToolHandle) MCPToolHandle->ToolCallback(true, TEXT("Unknown TaskWeaver tool"));
+		// 静默忽略：该组件未注册此工具名
+		UE_LOG(LogTemp, Verbose, TEXT("[TaskWeaver] Ignore MCP call: unknown tool on this component. Tool=%s This=%s"), *MCPTool.Name, *GetName());
 		return;
 	}
 

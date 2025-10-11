@@ -92,8 +92,29 @@ private:
     FString ActiveWsTargetKey;
     int32 ActiveWsSampleRate = 16000;
     int32 ActiveWsChannels = 1;
+
+    // 新增：/run 成功后持有的信息，供 /stream/{task_id} 使用
+    FString ActiveTaskId;
+    FString ActiveHttpHost; // host:port
+    bool bActiveUseHttps = false; // 是否使用 https/http
+
     void ConnectWebSocket(const FString& Url);
     void CloseWebSocket();
+
+    // 新增：主动发送POST到 /run，然后建立WS连接
+    UFUNCTION(BlueprintCallable, Category="AudioStream")
+    void StartRunAndConnect(const FString& ServerHostWithPort = TEXT("127.0.0.1:8001"),
+                            const FString& CallbackUrl = TEXT(""),
+                            const FString& TargetKey = TEXT(""),
+                            int32 SampleRate = 16000,
+                            int32 Channels = 1,
+                            bool bUseHttps = false,
+                            const FString& HttpRunPath = TEXT("/run"),
+                            const FString& WsPathPrefix = TEXT("/ws/"));
+
+    // 新增：第3步：向 /stream/{task_id} 推送文本块
+    UFUNCTION(BlueprintCallable, Category="AudioStream")
+    void PostStreamText(const FString& Text);
 
     // 统计
     void UpdateStats(int32 PcmBytes, int32 SampleRate, int32 Channels);

@@ -22,6 +22,9 @@
 #include "Containers/Ticker.h"
 
 #include "Engine/NetConnection.h"
+#include "HttpModule.h"
+#include "Interfaces/IHttpRequest.h"
+#include "Interfaces/IHttpResponse.h"
 
 // 进程级：最近一次成功HELLO的服务器IP（用于换房间/跨服务器时触发重新注册）
 static FString GLastHelloServerIp;
@@ -231,13 +234,10 @@ bool UAudioStreamHttpWsSubsystem::StartHttpListener(int32 /*Port*/)
         FNetworkCoreHttpServerDelegate D1; D1.BindUFunction(this, FName(TEXT("HandleAudioPush_NCP")));
         Core->BindRoute(TEXT("/audio/push"), ENivaHttpRequestVerbs::POST, D1);
 
-        FNetworkCoreHttpServerDelegate D2; D2.BindUFunction(this, FName(TEXT("HandleTaskStart_NCP")));
-        Core->BindRoute(TEXT("/task/start"), ENivaHttpRequestVerbs::POST, D2);
-
         FNetworkCoreHttpServerDelegate D3; D3.BindUFunction(this, FName(TEXT("HandleAudioStats_NCP")));
         Core->BindRoute(TEXT("/audio/stats"), ENivaHttpRequestVerbs::GET, D3);
         bHttpStarted = true;
-        UE_LOG(LogTemp, Log, TEXT("[AudioStream] HTTP routes bound: /audio/push, /task/start, /audio/stats"));
+        UE_LOG(LogTemp, Log, TEXT("[AudioStream] HTTP routes bound: /audio/push, /audio/stats (client handles /run as POST)"));
         return true;
     }
     UE_LOG(LogTemp, Verbose, TEXT("[AudioStream] NetworkCoreSubsystem not found, skip HTTP routes"));
@@ -273,6 +273,21 @@ bool UAudioStreamHttpWsSubsystem::RegisterComponent(UAudioStreamHttpWsComponent*
     ComponentMap.Add(UseKey, Comp);
     OutKey = UseKey;
     UE_LOG(LogTemp, Log, TEXT("[AudioStream] Component registered key=%s, total=%d"), *UseKey, ComponentMap.Num());
+
+    // If this is the first component, auto start the TTS flow: POST /run then connect WS using settings
+    if (ComponentMap.Num() == 1)
+    {
+        const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
+        const FString Host = S ? S->DefaultWsHost : TEXT("127.0.0.1:8001");
+        const bool bHttps = (S && S->DefaultWsScheme.Equals(TEXT("wss"), ESearchCase::IgnoreCase));
+        const int32 SR = S ? S->DefaultSampleRate : 16000;
+        const int32 CH = S ? S->DefaultChannels : 1;
+        const FString RunPath = TEXT("/run");
+        const FString WsPrefix = S ? S->DefaultWsPathPrefix : TEXT("/ws/");
+        UE_LOG(LogTemp, Log, TEXT("[AudioStream] First component added -> auto StartRunAndConnect (host=%s, scheme=%s, sr=%d, ch=%d, key=%s)"), *Host, bHttps?TEXT("wss"):TEXT("ws"), SR, CH, *UseKey);
+        StartRunAndConnect(Host, TEXT(""), UseKey, SR, CH, bHttps, RunPath, WsPrefix);
+    }
+
     return true;
 }
 
@@ -1141,6 +1156,21 @@ void UAudioStreamHttpWsSubsystem::ConnectWebSocket(const FString& Url)
             return;
         }
 
+        // Handle terminal status message: { "status": "completed" }
+        FString StatusStr;
+        if (RootObj->TryGetStringField(TEXT("status"), StatusStr))
+        {
+            if (StatusStr.Equals(TEXT("completed"), ESearchCase::IgnoreCase))
+            {
+                UE_LOG(LogTemp, Log, TEXT("WS status=completed -> closing WebSocket"));
+                AsyncTask(ENamedThreads::GameThread, [P]()
+                {
+                    if (P) { P->CloseWebSocket(); }
+                });
+                return;
+            }
+        }
+
         FString Type; RootObj->TryGetStringField(TEXT("type"), Type);
         FString MsgKey; RootObj->TryGetStringField(TEXT("key"), MsgKey); if (MsgKey.IsEmpty()) RootObj->TryGetStringField(TEXT("role_id"), MsgKey);
         const FString Key = ResolveTargetKeyOrFallback(P->ComponentMap, MsgKey, P->ActiveWsTargetKey);
@@ -1522,7 +1552,7 @@ FNivaHttpResponse UAudioStreamHttpWsSubsystem::HandleTaskStart_NCP(FNivaHttpRequ
 
             int32 Tmp;
             if (RootObj->TryGetNumberField(TEXT("sample_rate"), Tmp)) InSampleRate = Tmp;
-            if (RootObj->TryGetNumberField(TEXT("channels"), Tmp)) InChannels = Tmp;
+            if (RootObj->TryGetNumberField(TEXT("channels"), Tmp)) InChannels = Tmp;    
         }
         else
         {
@@ -1561,27 +1591,43 @@ FNivaHttpResponse UAudioStreamHttpWsSubsystem::HandleTaskStart_NCP(FNivaHttpRequ
             if (!PathPrefix.StartsWith(TEXT("/"))) PathPrefix = TEXT("/") + PathPrefix;
             if (!PathPrefix.EndsWith(TEXT("/")))  PathPrefix += TEXT("/");
             WsUrl = FString::Printf(TEXT("%s://%s%s%s"), *Scheme, *Host, *PathPrefix, *TaskId);
+            // 也更新用于状态记录的字段
+            WsScheme = Scheme;
+            WsHost = Host;
+            WsPathPrefix = PathPrefix;
         }
     }
     if (WsUrl.IsEmpty())
     {
         return UNetworkCoreSubsystem::MakeResponse(TEXT("Missing ws_url or task_id"), TEXT("text/plain"), 400);
     }
+    // 如果未提供 key，则回退为当前活动/唯一组件键
     if (TargetKey.IsEmpty())
     {
-        return UNetworkCoreSubsystem::MakeResponse(TEXT("Missing key (or role_id)"), TEXT("text/plain"), 400);
+        const FString FallbackKey = ResolveTargetKeyOrFallback(ComponentMap, FString(), ActiveWsTargetKey);
+        if (!FallbackKey.IsEmpty())
+        {
+            TargetKey = FallbackKey;
+        }
+        else
+        {
+            return UNetworkCoreSubsystem::MakeResponse(TEXT("Missing key (or role_id) and no fallback available"), TEXT("text/plain"), 400);
+        }
     }
 
     // 放宽：组件不存在也允许启动WS，用于服务器仅分发/回环自播
     TWeakObjectPtr<UAudioStreamHttpWsComponent>* Found = ComponentMap.Find(TargetKey);
     if (!Found || !Found->IsValid())
     {
-        UE_LOG(LogTemp, Warning, TEXT("/task/start: Component not found for key=%s, will still start WS for UDP-only distribution"), *TargetKey);
+        UE_LOG(LogTemp, Warning, TEXT("/task/start(parse): Component not found for key=%s, will still start WS for UDP-only distribution"), *TargetKey);
     }
 
     ActiveWsTargetKey = TargetKey;
     ActiveWsSampleRate = InSampleRate;
     ActiveWsChannels = InChannels;
+    ActiveTaskId = TaskId;
+    ActiveHttpHost = WsHost;
+    bActiveUseHttps = WsScheme.Equals(TEXT("wss"), ESearchCase::IgnoreCase);
 
     AsyncTask(ENamedThreads::GameThread, [this, WsUrl]()
     {
@@ -1589,7 +1635,7 @@ FNivaHttpResponse UAudioStreamHttpWsSubsystem::HandleTaskStart_NCP(FNivaHttpRequ
         ConnectWebSocket(WsUrl);
     });
 
-    UE_LOG(LogTemp, Log, TEXT("/task/start ok: key=%s task_id=%s ws_url=%s sr=%d ch=%d"), *TargetKey, *TaskId, *WsUrl, ActiveWsSampleRate, ActiveWsChannels);
+    UE_LOG(LogTemp, Log, TEXT("/task/start ok(parse): key=%s task_id=%s ws_url=%s sr=%d ch=%d"), *TargetKey, *TaskId, *WsUrl, ActiveWsSampleRate, ActiveWsChannels);
 
     TSharedRef<FJsonObject> OkObj = MakeShared<FJsonObject>();
     OkObj->SetStringField(TEXT("status"), TEXT("starting"));
@@ -1825,4 +1871,181 @@ void UAudioStreamHttpWsSubsystem::DumpState(const FString& Reason) const
     UE_LOG(LogTemp, Log, TEXT("[AudioStream][Dump] mediaClients=%d -> [%s]"), MediaClients.Num(), *FString::Join(ClientStrs, TEXT(", ")));
     UE_LOG(LogTemp, Log, TEXT("[AudioStream][Dump] streams(server=%d, client=%d) nextStreamId=%u subStreams=%d pendingKeySubs=%d"), ServerStreamCount, ClientStreamCount, (unsigned)NextStreamId, SubStreamCount, PendingKeySubCount);
     UE_LOG(LogTemp, Log, TEXT("[AudioStream][Dump] stats: sec=%.3f frames=%lld bytes=%lld visemes=%lld liveLog=%d"), Sec, Frames, Bytes, Vis, bStatsLiveLog?1:0);
+}
+
+
+// 主动向 TTS 服务 /run 发送 POST，获取 task_id 后连接 WebSocket /ws/<task_id>
+void UAudioStreamHttpWsSubsystem::StartRunAndConnect(const FString& ServerHostWithPort,
+                                                    const FString& CallbackUrl,
+                                                    const FString& TargetKey,
+                                                    int32 SampleRate,
+                                                    int32 Channels,
+                                                    bool bUseHttps,
+                                                    const FString& HttpRunPath,
+                                                    const FString& WsPathPrefix)
+{
+    // Merge with settings
+    const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
+
+    FString Host = ServerHostWithPort;
+    if (Host.IsEmpty() && S) Host = S->DefaultWsHost;
+    if (Host.IsEmpty()) Host = TEXT("127.0.0.1:8001");
+
+    FString RunPath = HttpRunPath.IsEmpty() ? TEXT("/run") : HttpRunPath;
+    if (!RunPath.StartsWith(TEXT("/"))) RunPath = TEXT("/") + RunPath;
+
+    FString WsPrefix = WsPathPrefix;
+    if (WsPrefix.IsEmpty() && S) WsPrefix = S->DefaultWsPathPrefix;
+    if (WsPrefix.IsEmpty()) WsPrefix = TEXT("/ws/");
+
+    int32 SR = (SampleRate > 0) ? SampleRate : (S ? S->DefaultSampleRate : 16000);
+    int32 CH = (Channels > 0) ? Channels : (S ? S->DefaultChannels : 1);
+
+    // If caller didn't explicitly request HTTPS, follow settings' scheme
+    const bool bUseHttpsFinal = bUseHttps || (S && S->DefaultWsScheme.Equals(TEXT("wss"), ESearchCase::IgnoreCase));
+    const FString HttpScheme = bUseHttpsFinal ? TEXT("https") : TEXT("http");
+
+    // Key fallback
+    FString KeyCopy = TargetKey;
+    if (KeyCopy.IsEmpty())
+    {
+        KeyCopy = ResolveTargetKeyOrFallback(ComponentMap, FString(), ActiveWsTargetKey);
+    }
+
+    const FString HttpUrl = FString::Printf(TEXT("%s://%s%s"), *HttpScheme, *Host, *RunPath);
+
+    TSharedRef<FJsonObject> BodyObj = MakeShared<FJsonObject>();
+    if (!CallbackUrl.IsEmpty())
+    {
+        BodyObj->SetStringField(TEXT("callback_url"), CallbackUrl);
+    }
+    FString BodyStr;
+    {
+        TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&BodyStr);
+        FJsonSerializer::Serialize(BodyObj, Writer);
+    }
+
+    TWeakObjectPtr<UAudioStreamHttpWsSubsystem> Self = this;
+
+    TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = FHttpModule::Get().CreateRequest();
+    Req->SetURL(HttpUrl);
+    Req->SetVerb(TEXT("POST"));
+    Req->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+    Req->SetContentAsString(BodyStr.IsEmpty() ? TEXT("{}") : BodyStr);
+    UE_LOG(LogTemp, Log, TEXT("[AudioStream] POST %s ... body=%s"), *HttpUrl, *BodyStr);
+
+    Req->OnProcessRequestComplete().BindLambda([Self, Host, WsPrefix, SR, CH, KeyCopy, bUseHttpsFinal](FHttpRequestPtr /*Request*/, FHttpResponsePtr Response, bool bSucceeded)
+    {
+        if (!Self.IsValid()) return;
+        if (!bSucceeded || !Response.IsValid())
+        {
+            UE_LOG(LogTemp, Error, TEXT("[AudioStream] /run POST failed (request error)"));
+            return;
+        }
+        const int32 Code = Response->GetResponseCode();
+        const FString Content = Response->GetContentAsString();
+        if (Code < 200 || Code >= 300)
+        {
+            UE_LOG(LogTemp, Error, TEXT("[AudioStream] /run POST non-2xx: %d content=%s"), Code, *Content);
+            return;
+        }
+
+        TSharedPtr<FJsonObject> Root;
+        const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Content);
+        if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+        {
+            UE_LOG(LogTemp, Error, TEXT("[AudioStream] /run POST JSON parse failed: %s"), *Content);
+            return;
+        }
+        FString TaskId;
+        if (!Root->TryGetStringField(TEXT("task_id"), TaskId) || TaskId.IsEmpty())
+        {
+            UE_LOG(LogTemp, Error, TEXT("[AudioStream] /run POST missing task_id in response: %s"), *Content);
+            return;
+        }
+
+        // 通过 HandleTaskStart_NCP 统一解析与连接
+        TSharedRef<FJsonObject> Synthetic = MakeShared<FJsonObject>();
+        Synthetic->SetStringField(TEXT("task_id"), TaskId);
+        Synthetic->SetStringField(TEXT("ws_host"), Host);
+        Synthetic->SetStringField(TEXT("ws_scheme"), bUseHttpsFinal ? TEXT("wss") : TEXT("ws"));
+        Synthetic->SetStringField(TEXT("ws_path_prefix"), WsPrefix);
+        Synthetic->SetStringField(TEXT("key"), KeyCopy);
+        Synthetic->SetNumberField(TEXT("sample_rate"), SR);
+        Synthetic->SetNumberField(TEXT("channels"), CH);
+
+        FString BodyForParser;
+        {
+            TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&BodyForParser);
+            FJsonSerializer::Serialize(Synthetic, W);
+        }
+
+        FNivaHttpRequest FakeReq; FakeReq.Body = BodyForParser;
+        Self->HandleTaskStart_NCP(FakeReq);
+    });
+
+    Req->ProcessRequest();
+}
+
+
+// 第3步：向 /stream/{task_id} 发送文本块
+void UAudioStreamHttpWsSubsystem::PostStreamText(const FString& Text)
+{
+    FString TaskId = ActiveTaskId;
+    if (TaskId.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[AudioStream] PostStreamText: missing task_id. Call StartRunAndConnect first or pass TaskIdOverride."));
+        return;
+    }
+
+    FString Host = ActiveHttpHost;
+    const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
+    if (Host.IsEmpty() && S) Host = S->DefaultWsHost;
+    if (Host.IsEmpty()) Host = TEXT("127.0.0.1:8001");
+
+    bool bHttps = bActiveUseHttps;
+    if (!bHttps && S)
+    {
+        bHttps = S->DefaultWsScheme.Equals(TEXT("wss"), ESearchCase::IgnoreCase);
+    }
+    const FString HttpScheme = bHttps ? TEXT("https") : TEXT("http");
+
+    FString Prefix = TEXT("/stream/");
+    if (!Prefix.StartsWith(TEXT("/"))) Prefix = TEXT("/") + Prefix;
+    if (!Prefix.EndsWith(TEXT("/"))) Prefix += TEXT("/");
+
+    const FString Url = FString::Printf(TEXT("%s://%s%s%s"), *HttpScheme, *Host, *Prefix, *TaskId);
+
+    TSharedRef<FJsonObject> BodyObj = MakeShared<FJsonObject>();
+    BodyObj->SetStringField(TEXT("text"), Text);
+
+    FString BodyStr;
+    {
+        TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&BodyStr);
+        FJsonSerializer::Serialize(BodyObj, Writer);
+    }
+
+    TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = FHttpModule::Get().CreateRequest();
+    Req->SetURL(Url);
+    Req->SetVerb(TEXT("POST"));
+    Req->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+    Req->SetContentAsString(BodyStr);
+
+    UE_LOG(LogTemp, Log, TEXT("[AudioStream] POST %s ... textLen=%d"), *Url, Text.Len());
+
+    Req->OnProcessRequestComplete().BindLambda([](FHttpRequestPtr /*Request*/, FHttpResponsePtr Response, bool bSucceeded)
+    {
+        if (!bSucceeded || !Response.IsValid())
+        {
+            UE_LOG(LogTemp, Warning, TEXT("[AudioStream] /stream POST failed (request error)"));
+            return;
+        }
+        const int32 Code = Response->GetResponseCode();
+        if (Code < 200 || Code >= 300)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("[AudioStream] /stream POST non-2xx: %d, resp=%s"), Code, *Response->GetContentAsString());
+        }
+    });
+
+    Req->ProcessRequest();
 }

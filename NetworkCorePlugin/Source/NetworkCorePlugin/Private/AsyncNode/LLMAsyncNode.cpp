@@ -680,7 +680,7 @@ void UNivaAgentLLMRequest::init(TMap<FString, FString> Chated, FString Chat)
 	}
 	
 	// 设置请求URL - 假设智能体聊天API端点
-	FString AgentChatURL = Settings->AgentChatURL + TEXT("/agent/chat");
+	FString AgentChatURL = Settings->AgentChatURL + TEXT("/chat/stream/");
 	LLMRequest->SetURL(AgentChatURL);
     
 	// 设置请求方法
@@ -779,13 +779,13 @@ void UNivaAgentLLMRequest::OnProgressDelegate(FHttpRequestPtr Request, uint64 By
 	ReceivedBuffer.ParseIntoArrayLines(Lines, true);
 	for (const FString& Line : Lines)
 	{
-		FString Prefix = TEXT("data: data: ");
+		FString Prefix = TEXT("data: ");
 		if (Line.StartsWith(Prefix))
 		{
 			FString JsonPart = Line.Mid(Prefix.Len()).TrimStartAndEnd();
 
-			// UE_LOG 打印 data: 后所有内容
-			UE_LOG(LogTemp, Log, TEXT("Raw Data after 'data:': %s"), *JsonPart)
+				// UE_LOG 打印 data: 后所有内容
+				UE_LOG(LogTemp, Log, TEXT("Raw Data after 'data:': %s"), *JsonPart);
 
             
 			// 解析JSON内容
@@ -826,30 +826,56 @@ void UNivaAgentLLMRequest::OnProgressDelegate(FHttpRequestPtr Request, uint64 By
 				// 	}
 				// 	
 				// }
-				// 处理 status 字段
-				FString Status;
+				// 解析新的 OpenAI 风格的流式返回：choices[0].delta.content 和 finish_reason
 				FString AssistantContent;
-				FString AssistantRole;
 				bool bDone = false;
-				if (JsonObj->TryGetStringField(TEXT("status"), Status))
+				// 默认角色为 assistant
+				FString AssistantRole = TEXT("assistant");
+
+				const TArray<TSharedPtr<FJsonValue>>* ChoicesArrayPtr = nullptr;
+				if (JsonObj->TryGetArrayField(TEXT("choices"), ChoicesArrayPtr) && ChoicesArrayPtr && ChoicesArrayPtr->Num() > 0)
 				{
-					bDone = (Status == "completed");
+					const TSharedPtr<FJsonObject>* FirstChoiceObjPtr = nullptr;
+					if ((*ChoicesArrayPtr)[0].IsValid() && (*ChoicesArrayPtr)[0]->TryGetObject(FirstChoiceObjPtr) && FirstChoiceObjPtr && (*FirstChoiceObjPtr).IsValid())
+					{
+						const TSharedPtr<FJsonObject> FirstChoiceObj = *FirstChoiceObjPtr;
+						// finish_reason 非空表示结束
+						FString FinishReason;
+						if (FirstChoiceObj->TryGetStringField(TEXT("finish_reason"), FinishReason))
+						{
+							bDone = !FinishReason.IsEmpty();
+						}
+						// 解析 delta.content
+						const TSharedPtr<FJsonObject>* DeltaObjPtr = nullptr;
+						if (FirstChoiceObj->TryGetObjectField(TEXT("delta"), DeltaObjPtr) && DeltaObjPtr && (*DeltaObjPtr).IsValid())
+						{
+							(*DeltaObjPtr)->TryGetStringField(TEXT("content"), AssistantContent);
+							// 如果服务端在 delta 中给了 role，也一并更新
+							(*DeltaObjPtr)->TryGetStringField(TEXT("role"), AssistantRole);
+						}
+					}
 				}
-				
-				JsonObj->TryGetStringField(TEXT("content"), AssistantContent);
-				JsonObj->TryGetStringField(TEXT("role"), AssistantRole);
-				
-				
-					
-				// 构造最后结果的 json
+
+				// 构造最后结果的 json（保持下游兼容）
 				TSharedPtr<FJsonObject> OutJson = MakeShared<FJsonObject>();
-				OutJson->SetStringField(TEXT("created_at"), FDateTime::UtcNow().ToString(TEXT("%Y-%m-%dT%H:%M:%S.%sZ")));
+				// 如果上游给了 created 字段，可用；否则使用当前 UTC 时间
+				int64 CreatedUnix = 0;
+				if (JsonObj->TryGetNumberField(TEXT("created"), CreatedUnix))
+				{
+					// 将 Unix 秒转为 ISO8601
+					FDateTime Epoch(1970,1,1);
+					FDateTime CreatedDT = Epoch + FTimespan::FromSeconds(CreatedUnix);
+					OutJson->SetStringField(TEXT("created_at"), CreatedDT.ToIso8601());
+				}
+				else
+				{
+					OutJson->SetStringField(TEXT("created_at"), FDateTime::UtcNow().ToIso8601());
+				}
 				OutJson->SetBoolField(TEXT("done"), bDone);
 
 				TSharedPtr<FJsonObject> MsgObj = MakeShared<FJsonObject>();
 				MsgObj->SetStringField(TEXT("role"), AssistantRole);
 				MsgObj->SetStringField(TEXT("content"), AssistantContent);
-
 				OutJson->SetObjectField(TEXT("message"), MsgObj);
 
 				// 转为字符串，log输出

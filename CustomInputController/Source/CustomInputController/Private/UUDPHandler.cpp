@@ -95,7 +95,7 @@ void UUDPHandler::StopUDPReceiver()
     bIsListening = false;
 
 
-    // Close the socket to unblock any pending Wait/Recv on receiver thread, but don't destroy yet
+    // Close the socket to unblock any pending Wait/Recv on receiver thread, but don't destroy yet 
     if (ListenSocket)
     {
         ListenSocket->Close();

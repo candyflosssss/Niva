@@ -26,6 +26,18 @@ public:
 	UFUNCTION(BlueprintCallable, Category="TaskManager")
 	void ClearTasks();
 
+	// 取消当前正在执行的任务（优雅取消）：仅发起取消，等待任务在 Tick 中完成善后后再切换
+	UFUNCTION(BlueprintCallable, Category="TaskManager")
+	void CancelCurrentTask();
+
+	// 立马执行型任务：插入队列最前；默认仅优雅取消当前任务等待其结束。bHardAbort=true 将立即打断并同帧启动（谨慎使用）。
+	UFUNCTION(BlueprintCallable, Category="TaskManager")
+	void AddTaskImmediate(UTaskBase* Task, bool bHardAbort /*= false*/);
+
+	// 导出“队列”的文本（严格 JSON 风格字符串），不包含当前任务，仅用于可视化
+	UFUNCTION(BlueprintPure, Category="TaskManager|Viz")
+	FString GetQueueText() const;
+
 	UFUNCTION(BlueprintPure, Category="TaskManager")
 	bool IsIdle() const { return !CurrentTask && TaskQueue.Num()==0; }
 
@@ -34,6 +46,10 @@ private:
 
 	// MCP: 在 BeginPlay 收集并注册工具
 	void RegisterMcpTools();
+
+	// 防止重复注册（例如关卡切换或重复 BeginPlay）
+	UPROPERTY(Transient)
+	bool bMcpToolsRegistered = false;
 
 	// MCP: 工具被调用时的回调，将对应 Task 入队
 	UFUNCTION()

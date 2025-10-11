@@ -296,6 +296,10 @@ public:
   UPROPERTY(config, EditAnywhere, BlueprintReadOnly, Category = "Network|LLM|NivaAgent")
   FString DefaultAgentID = TEXT("test-agent-id");
 
+  // MCP 服务基础 URL（不要包含具体端点），用于拼接各接口
+  UPROPERTY(Config, EditAnywhere, BlueprintReadOnly, Category = "Network|LLM|NivaAgent")
+  FString MCPBaseURL = TEXT("http://localhost:8081");
+
   // Runner LLM 配置
   UPROPERTY(Config, EditAnywhere, Category = "Network|LLM|Runner")
   FString LLMRunnerURL = TEXT("http://10.1.10.93:8000/run");

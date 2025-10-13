@@ -1,5 +1,7 @@
 ﻿#include "MicAudioCaptureModule.h"
+#if WITH_EDITOR
 #include "MicAudioCaptureCommands.h"
+#endif
 #include "MicAudioCaptureComponent.h"
 #include "MicAudioCaptureSubsystem.h"
 #include "MicAudioCaptureSettings.h"
@@ -8,20 +10,23 @@
 #include "Framework/Commands/UICommandList.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "Engine/GameInstance.h"
+#if WITH_EDITOR
 #include "LevelEditor.h"
 #include "ISettingsModule.h"
 #include "ISettingsSection.h"
+#endif
 #include "Modules/ModuleManager.h"
 
 #define LOCTEXT_NAMESPACE "FMicAudioCaptureModule"
 
 void FMicAudioCaptureModule::StartupModule()
 {
-	// 注册命令
+#if WITH_EDITOR
+	// 注册命令（仅编辑器）
 	FMicAudioCaptureCommands::Register();
 	PluginCommands = MakeShareable(new FUICommandList);
 
-	// 绑定命令处理函数
+	// 绑定命令处理函数（仅编辑器）
 	PluginCommands->MapAction(
 		FMicAudioCaptureCommands::Get().OpenMicAudioCaptureSettings,
 		FExecuteAction::CreateRaw(this, &FMicAudioCaptureModule::OpenMicAudioCaptureSettings),
@@ -88,11 +93,13 @@ void FMicAudioCaptureModule::StartupModule()
 			LOCTEXT("麦克风音频捕获和WebSocket推流设置", "MicAudioCapture"),
 			GetMutableDefault<UMicAudioCaptureSettings>());
 	}
+#endif
 }
 
 void FMicAudioCaptureModule::ShutdownModule()
 {
-	// 注销命令
+#if WITH_EDITOR
+	// 注销命令（仅编辑器）
 	FMicAudioCaptureCommands::Unregister();
 
 	// 注销设置
@@ -101,8 +108,10 @@ void FMicAudioCaptureModule::ShutdownModule()
 	{
 		SettingsModule->UnregisterSettings("Project", "Plugins", "MicAudioCapture");
 	}
+#endif
 }
 
+#if WITH_EDITOR
 void FMicAudioCaptureModule::AddToolbarExtension(FToolBarBuilder& Builder)
 {
 	Builder.BeginSection("MicAudioCapture");
@@ -177,13 +186,16 @@ void FMicAudioCaptureModule::AddMenuExtension(FMenuBuilder& Builder)
 	}
 	Builder.EndSection();
 }
+#endif
 
+#if WITH_EDITOR
 void FMicAudioCaptureModule::OpenMicAudioCaptureSettings()
 {
 	// 打开设置页面
-	FModuleManager::LoadModuleChecked<ISettingsModule>("Settings")
+ FModuleManager::LoadModuleChecked<ISettingsModule>("Settings")
 		.ShowViewer("Project", "Plugins", "MicAudioCapture");
 }
+#endif
 
 void FMicAudioCaptureModule::StartMicCapture()
 {

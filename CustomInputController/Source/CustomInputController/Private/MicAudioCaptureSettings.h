@@ -21,12 +21,14 @@ public:
 
 	// 编辑器设置分类
 	virtual FName GetCategoryName() const override;
-
-	// 设置显示名称
+	
+#if WITH_EDITOR
+	// 设置显示名称（仅编辑器）
 	virtual FText GetSectionText() const override;
-
-	// 设置描述
+	
+	// 设置描述（仅编辑器）
 	virtual FText GetSectionDescription() const override;
+#endif
 
 #if WITH_EDITOR
 	// 编辑器中设置修改回调

@@ -4,6 +4,9 @@
 #include "Engine/GameInstance.h"
 #include "GameFramework/Actor.h"
 #include "NetworkCoreSubsystem.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "Engine/AssetManager.h"
+#include "Engine/StreamableManager.h"
 
 UTaskManagerComponent::UTaskManagerComponent(){ PrimaryComponentTick.bCanEverTick = true; }
 void UTaskManagerComponent::BeginPlay(){ Super::BeginPlay(); RegisterMcpTools(); }
@@ -139,6 +142,28 @@ void UTaskManagerComponent::PopAndStartNext()
 
 void UTaskManagerComponent::RegisterMcpTools()
 {
+	// 预加载所有派生于 UTaskBase 的蓝图类，避免由于未加载导致的枚举缺失
+	{
+		FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+		IAssetRegistry& AR = ARM.Get();
+		// 确保资产搜索完成（Cooked 环境也可用）
+		AR.SearchAllAssets(true);
+
+		TArray<FTopLevelAssetPath> Base;
+		Base.Add(UTaskBase::StaticClass()->GetClassPathName());
+		TSet<FTopLevelAssetPath> Excluded; // none
+		TSet<FTopLevelAssetPath> Derived;
+		AR.GetDerivedClassNames(Base, Excluded, Derived);
+
+		for (const FTopLevelAssetPath& ClassPath : Derived)
+		{
+			// 使用软路径加载生成类，例如 /Game/X/BP_Task.BP_Task_C
+			const FString ClassPathStr = ClassPath.ToString();
+			FSoftClassPath SCP(ClassPathStr);
+			UClass* LoadedClass = SCP.TryLoadClass<UTaskBase>();
+			// 静默：如果加载失败，可能是 EditorOnly 或被剔除，忽略
+		}
+	}
 
 	UWorld* World = GetWorld();
 	if (!World) return;
@@ -163,10 +188,10 @@ void UTaskManagerComponent::RegisterMcpTools()
 		if (!CDO->ShouldCreateMcpTool(this)) continue;
 
 		const FString ToolName = Cls->GetName();
-		// if (RegisteredToolNames.Contains(ToolName))
-		// {
-		// 	continue; // 本组件已注册过同名工具，跳过
-		// }
+		if (RegisteredToolNames.Contains(ToolName))
+		{
+			continue; // 本组件已注册过同名工具，跳过
+		}
 
 		FMCPTool Tool;
 		Tool.Name = ToolName;

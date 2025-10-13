@@ -29,7 +29,8 @@ public class TaskWeaver : ModuleRules
 				"CoreUObject", 
 				"Engine",
 				"AIModule",
-				"NetworkCorePlugin"
+				"NetworkCorePlugin",
+				"AssetRegistry"
 				// ... add other public dependencies that you statically link with here ...
 			}
 			);

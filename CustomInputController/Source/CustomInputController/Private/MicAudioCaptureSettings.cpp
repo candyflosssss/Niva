@@ -29,6 +29,7 @@ FName UMicAudioCaptureSettings::GetCategoryName() const
 	return TEXT("Plugins");
 }
 
+#if WITH_EDITOR
 FText UMicAudioCaptureSettings::GetSectionText() const
 {
 	return NSLOCTEXT("MicAudioCapture", "MicAudioCaptureSectionText", "麦克风音频捕获");
@@ -39,6 +40,8 @@ FText UMicAudioCaptureSettings::GetSectionDescription() const
 	return NSLOCTEXT("MicAudioCapture", "MicAudioCaptureSectionDescription", 
 		"麦克风音频捕获插件的全局设置。配置麦克风捕获和WebSocket推流参数。");
 }
+
+#endif
 
 #if WITH_EDITOR
 void UMicAudioCaptureSettings::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)

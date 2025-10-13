@@ -1,128 +1,45 @@
-﻿# 自定义输入控制器插件
+﻿# CustomInputController 插件说明
 
-## 概述
+- 功能分类：输入与设备 / 数据采集、音频采集与流式传输
+- 主要功能：
+  - 自定义输入设备接入与按键/事件分发。
+  - 麦克风采集、音频缓冲与推流（HTTP / WebSocket / UDP），同时支持从网络拉取音频流做本地播放与统计。
+  - 手部/外设数据监听，提供手部21点解析、平滑/过滤与骨骼驱动辅助。
+  - UDP 监听器用于接收低延迟二进制/文本消息（含 C++/蓝图事件）。
 
-该插件提供了自定义输入控制功能和音频流传输能力。音频流模块可以捕获麦克风音频并通过WebSocket以PCM格式推送到指定服务器。
+- 完整类/对象清单（按角色分组）：
+  - 流媒体/网络
+    - UAudioStreamHttpWsSubsystem（UGameInstanceSubsystem）：音频 HTTP/WS 会话中枢；路由注册、推流/拉流、统计与调度；内置媒体 UDP 组播/单播分发、客户端对时与抖动缓冲。
+    - UAudioStreamHttpWsComponent（UActorComponent）：为 Actor 提供推流/控制入口，管理缓冲、viseme 队列与与子系统的注册绑定。
+    - UNetMicWsSubsystem（UGameInstanceSubsystem）：最小“网络麦克风”子系统，经 HTTP POST 获取 wsUrl 后建立 WS，接收二进制音频并做环形暂存（蓝图事件 OnAudioBinary）。
+    - UUDPHandler（UObject）：轻量 UDP 接收器，封装 FUdpSocketReceiver；事件：OnBinaryReceived（C++）、OnDataReceived/OnDataReceivedDynamic（文本）。
+    - UStreamProcSoundWave（USoundWaveProcedural）：过程音频波形，支持多生产者/单消费者入队、欠载淡入与内存压缩；用于拉流端播放。
+  
+  - 音频采集
+    - UMicAudioCaptureComponent（UActorComponent）：采集本地麦克风；设备枚举、音量检测、分包与（可选）WebSocket 推送；动态多播事件（开始/停止/音量等）。
+    - UMicAudioCaptureSubsystem（UGameInstanceSubsystem）：封装组件实例的全局访问与参数管理，向上层提供统一蓝图/代码接口。
+    - Mic 相关设置类：
+      - UAudioStreamSettings（UDeveloperSettings，Config=Game）：媒体 UDP 端口、接收缓冲、默认 WS/组件/viseme/同步/日志等参数。
+      - UMicAudioCaptureSettings（UDeveloperSettings 或等效设置类，若存在）：麦克风采集默认参数（如采样率、声道、缓冲）。
 
-## 音频流模块
+  - 输入/设备与手部工具
+    - UInputPlusSubsystem（UGameInstanceSubsystem）：
+      - 从 UDP 文本流解析双手 21 点（左右分组）；缓存最新帧；对外广播手部数据（动态/非动态委托）。
+    - UHandDataListenerComponent（UActorComponent）：
+      - 订阅并输出左/右手数据；提供平滑（指数）、离群过滤、自适应阈值、速度限幅与丢帧策略等；可输出相对/世界旋转映射。
+    - UHandKinematicsBPLibrary（UBlueprintFunctionLibrary；文件名 UHandRelRotBPLibrary.h）：
+      - FHandRuntimeState / FHandLimitsConfig / FHandCalibOffsets 辅助结构；
+      - 计算父->子相对旋转、腕部朝向；
+      - Offset 标定/应用；Mannequin 左右手映射生成等。
 
-### 功能
+- 其他公开头文件与结构：
+  - AudioStreamSettings.h（见上）、StreamProcSoundWave.h、InputPlusSubsystem.h、HandDataListenerComponent.h、UHandRelRotBPLibrary.h、UUDPHandler.h 等。
 
-- 捕获系统麦克风音频
-- 实时转换为PCM格式
-- 通过WebSocket推送到服务器
-- 提供可配置的设置，如采样率、通道数、缓冲区大小等
-- 支持语音活动检测(VAD)
+- 典型交互关系：
+  - 采集推流：UMicAudioCaptureComponent -> UAudioStreamHttpWsSubsystem / UNetMicWsSubsystem ->（HTTP/WS/UDP）服务端。
+  - 拉流播放：UAudioStreamHttpWsSubsystem/UNetMicWsSubsystem -> UStreamProcSoundWave（本地播放）-> 统计/viseme。
+  - 手部数据：UInputPlusSubsystem（UDP 解析） -> UHandDataListenerComponent（平滑/过滤/输出旋转）。
 
-### 使用方法
-
-#### 通过蓝图使用
-
-1. 将`AudioStreamingComponent`添加到你的Actor中
-2. 配置组件属性，如自动启动、音频增益等
-3. 调用组件的`StartStreaming`、`StopStreaming`等方法控制音频流
-
-#### 通过代码使用
-
-```cpp
-// 启动音频流
-UAudioStreamingBPLibrary::StartAudioStreaming();
-
-// 停止音频流
-UAudioStreamingBPLibrary::StopAudioStreaming();
-# 麦克风音频捕获插件
-
-这个插件允许您捕获麦克风输入，并通过WebSocket将PCM音频数据推流到指定的服务器。
-
-## 功能特点
-
-- 捕获本地麦克风音频
-- 将音频数据以PCM格式通过WebSocket推流
-- 支持不同的采样率和声道配置
-- 提供音量增益控制
-- 可视化音量级别
-- 显示可用麦克风设备列表
-- 自动重连机制
-- 编辑器集成工具栏
-
-## 使用方法
-
-### 通过蓝图使用
-
-1. 将`MicAudioCaptureComponent`添加到Actor中
-2. 配置必要的参数（采样率、声道数、服务器URL等）
-3. 调用`StartCapture`开始捕获
-4. 调用`ConnectToServer`连接到服务器
-
-### 通过子系统使用
-
-在任何蓝图或C++代码中获取子系统并使用：
-
-```c++
-// C++示例
-UMicAudioCaptureSubsystem* MicSubsystem = GetGameInstance()->GetSubsystem<UMicAudioCaptureSubsystem>();
-if (MicSubsystem)
-{
-    MicSubsystem->ConnectToServer("ws://your-server-url:port");
-    MicSubsystem->StartCapture(0); // 使用第一个麦克风设备
-}
-```
-
-```
-// 蓝图示例
-// 获取MicAudioCaptureSubsystem
-// 然后调用ConnectToServer和StartCapture
-```
-
-## 调试工具
-
-插件包含一个调试小部件，可以在游戏中显示：
-
-1. 创建一个继承自`MicAudioCaptureDebugWidget`的蓝图小部件
-2. 在UI中添加该小部件
-3. 通过小部件可以监控音频级别、管理设备连接等
-
-## 配置选项
-
-在项目设置中可以找到`麦克风音频捕获`配置部分，包含以下选项：
-
-- 默认WebSocket服务器URL
-- 默认采样率和声道数
-- 缓冲区大小
-- 音量放大系数
-- 调试日志开关
-- 重连机制配置
-
-## 编辑器集成
-
-插件在编辑器工具栏中添加了以下功能：
-
-- 开始/停止麦克风捕获
-- 连接/断开WebSocket服务器
-- 刷新麦克风设备
-- 打开设置
-
-## 技术细节
-
-- 使用`FAudioCapture`API捕获麦克风数据
-- 支持8kHz到48kHz的采样率
-- 支持单声道和立体声配置
-- 将浮点音频数据转换为16位PCM
-- 使用WebSocket传输数据
-- 通过`MediaStreamPacket`协议包装数据
-
-## 服务器要求
-
-目标WebSocket服务器需要能够接收以下格式的数据：
-
-- 24字节的`FMediaPacketHeader`头部
-- 紧随其后的16位PCM音频数据
-
-默认服务器URL为`ws://10.1.20.57:8765`
-// 设置增益
-UAudioStreamingBPLibrary::SetAudioStreamingGain(1.5f);
-```
-
-### 配置
-
-在项目设置中可以找到
+- 参考与定位：
+  - 插件清单：CustomInputController.uplugin（依赖 NetworkCorePlugin）。
+  - 源码：Plugins/CustomInputController/Source/CustomInputController（Public/Private）。

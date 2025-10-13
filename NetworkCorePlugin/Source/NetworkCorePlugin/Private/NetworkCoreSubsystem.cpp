@@ -1371,7 +1371,7 @@ UMCPToolProperty* UMCPToolPropertyActorPtr::CreateActorPtrProperty(FString InNam
 	Property->Type = EMCPJsonType::String;
 	Property->Description = InDescription;
 	Property->ActorClass = InActorClass;
-	UE_LOG(LogTemp, Log, TEXT("CreateActorPtrProperty: Stored ActorClass=%s"), Property->ActorClass ? *Property->ActorClass->GetName() : TEXT("<null>"));
+	UE_LOG(LogTemp, Log, TEXT("CreateActorP、trProperty: Stored ActorClass=%s"), Property->ActorClass ? *Property->ActorClass->GetName() : TEXT("<null>"));
 	Property->FindActors();
 	
 	return Property;

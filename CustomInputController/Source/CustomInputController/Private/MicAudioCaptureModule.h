@@ -2,7 +2,10 @@
 
 #include "CoreMinimal.h"
 #include "Modules/ModuleInterface.h"
+
+#if WITH_EDITOR
 #include "MicAudioCaptureCommands.h"
+#endif
 
 class FToolBarBuilder;
 class FMenuBuilder;
@@ -18,15 +21,19 @@ public:
 	virtual void StartupModule() override;
 	virtual void ShutdownModule() override;
 
+#if WITH_EDITOR
 	/** 添加工具栏按钮 */
 	void AddToolbarExtension(FToolBarBuilder& Builder);
 
 	/** 添加菜单扩展 */
 	void AddMenuExtension(FMenuBuilder& Builder);
+#endif
 
 private:
+#if WITH_EDITOR
 	/** 命令列表 */
 	TSharedPtr<FUICommandList> PluginCommands;
+#endif
 
 	/** 命令处理函数 */
 	void OpenMicAudioCaptureSettings();

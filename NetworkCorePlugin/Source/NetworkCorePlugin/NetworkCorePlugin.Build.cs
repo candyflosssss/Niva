@@ -7,10 +7,8 @@ public class NetworkCorePlugin : ModuleRules
 {
 	public NetworkCorePlugin(ReadOnlyTargetRules Target) : base(Target)
 	{
-        // ���������Ŀ¼
         string CivetWebPath = Path.Combine(ModuleDirectory, "ThirdParty", "CivetWeb");
 
-        // ����ͷ�ļ�
         PublicIncludePaths.Add(Path.Combine(CivetWebPath, "include"));
         PrivateIncludePaths.Add(Path.Combine(CivetWebPath, "include"));
         PublicIncludePaths.Add(Path.Combine(CivetWebPath, "src"));
@@ -39,6 +37,7 @@ public class NetworkCorePlugin : ModuleRules
 			{
 				"Core",
 				"HTTPServer",
+				"HTTP",
 				// ... add other public dependencies that you statically link with here ...
 			}
 			);

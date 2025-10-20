@@ -7,6 +7,7 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Engine/AssetManager.h"
 #include "Engine/StreamableManager.h"
+#include "Misc/DateTime.h"
 
 UTaskManagerComponent::UTaskManagerComponent(){ PrimaryComponentTick.bCanEverTick = true; }
 void UTaskManagerComponent::BeginPlay(){ Super::BeginPlay(); RegisterMcpTools(); }
@@ -15,7 +16,43 @@ void UTaskManagerComponent::EndPlay(const EEndPlayReason::Type Reason){ ClearTas
 void UTaskManagerComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
-	if (CurrentTask){ CurrentTask->Update(this, DeltaTime); if (CurrentTask->IsFinished()) CurrentTask=nullptr; }
+
+	// 运行中任务心跳 & 完成检测
+	if (CurrentTask)
+	{
+		// 主动更新
+		CurrentTask->Update(this, DeltaTime);
+
+		// Heartbeat: 若该任务是 MCP 触发，且超过心跳间隔未上报，则发一次保活进度
+		if (FTaskCallbackContext* Ctx = CallbackContexts.Find(CurrentTask))
+		{
+			const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+			if ((Now - Ctx->LastHeartbeatTime) >= Ctx->HeartbeatInterval)
+			{
+				// 使用上次百分比，若未知则 -1 表示未知
+				TMap<FString,FString> Extra; Extra.Add(TEXT("heartbeat"), TEXT("true"));
+				ReportProgress(CurrentTask, Ctx->LastPercent, TEXT("running"), Extra);
+				Ctx->LastHeartbeatTime = Now;
+			}
+		}
+
+		// 完成后发送最终结果（若尚未发送）并切换
+		if (CurrentTask->IsFinished())
+		{
+			if (FTaskCallbackContext* Ctx = CallbackContexts.Find(CurrentTask))
+			{
+				if (!Ctx->bFinalSent)
+				{
+					TMap<FString,FString> Payload; // 可为空
+					const bool bSuccess = (CurrentTask->State == ETaskState::Completed);
+					ReportResult(CurrentTask, bSuccess, bSuccess ? TEXT("completed") : TEXT("canceled"), Payload);
+				}
+				CallbackContexts.Remove(CurrentTask);
+			}
+			CurrentTask = nullptr;
+		}
+	}
+
 	if (!CurrentTask && TaskQueue.Num()>0) PopAndStartNext(); 
 }
 
@@ -39,12 +76,20 @@ void UTaskManagerComponent::ClearTasks()
 		CurrentTask->Cancel(this);
 	}
 
-	// 取消并清空队列中未开始的任务
+	// 取消并清空队列中未开始的任务，同时对来自 MCP 的任务发送一次取消的最终结果
 	for (TObjectPtr<UTaskBase>& T : TaskQueue)
 	{
 		if (T && !T->IsFinished())
 		{
 			T->Cancel(this);
+			if (FTaskCallbackContext* Ctx = CallbackContexts.Find(T))
+			{
+				if (!Ctx->bFinalSent)
+				{
+					TMap<FString,FString> Payload; ReportResult(T, /*bSuccess=*/false, TEXT("canceled"), Payload);
+				}
+				CallbackContexts.Remove(T);
+			}
 		}
 	}
 	TaskQueue.Empty();
@@ -86,6 +131,77 @@ static FString TW_TaskToText(const UTaskBase* Task)
 	return TW_KvToJsonObject(KVs);
 }
 
+// 进度上报：
+// - 节流保护：使用 CallbackContext.MinProgressInterval 控制最小上报间隔；
+// - 百分比处理：当 Percent>=0 时，记录 LastPercent 并同时生成 Completed/Total（0..100/100），以便 UI 进度条展示；
+// - 仅对来自 MCP 的任务生效（存在有效 UMCPToolHandle）。
+void UTaskManagerComponent::ReportProgress(UTaskBase* Task, float Percent, const FString& Message, const TMap<FString,FString>& ExtraKVs)
+{
+	if (!Task) return;
+	FTaskCallbackContext* Ctx = CallbackContexts.Find(Task);
+	if (!Ctx) return; // 非 MCP 触发任务，无需上报
+	UMCPToolHandle* Handle = Ctx->Handle.Get();
+	if (!Handle) return; // 通道失效
+
+	const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+	if ((Now - Ctx->LastProgressTime) < Ctx->MinProgressInterval)
+	{
+		return; // 节流
+	}
+	Ctx->LastProgressTime = Now;
+
+	if (Percent >= 0.f) { Ctx->LastPercent = Percent; }
+
+	// 组织紧凑 JSON 文本作为 message
+	TMap<FString,FString> KVs;
+	KVs.Add(TEXT("type"), TEXT("progress"));
+	KVs.Add(TEXT("taskId"), Ctx->TaskId.ToString(EGuidFormats::DigitsWithHyphensInBraces));
+	KVs.Add(TEXT("tool"), Ctx->ToolName);
+	KVs.Add(TEXT("owner"), Ctx->OwnerDisplay);
+	if (Percent >= 0.f)
+	{
+		KVs.Add(TEXT("percent"), FString::SanitizeFloat(Percent));
+	}
+	KVs.Add(TEXT("message"), Message);
+	for (const auto& It : ExtraKVs) { KVs.Add(It.Key, It.Value); }
+	const FString Msg = TW_KvToJsonObject(KVs);
+
+	int32 Completed = -1, Total = -1;
+	if (Percent >= 0.f)
+	{
+		Completed = FMath::Clamp<int32>(FMath::RoundToInt(Percent), 0, 100);
+		Total = 100;
+	}
+	Handle->ToolCallbackRaw(false, Msg, /*bFinal=*/false, Completed, Total);
+}
+
+// 最终结果上报：
+// - 只上报一次：通过 bFinalSent 防止重复；
+// - bSuccess 会被取反作为底层 error 标记传递给 ToolCallbackRaw（error = !bSuccess）；
+// - bFinal=true 结束回调通道，后续不应再调用 ReportProgress；
+// - 负载中会包含 type=result, taskId, tool, owner, success, message 以及自定义键值。
+void UTaskManagerComponent::ReportResult(UTaskBase* Task, bool bSuccess, const FString& Message, const TMap<FString,FString>& PayloadKVs)
+{
+	if (!Task) return;
+	FTaskCallbackContext* Ctx = CallbackContexts.Find(Task);
+	if (!Ctx) return;
+	UMCPToolHandle* Handle = Ctx->Handle.Get();
+	if (!Handle) return;
+	if (Ctx->bFinalSent) return;
+	Ctx->bFinalSent = true;
+
+	TMap<FString,FString> KVs;
+	KVs.Add(TEXT("type"), TEXT("result"));
+	KVs.Add(TEXT("taskId"), Ctx->TaskId.ToString(EGuidFormats::DigitsWithHyphensInBraces));
+	KVs.Add(TEXT("tool"), Ctx->ToolName);
+	KVs.Add(TEXT("owner"), Ctx->OwnerDisplay);
+	KVs.Add(TEXT("success"), bSuccess ? TEXT("true") : TEXT("false"));
+	KVs.Add(TEXT("message"), Message);
+	for (const auto& It : PayloadKVs) { KVs.Add(It.Key, It.Value); }
+	const FString Msg = TW_KvToJsonObject(KVs);
+	Handle->ToolCallbackRaw(!bSuccess, Msg, /*bFinal=*/true);
+}
+
 void UTaskManagerComponent::AddTaskImmediate(UTaskBase* Task, bool bHardAbort /*= false*/)
 {
 	if (!Task) return;
@@ -111,6 +227,14 @@ void UTaskManagerComponent::AddTaskImmediate(UTaskBase* Task, bool bHardAbort /*
 	{
 		// 警告：硬中断会违背“善后”约束，仅在确需时使用
 		UE_LOG(LogTemp, Warning, TEXT("[TaskWeaver] HARD ABORT current task to start immediate task: %s"), *Task->GetName());
+		if (FTaskCallbackContext* Ctx = CallbackContexts.Find(CurrentTask))
+		{
+			if (!Ctx->bFinalSent)
+			{
+				TMap<FString,FString> Payload; ReportResult(CurrentTask, /*bSuccess=*/false, TEXT("aborted"), Payload);
+			}
+			CallbackContexts.Remove(CurrentTask);
+		}
 		CurrentTask = nullptr;
 		PopAndStartNext();
 	}
@@ -137,6 +261,12 @@ void UTaskManagerComponent::PopAndStartNext()
 	{
 		if (!CurrentTask->GetOuter()) CurrentTask->Rename(nullptr, this);
 		CurrentTask->Start(this);
+		// 启动时重置心跳计时
+		if (FTaskCallbackContext* Ctx = CallbackContexts.Find(CurrentTask))
+		{
+			Ctx->LastHeartbeatTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+			Ctx->StartedAt = FPlatformTime::Seconds();
+		}
 	}
 }
 
@@ -277,17 +407,34 @@ void UTaskManagerComponent::OnMcpToolCalled(const FString& Result, UMCPToolHandl
 		return;
 	}
 
-	// 让任务解析并应用自身所需的参数，失���则返回错误
+	// 让任务解析并应用自身所需的参数，失败则返回错误
 	if (!NewTask->ApplyMcpArgumentsBP(MCPTool, Result, this))
 	{
 		if (MCPToolHandle) MCPToolHandle->ToolCallback(true, TEXT("Failed to apply MCP arguments"));
 		return;
 	}
 
-	AddTask(NewTask);
+	// 建立回调上下文（仅当句柄有效）
 	if (MCPToolHandle)
 	{
-		const FString Msg = FString::Printf(TEXT("Queued task: %s (Owner: %s)"), *MCPTool.Name, *GetNameSafe(GetOwner()));
-		MCPToolHandle->ToolCallback(false, Msg);
+		FTaskCallbackContext Ctx;
+		Ctx.TaskId = FGuid::NewGuid();
+		Ctx.ToolName = MCPTool.Name;
+		Ctx.OwnerDisplay = GetOwner() ? GetOwner()->GetName() : TEXT("<none>");
+		Ctx.Handle = MCPToolHandle;
+		// 从组件配置复制心跳/节流设置
+		Ctx.HeartbeatInterval = FMath::Max(0.0f, HeartbeatIntervalSeconds);
+		Ctx.MinProgressInterval = FMath::Max(0.0f, MinProgressIntervalSeconds);
+		Ctx.StartedAt = FPlatformTime::Seconds();
+		CallbackContexts.Add(NewTask, Ctx);
+	}
+
+	AddTask(NewTask);
+
+	// 初次反馈：Queued（使用 progress 通知）
+	if (MCPToolHandle)
+	{
+		TMap<FString,FString> Extra; Extra.Add(TEXT("status"), TEXT("queued"));
+		ReportProgress(NewTask, -1.f, FString::Printf(TEXT("Queued task: %s"), *MCPTool.Name), Extra);
 	}
 }

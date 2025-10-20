@@ -655,19 +655,54 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
 		SendSSE(SessionId, TEXT("message"), ToolListMessage);
 	}
 	else if (Method == "resources/list") {
-		// 展示资源
-		// TODO
+		// 按 MCP 规范返回空资源列表
+		FString Msg;
+		TSharedPtr<FJsonObject> Root = MakeShareable(new FJsonObject);
+		Root->SetStringField("jsonrpc", "2.0");
+		Root->SetNumberField("id", id);
+		TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject);
+		TArray<TSharedPtr<FJsonValue>> Resources;
+		Result->SetArrayField("resources", Resources);
+		Result->SetStringField("nextCursor", ""); // 暂无分页
+		Root->SetObjectField("result", Result);
+		TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Msg);
+		FJsonSerializer::Serialize(Root.ToSharedRef(), W);
+		Msg.ReplaceInline(TEXT("\n"), TEXT("")); Msg.ReplaceInline(TEXT("\r"), TEXT("")); Msg.ReplaceInline(TEXT("\t"), TEXT(""));
+		SendSSE(SessionId, TEXT("message"), Msg);
 	}
 	else if (Method == "prompts/list") {
-		// 展示提示
-		// TODO
+		// 按 MCP 规范返回空提示列表
+		FString Msg;
+		TSharedPtr<FJsonObject> Root = MakeShareable(new FJsonObject);
+		Root->SetStringField("jsonrpc", "2.0");
+		Root->SetNumberField("id", id);
+		TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject);
+		TArray<TSharedPtr<FJsonValue>> Prompts;
+		Result->SetArrayField("prompts", Prompts);
+		Result->SetStringField("nextCursor", "");
+		Root->SetObjectField("result", Result);
+		TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Msg);
+		FJsonSerializer::Serialize(Root.ToSharedRef(), W);
+		Msg.ReplaceInline(TEXT("\n"), TEXT("")); Msg.ReplaceInline(TEXT("\r"), TEXT("")); Msg.ReplaceInline(TEXT("\t"), TEXT(""));
+		SendSSE(SessionId, TEXT("message"), Msg);
 	}
 	else if (Method == "logging/list") {
-		// 展示日志
-		// TODO
+		// 暂不支持：按 JSON-RPC 返回标准错误（-32601 方法不存在/不支持）
+		FString Msg;
+		TSharedPtr<FJsonObject> Root = MakeShareable(new FJsonObject);
+		Root->SetStringField("jsonrpc", "2.0");
+		Root->SetNumberField("id", id);
+		TSharedPtr<FJsonObject> Err = MakeShareable(new FJsonObject);
+		Err->SetNumberField("code", -32601);
+		Err->SetStringField("message", TEXT("logging/list not supported"));
+		Root->SetObjectField("error", Err);
+		TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Msg);
+		FJsonSerializer::Serialize(Root.ToSharedRef(), W);
+		Msg.ReplaceInline(TEXT("\n"), TEXT("")); Msg.ReplaceInline(TEXT("\r"), TEXT("")); Msg.ReplaceInline(TEXT("\t"), TEXT(""));
+		SendSSE(SessionId, TEXT("message"), Msg);
 
     }
-    else if (Method == "tools/call") {
+	else if (Method == "tools/call") {
 
         // 从params里面获取name
 		FString ToolName = Params->GetStringField(TEXT("name"));

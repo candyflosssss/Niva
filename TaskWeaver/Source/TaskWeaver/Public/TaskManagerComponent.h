@@ -9,6 +9,30 @@
 class UMCPToolHandle;
 struct FMCPTool;
 
+USTRUCT()
+struct FTaskCallbackContext
+{
+	GENERATED_BODY()
+
+	// 唯一标识一次任务执行
+	FGuid TaskId;
+	// 归因信息
+	FString ToolName;
+	FString OwnerDisplay;
+	// 回调通道
+	TWeakObjectPtr<UMCPToolHandle> Handle;
+	// 进度节流/心跳
+	float LastProgressTime = 0.f;
+	float LastHeartbeatTime = 0.f;
+	float LastPercent = -1.f;
+	float MinProgressInterval = 0.5f; // s
+	float HeartbeatInterval = 2.0f;   // s
+	// 完结控制
+	bool bFinalSent = false;
+	// 统计
+	double StartedAt = 0.0;
+};
+
 UCLASS(ClassGroup=(TaskWeaver), meta=(BlueprintSpawnableComponent))
 class TASKWEAVER_API UTaskManagerComponent : public UActorComponent
 {
@@ -41,6 +65,39 @@ public:
 	UFUNCTION(BlueprintPure, Category="TaskManager")
 	bool IsIdle() const { return !CurrentTask && TaskQueue.Num()==0; }
 
+	// === 配置：心跳与进度节流（可在编辑器或蓝图中设置） ===
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="TaskManager|MCP|Config")
+	float HeartbeatIntervalSeconds = 3.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="TaskManager|MCP|Config")
+	float MinProgressIntervalSeconds = 0.5f;
+
+	// 任务侧上报接口（由任务在关键节点/定时调用）
+	// ReportProgress：向 MCP/上层报告当前任务的进度与状态信息。
+	// 参数说明：
+	// - Task：发起上报的任务实例指针。仅当该任务来源于 MCP 调用且仍绑定着回调通道时才会被转发；否则调用将被忽略。
+	// - Percent：进度百分比，建议范围 [0,100]。传入 <0 表示“未知/不更新”，仅发送文本消息与扩展键值。
+	// - Message：人类可读的阶段性描述，例如“下载中(3/10)”或“正在解析配置”。
+	// - ExtraKVs：额外的键值对，会并入 JSON 负载中，便于上层做结构化消费（例如 stage=download, speed=1.2MBps）。
+	// 行为说明：
+	// - 函数内部会进行“节流”，默认最小间隔 MinProgressIntervalSeconds（可在组件上配置），过快调用将被丢弃以避免刷屏。
+	// - 若 Percent>=0，会被同时转换为整数 Completed/Total（0..100/100）以兼容通用进度条；否则不附带 Completed/Total。
+	// - 该函数不会结束任务，仅作为中间态通知；上层收到的 JSON 负载包含：type=progress, taskId, tool, owner, 以及可选的 percent 与 message 等字段。
+	UFUNCTION(BlueprintCallable, Category="TaskManager|MCP")
+	void ReportProgress(UTaskBase* Task, float Percent, const FString& Message, const TMap<FString,FString>& ExtraKVs);
+	UFUNCTION(BlueprintCallable, Category="TaskManager|MCP")
+	// ReportResult：向 MCP/上层报告任务的最终结果（成功/失败），并宣告回调通道完成。
+	// 参数说明：
+	// - Task：完成的任务实例指针。
+	// - bSuccess：是否成功。true 表示成功，false 表示失败；将会影响底层 ToolCallbackRaw 的 error 标记（取反传递）。
+	// - Message：最终的人类可读总结/错误信息。
+	// - PayloadKVs：最终的结构化结果负载，会与内置字段合并成 JSON 返回上层（如输出路径、统计数据等）。
+	// 行为说明：
+	// - 每个任务仅允许上报一次最终结果，重复上报将被忽略（内部用 bFinalSent 防抖）。
+	// - 上报的 JSON 负载包含：type=result, taskId, tool, owner, success, message 以及自定义负载字段。
+	// - 调用后底层会以 bFinal=true 结束回调流，之后不应再调用 ReportProgress。
+	void ReportResult(UTaskBase* Task, bool bSuccess, const FString& Message, const TMap<FString,FString>& PayloadKVs);
+
 private:
 	void PopAndStartNext();
 
@@ -62,6 +119,10 @@ private:
 	// MCP: 已注册的工具名集合（本组件范围内去重）
 	UPROPERTY(Transient)
 	TSet<FString> RegisteredToolNames;
+
+	// 回调上下文（仅对来自 MCP 的任务建立）
+	UPROPERTY(Transient)
+	TMap<TWeakObjectPtr<UTaskBase>, FTaskCallbackContext> CallbackContexts;
 
 	UPROPERTY(Transient) TObjectPtr<UTaskBase> CurrentTask;
 	UPROPERTY(Transient) TArray<TObjectPtr<UTaskBase>> TaskQueue;

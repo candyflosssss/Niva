@@ -1162,7 +1162,7 @@ FString UMCPToolPropertyString::GetValue(FString InJson)
       "location": "New York"
     }
   }
-}
+  
 	* 取出其中的location
 	*/
 	TSharedPtr<FJsonObject> JsonObject;

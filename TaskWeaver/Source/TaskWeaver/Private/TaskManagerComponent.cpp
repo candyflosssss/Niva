@@ -26,7 +26,7 @@ void UTaskManagerComponent::TickComponent(float DeltaTime, ELevelTick TickType, 
 		// Heartbeat: 若该任务是 MCP 触发，且超过心跳间隔未上报，则发一次保活进度
 		if (FTaskCallbackContext* Ctx = CallbackContexts.Find(CurrentTask))
 		{
-			const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+			const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : static_cast<float>(FPlatformTime::Seconds());
 			if ((Now - Ctx->LastHeartbeatTime) >= Ctx->HeartbeatInterval)
 			{
 				// 使用上次百分比，若未知则 -1 表示未知
@@ -143,7 +143,7 @@ void UTaskManagerComponent::ReportProgress(UTaskBase* Task, float Percent, const
 	UMCPToolHandle* Handle = Ctx->Handle.Get();
 	if (!Handle) return; // 通道失效
 
-	const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+	const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : static_cast<float>(FPlatformTime::Seconds());
 	if ((Now - Ctx->LastProgressTime) < Ctx->MinProgressInterval)
 	{
 		return; // 节流
@@ -240,6 +240,41 @@ void UTaskManagerComponent::AddTaskImmediate(UTaskBase* Task, bool bHardAbort /*
 	}
 }
 
+bool UTaskManagerComponent::InsertImmediateAndYield(UTaskBase* NewTask, bool bRequeueCurrentAfterInserted /*= true*/)
+{
+	if (!NewTask) return false;
+
+	// 若当前没有在运行的任务，退化为立即插入并尝试启动
+	if (!CurrentTask || CurrentTask->IsFinished())
+	{
+		TaskQueue.Insert(NewTask, 0);
+		if (!CurrentTask) PopAndStartNext();
+		return true;
+	}
+
+	// 让出当前任务：发出可选钩子并标记为挂起（不发送最终结果，不移除上下文）
+	CurrentTask->OnDeferred(this);
+	CurrentTask->SetState(ETaskState::Deferred);
+
+	// 插入新任务到队首
+	TaskQueue.Insert(NewTask, 0);
+
+	// 将当前任务重新排队（通常紧随新任务之后）
+	if (bRequeueCurrentAfterInserted)
+	{
+		TaskQueue.Insert(CurrentTask, 1);
+	}
+	else
+	{
+		TaskQueue.Add(CurrentTask);
+	}
+
+	// 切换到新任务
+	CurrentTask = nullptr;
+	PopAndStartNext();
+	return true;
+}
+
 FString UTaskManagerComponent::GetQueueText() const
 {
 	FString Out(TEXT("[")); bool bFirst = true;
@@ -264,7 +299,7 @@ void UTaskManagerComponent::PopAndStartNext()
 		// 启动时重置心跳计时
 		if (FTaskCallbackContext* Ctx = CallbackContexts.Find(CurrentTask))
 		{
-			Ctx->LastHeartbeatTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+			Ctx->LastHeartbeatTime = GetWorld() ? GetWorld()->GetTimeSeconds() : static_cast<float>(FPlatformTime::Seconds());
 			Ctx->StartedAt = FPlatformTime::Seconds();
 		}
 	}

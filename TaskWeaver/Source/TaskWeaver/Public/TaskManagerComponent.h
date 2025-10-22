@@ -58,6 +58,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category="TaskManager")
 	void AddTaskImmediate(UTaskBase* Task, bool bHardAbort /*= false*/);
 
+	// 轻量插入：由当前任务在 Start/Update 中调用。将 NewTask 插入到队首，并把当前任务挂起(Deferred)后放在其后，随后立刻切换执行 NewTask。
+	// 若当前没有运行中的任务，则等价于 AddTaskImmediate(NewTask, false)。
+	UFUNCTION(BlueprintCallable, Category="TaskManager")
+	bool InsertImmediateAndYield(UTaskBase* NewTask, bool bRequeueCurrentAfterInserted /*= true*/);
+
 	// 导出“队列”的文本（严格 JSON 风格字符串），不包含当前任务，仅用于可视化
 	UFUNCTION(BlueprintPure, Category="TaskManager|Viz")
 	FString GetQueueText() const;

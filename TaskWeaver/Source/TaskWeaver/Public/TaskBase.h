@@ -7,7 +7,7 @@ class UTaskManagerComponent;
 struct FMCPTool;
 
 UENUM(BlueprintType)
-enum class ETaskState : uint8 { None, Running, Completed, Canceled };
+enum class ETaskState : uint8 { None, Running, Completed, Canceled, Deferred };
 
 UCLASS(BlueprintType, Blueprintable, Abstract)
 class TASKWEAVER_API UTaskBase : public UObject
@@ -31,6 +31,16 @@ public:
 	virtual void Update_Implementation(UTaskManagerComponent* /*Manager*/, float /*DeltaTime*/){ }
 	UFUNCTION(BlueprintNativeEvent, Category="Task|Lifecycle") void Cancel(UTaskManagerComponent* Manager);
 	virtual void Cancel_Implementation(UTaskManagerComponent* /*Manager*/){ State = ETaskState::Canceled; }
+
+	// 当任务被让出（挂起）时调用（可蓝图覆写），默认不做任何事
+	UFUNCTION(BlueprintNativeEvent, Category="Task|Lifecycle")
+	void OnDeferred(UTaskManagerComponent* Manager);
+	virtual void OnDeferred_Implementation(UTaskManagerComponent* /*Manager*/) {}
+
+	// 当任务从挂起恢复再次执行时调用（可蓝图覆写），默认不做任何事
+	UFUNCTION(BlueprintNativeEvent, Category="Task|Lifecycle")
+	void OnResume(UTaskManagerComponent* Manager);
+	virtual void OnResume_Implementation(UTaskManagerComponent* /*Manager*/) {}
 
 	UFUNCTION(BlueprintPure, Category="Task|Lifecycle")
 	bool IsFinished() const { return State==ETaskState::Completed || State==ETaskState::Canceled; }

@@ -2,8 +2,6 @@
 
 
 #include "NetworkCoreSubsystem.h"
-#include "McpComponentRegistrySubsystem.h"
-#include "McpExposableBaseComponent.h"
 #include "HAL/PlatformProcess.h"
 #include "Async/Async.h"
 #include "Misc/OutputDeviceDebug.h"
@@ -1458,13 +1456,17 @@ AActor* UMCPToolPropertyActorPtr::GetValue(FString InJson)
 	TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(InJson);
 	if (FJsonSerializer::Deserialize(JsonReader, JsonObject))
 	{
+		// 获取params字段
 		TSharedPtr<FJsonObject> ParamsObject = JsonObject->GetObjectField(TEXT("params"));
 		if (ParamsObject.IsValid())
 		{
+			// 获取arguments字段
 			TSharedPtr<FJsonObject> ArgumentsObject = ParamsObject->GetObjectField(TEXT("arguments"));
 			if (ArgumentsObject.IsValid())
 			{
+				// 获取指定的字段值
 				FString ActorName = ArgumentsObject->GetStringField(Name);
+				// 在ActorMap中查找
 				return GetActor(ActorName);
 			}
 			else
@@ -1482,146 +1484,7 @@ AActor* UMCPToolPropertyActorPtr::GetValue(FString InJson)
 		UE_LOG(LogTemp, Warning, TEXT("GetValue: Failed to parse JSON: %s"), *InJson);
 	}
 	return nullptr;
-}
-
-// === ComponentPtr implementation ===
-UMCPToolProperty* UMCPToolPropertyComponentPtr::CreateComponentPtrProperty(FString InName, FString InDescription, TSubclassOf<UMcpExposableBaseComponent> InComponentClass)
-{
-	UMCPToolPropertyComponentPtr* Property = NewObject<UMCPToolPropertyComponentPtr>();
-	Property->Name = InName;
-	Property->Type = EMCPJsonType::String;
-	Property->Description = InDescription;
-	Property->ComponentClass = InComponentClass;
-	Property->FindComponents();
-	return Property;
-}
-
-TArray<UMcpExposableBaseComponent*> UMCPToolPropertyComponentPtr::FindComponents()
-{
-	TArray<UMcpExposableBaseComponent*> Result;
-	UWorld* World = nullptr;
-	if (GEngine)
-	{
-		for (const FWorldContext& Context : GEngine->GetWorldContexts())
-		{
-			if (Context.World() && Context.World()->IsGameWorld())
-			{
-				World = Context.World();
-				break;
-			}
-		}
-	}
-	if (!World)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("FindComponents: Failed to find valid World"));
-		return Result;
-	}
-	ComponentMap.Empty();
-
-	UMcpComponentRegistrySubsystem* Reg = World->GetSubsystem<UMcpComponentRegistrySubsystem>();
-	if (!Reg)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("FindComponents: Registry subsystem missing"));
-		return Result;
-	}
-	TArray<UMcpExposableBaseComponent*> Temp;
-	Reg->Enumerate(ComponentClass, Temp);
-
-	for (UMcpExposableBaseComponent* Comp : Temp)
-	{
-		if (!IsValid(Comp)) continue;
-		// 生成可读名
-		FString Label = Comp->GetMcpReadableName();
-		if (Label.IsEmpty())
-		{
-			AActor* Owner = Comp->GetOwner();
-			const FString OwnerName = Owner ? Owner->GetName() : TEXT("<None>");
-			const FString TypeName = Comp->GetClass() ? Comp->GetClass()->GetName() : TEXT("Component");
-			Label = FString::Printf(TEXT("%s • %s • %s"), *OwnerName, *TypeName, *Comp->GetName());
-		}
-		FString Unique = Label;
-		int32 N = 2;
-		while (ComponentMap.Contains(Unique))
-		{
-			Unique = FString::Printf(TEXT("%s #%d"), *Label, N++);
-		}
-		ComponentMap.Add(Unique, Comp);
-		Result.Add(Comp);
-	}
-	UE_LOG(LogTemp, Log, TEXT("FindComponents: Found %d registered components (after filter)"), Result.Num());
-	return Result;
-}
-
-TSharedPtr<FJsonObject> UMCPToolPropertyComponentPtr::GetJsonObject()
-{
-	TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
-	RootObject->SetStringField("name", Name);
-	RootObject->SetStringField("type", StaticEnum<EMCPJsonType>()->GetNameStringByValue(static_cast<int64>(Type)));
-	RootObject->SetStringField("description", Description);
-
-	// 构建枚举
-	TArray<TSharedPtr<FJsonValue>> EnumArray;
-	for (const auto& KV : ComponentMap)
-	{
-		EnumArray.Add(MakeShareable(new FJsonValueString(KV.Key)));
-	}
-	RootObject->SetArrayField("enum", EnumArray);
-	return RootObject;
-}
-
-TArray<FString> UMCPToolPropertyComponentPtr::GetAvailableTargets()
-{
-	FindComponents();
-	TArray<FString> Targets;
-	for (const auto& KV : ComponentMap)
-	{
-		if (KV.Value.IsValid())
-		{
-			Targets.Add(KV.Key);
-		}
-	}
-	return Targets;
-}
-
-UMcpExposableBaseComponent* UMCPToolPropertyComponentPtr::GetComponentByLabel(FString InLabel)
-{
-	if (TWeakObjectPtr<UMcpExposableBaseComponent>* Ptr = ComponentMap.Find(InLabel))
-	{
-		return Ptr->IsValid() ? Ptr->Get() : nullptr;
-	}
-	return nullptr;
-}
-
-UMcpExposableBaseComponent* UMCPToolPropertyComponentPtr::GetValue(FString InJson)
-{
-	TSharedPtr<FJsonObject> JsonObject;
-	TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(InJson);
-	if (FJsonSerializer::Deserialize(JsonReader, JsonObject))
-	{
-		TSharedPtr<FJsonObject> ParamsObject = JsonObject->GetObjectField(TEXT("params"));
-		if (ParamsObject.IsValid())
-		{
-			TSharedPtr<FJsonObject> ArgumentsObject = ParamsObject->GetObjectField(TEXT("arguments"));
-			if (ArgumentsObject.IsValid())
-			{
-				FString Label = ArgumentsObject->GetStringField(Name);
-				return GetComponentByLabel(Label);
-			}
-			else
-			{
-				UE_LOG(LogTemp, Warning, TEXT("GetValue(Component): No arguments field found in params"));
-			}
-		}
-		else
-		{
-			UE_LOG(LogTemp, Warning, TEXT("GetValue(Component): No params field found in JSON"));
-		}
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("GetValue(Component): Failed to parse JSON: %s"), *InJson);
-	}
-	return nullptr;
+	
 }
 
 UMCPToolProperty* UMCPToolPropertyArray::CreateArrayProperty(FString InName, FString InDescription,  UMCPToolProperty* InProperty)
@@ -1703,22 +1566,10 @@ bool UMCPToolBlueprintLibrary::GetActorValue(const FMCPTool& MCPTool, const FStr
 	AActor*& OutValue)
 {
 	if (UMCPToolProperty* Property = GetProperty(MCPTool,Name)) {
+		//直接转换Property为UMCPToolPropertyActorPtr
+		
 		if (UMCPToolPropertyActorPtr* PropertyActorPtr = Cast<UMCPToolPropertyActorPtr>(Property)) {
 			OutValue = PropertyActorPtr->GetValue(InJson);
-			return true;
-		}
-	}
-	return false;
-}
-
-bool UMCPToolBlueprintLibrary::GetComponentValue(const FMCPTool& MCPTool, const FString& Name, const FString& InJson,
-	UActorComponent*& OutValue)
-{
-	if (UMCPToolProperty* Property = GetProperty(MCPTool, Name))
-	{
-		if (UMCPToolPropertyComponentPtr* CompProp = Cast<UMCPToolPropertyComponentPtr>(Property))
-		{
-			OutValue = CompProp->GetValue(InJson);
 			return true;
 		}
 	}

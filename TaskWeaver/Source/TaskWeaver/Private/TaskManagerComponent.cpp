@@ -352,7 +352,8 @@ void UTaskManagerComponent::RegisterMcpTools()
 		if (!CDO) continue;
 		if (!CDO->ShouldCreateMcpTool(this)) continue;
 
-		const FString ToolName = Cls->GetName();
+		// 允许任务自定义 MCP 工具名称；未设置则回退为类名
+		const FString ToolName = CDO->McpToolName.IsEmpty() ? Cls->GetName() : CDO->McpToolName;
 		if (RegisteredToolNames.Contains(ToolName))
 		{
 			continue; // 本组件已注册过同名工具，跳过
@@ -360,7 +361,10 @@ void UTaskManagerComponent::RegisterMcpTools()
 
 		FMCPTool Tool;
 		Tool.Name = ToolName;
-		Tool.Description = FString::Printf(TEXT("TaskWeaver task: %s"), *Tool.Name);
+		// 描述同样允许覆盖
+		Tool.Description = CDO->McpToolDescription.IsEmpty()
+			? FString::Printf(TEXT("TaskWeaver task: %s"), *Tool.Name)
+			: CDO->McpToolDescription;
 
 		// 添加 Owner 参数（Actor 指针类型），用于调用时指定本组件的拥有者
 		UClass* OwnerClass = GetOwner() ? GetOwner()->GetClass() : AActor::StaticClass();

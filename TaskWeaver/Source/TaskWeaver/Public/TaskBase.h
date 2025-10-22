@@ -25,6 +25,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Task")
 	FString DisplayName;
 
+	// MCP 工具名称（可选）。如果设置，将作为该任务导出的 MCP 工具的名称；未设置则使用类名。
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Task|MCP", meta=(DisplayName="MCP Tool Name"))
+	FString McpToolName;
+	// MCP 工具描述（可选）。如果设置，将覆盖默认描述。
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Task|MCP", meta=(DisplayName="MCP Tool Description"))
+	FString McpToolDescription;
+
 	UFUNCTION(BlueprintNativeEvent, Category="Task|Lifecycle") void Start(UTaskManagerComponent* Manager);
 	virtual void Start_Implementation(UTaskManagerComponent* /*Manager*/){ State = ETaskState::Running; }
 	UFUNCTION(BlueprintNativeEvent, Category="Task|Lifecycle") void Update(UTaskManagerComponent* Manager, float DeltaTime);

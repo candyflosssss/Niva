@@ -85,4 +85,9 @@ public:
 	UFUNCTION(BlueprintNativeEvent, Category="Task|MCP")
 	bool ApplyMcpArgumentsBP(const FMCPTool& MCPTool, const FString& Json, UTaskManagerComponent* Manager);
 	virtual bool ApplyMcpArgumentsBP_Implementation(const FMCPTool& MCPTool, const FString& Json, UTaskManagerComponent* Manager) { return ApplyMcpArguments(MCPTool, Json, Manager); }
+
+	// 任务语义层的有效性校验（可选覆盖）。默认返回 true。
+	UFUNCTION(BlueprintNativeEvent, Category="Task|MCP")
+	bool IsMcpTargetValid(UTaskManagerComponent* Manager, AActor* TargetActor, UActorComponent* TargetComponent, FString& OutReason) const;
+	virtual bool IsMcpTargetValid_Implementation(UTaskManagerComponent* /*Manager*/, AActor* /*TargetActor*/, UActorComponent* /*TargetComponent*/, FString& /*OutReason*/) const { return true; }
 };

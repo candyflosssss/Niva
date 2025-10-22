@@ -23,6 +23,8 @@
 #include "Policies/CondensedJsonPrintPolicy.h"
 #include "Containers/Queue.h"
 #include "HAL/RunnableThread.h"
+#include "Components/ActorComponent.h"
+#include "McpExposableBaseComponent.h"
 #include "NetworkCoreSubsystem.generated.h"
 
 
@@ -452,9 +454,6 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NetworkCore|MCP|Tool", meta=(MetaClass="Actor", AllowAbstract="false"))
 	static UMCPToolProperty* CreateActorPtrProperty(FString InName, FString InDescription, TSubclassOf<AActor> InActorClass);
 	
-
-	
-	
 	//重载虚函数，返回一个jsonObject
 	virtual TSharedPtr<FJsonObject> GetJsonObject() override;
 
@@ -466,6 +465,43 @@ public:
 
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NetworkCore|MCP|Tool")
 	AActor* GetValue(FString InJson);
+};
+
+
+// === 组件指针参数类型 ===
+UCLASS(BlueprintType)
+class NETWORKCOREPLUGIN_API UMCPToolPropertyComponentPtr : public UMCPToolProperty
+{
+	GENERATED_BODY()
+public:
+	// 基类过滤（可为空表示不过滤），必须为 UMcpExposableBaseComponent 的派生
+	UPROPERTY(BlueprintReadOnly, Category = "NetworkCore|MCP|Tool", meta=(MetaClass="McpExposableBaseComponent", AllowAbstract="true"))
+	TSubclassOf<UMcpExposableBaseComponent> ComponentClass;
+
+	// 名称 → 组件 的映射（可读名必须在一次枚举集合内唯一）
+	TMap<FString, TWeakObjectPtr<UMcpExposableBaseComponent>> ComponentMap;
+
+	// 创建参数对象
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NetworkCore|MCP|Tool")
+	static UMCPToolProperty* CreateComponentPtrProperty(FString InName, FString InDescription, TSubclassOf<UMcpExposableBaseComponent> InComponentClass);
+
+	// 通过注册表构建可选组件集合
+	UFUNCTION(BlueprintCallable, Category = "NetworkCore|MCP|Tool")
+	TArray<UMcpExposableBaseComponent*> FindComponents();
+
+	// Schema 构建（返回可读名枚举）
+	virtual TSharedPtr<FJsonObject> GetJsonObject() override;
+
+	// 可读名集合
+	virtual TArray<FString> GetAvailableTargets() override;
+
+	// 解析可读名 → 组件
+	UFUNCTION(BlueprintCallable)
+	UMcpExposableBaseComponent* GetComponentByLabel(FString InLabel);
+
+	// 从提交 JSON 解析组件
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NetworkCore|MCP|Tool")
+	UMcpExposableBaseComponent* GetValue(FString InJson);
 };
 
 
@@ -563,6 +599,9 @@ public:
 	// actor
 	UFUNCTION(BlueprintCallable, Category = "MCP Tool")
 	static bool GetActorValue(const FMCPTool& MCPTool, const FString& Name, const FString& InJson, AActor*& OutValue);
+	// component
+	UFUNCTION(BlueprintCallable, Category = "MCP Tool")
+	static bool GetComponentValue(const FMCPTool& MCPTool, const FString& Name, const FString& InJson, UActorComponent*& OutValue);
 
 	// 向 FMCPTool 中追加一个参数属性（蓝图辅助）
 	UFUNCTION(BlueprintCallable, Category = "MCP Tool")

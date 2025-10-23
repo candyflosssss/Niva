@@ -468,6 +468,38 @@ public:
 	AActor* GetValue(FString InJson);
 };
 
+// === Component pointer property (for UMcpExposableBaseComponent and subclasses) ===
+UCLASS(BlueprintType)
+class NETWORKCOREPLUGIN_API UMCPToolPropertyComponentPtr: public UMCPToolProperty
+{
+	GENERATED_BODY()
+public:
+	// Target component base class (must derive from UMcpExposableBaseComponent)
+	UPROPERTY(BlueprintReadOnly, Category = "NetworkCore|MCP|Tool", meta=(MetaClass="McpExposableBaseComponent", AllowAbstract="false"))
+	TSubclassOf<class UMcpExposableBaseComponent> ComponentClass;
+
+	// Map from readable name to component (weak)
+	TMap<FString, TWeakObjectPtr<class UMcpExposableBaseComponent>> ComponentMap;
+
+	// Factory
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NetworkCore|MCP|Tool")
+	static UMCPToolProperty* CreateComponentPtrProperty(FString InName, FString InDescription, TSubclassOf<class UMcpExposableBaseComponent> InComponentClass);
+
+	// Build JSON schema with enum of labels
+	virtual TSharedPtr<FJsonObject> GetJsonObject() override;
+
+	// Re-enumerate available targets (labels)
+	virtual TArray<FString> GetAvailableTargets() override;
+
+	// Lookup by label
+	UFUNCTION(BlueprintCallable)
+	UActorComponent* GetComponentByLabel(const FString& InLabel);
+
+	// Parse JSON payload to component
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NetworkCore|MCP|Tool")
+	UActorComponent* GetValue(FString InJson);
+};
+
 
 //继承UMCPToolProperty，并支持数组类型的参数
 UCLASS(BlueprintType)
@@ -563,6 +595,9 @@ public:
 	// actor
 	UFUNCTION(BlueprintCallable, Category = "MCP Tool")
 	static bool GetActorValue(const FMCPTool& MCPTool, const FString& Name, const FString& InJson, AActor*& OutValue);
+	// component (UMcpExposableBaseComponent and subclasses)
+	UFUNCTION(BlueprintCallable, Category = "MCP Tool")
+	static bool GetComponentValue(const FMCPTool& MCPTool, const FString& Name, const FString& InJson, UActorComponent*& OutValue);
 
 	// 向 FMCPTool 中追加一个参数属性（蓝图辅助）
 	UFUNCTION(BlueprintCallable, Category = "MCP Tool")
@@ -840,6 +875,9 @@ private:
 	 * @return 指示SSE操作成功或失败的状态码。
 	 */
 	static int OnSSE(struct mg_connection* Connection, void* UserData);
+	// 新增：GET /tools 与 /ui/tools 处理器
+	static int OnGetTools(struct mg_connection* Connection, void* UserData);
+	static int OnGetToolsUI(struct mg_connection* Connection, void* UserData);
 
 	/**
 	 * @brief 生成唯一的会话标识符。
@@ -948,6 +986,17 @@ public:
 			MCPToolHandle->ToolCallback(true, TEXT("解析json失败"));
 		}
 	}
+
+	// 列出当前注册的所有工具、其参数以及可用目标（对象/组件）
+	// 注意：UHT 不支持返回 TSharedPtr，提供一个 FString 版本给蓝图/外部调用；
+	// 内部使用一个 C++ 辅助函数构造 JsonObject。
+	TSharedPtr<FJsonObject> BuildAllRegisteredToolsJsonObject() const;
+	UFUNCTION(BlueprintCallable, Category = "NetworkCore|MCP|Introspect")
+	FString GetAllRegisteredToolsJson();
+
+	// 线程安全版本：在非游戏线程调用时，会切到游戏线程构建（以返回包含 targets 的完整信息）
+	UFUNCTION(BlueprintCallable, Category = "NetworkCore|MCP|Introspect")
+	FString GetAllRegisteredToolsJson_Safe();
 };
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnRefreshMCPComplete, bool, bSuccess, const FString&, Message);

@@ -26,7 +26,7 @@ struct FTaskCallbackContext
 	float LastHeartbeatTime = 0.f;
 	float LastPercent = -1.f;
 	float MinProgressInterval = 0.5f; // s
-	float HeartbeatInterval = 2.0f;   // s
+	float HeartbeatInterval = 1.0f;   // s
 	// 完结控制
 	bool bFinalSent = false;
 	// 统计
@@ -72,7 +72,7 @@ public:
 
 	// === 配置：心跳与进度节流（可在编辑器或蓝图中设置） ===
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="TaskManager|MCP|Config")
-	float HeartbeatIntervalSeconds = 3.0f;
+	float HeartbeatIntervalSeconds = 1.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="TaskManager|MCP|Config")
 	float MinProgressIntervalSeconds = 0.5f;

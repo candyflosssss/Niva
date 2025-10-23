@@ -7,6 +7,8 @@
 #include "Misc/OutputDeviceDebug.h"
 #include "Delegates/Delegate.h"
 #include "Kismet/GameplayStatics.h"
+#include "McpComponentRegistrySubsystem.h"
+#include "McpExposableBaseComponent.h"
 
 void UNetworkCoreSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
@@ -943,6 +945,9 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
 	}
 }
 
+// forward declaration for favicon handler
+static int OnGetFavicon(struct mg_connection* Connection, void* UserData);
+
 void UMCPTransportSubsystem::StartMCPServer()
 {
     // 先获取UMCPTransportSubsystem
@@ -970,6 +975,11 @@ void UMCPTransportSubsystem::StartMCPServer()
     mg_set_request_handler(ServerContext, "/message", OnPostMessage, this);
     // SSE服务器，用于服务器向客户端发送数据
     mg_set_request_handler(ServerContext, "/sse", OnSSE, this);
+    // 新增：工具可视化 API 与简单 UI
+    mg_set_request_handler(ServerContext, "/tools", OnGetTools, this);
+    mg_set_request_handler(ServerContext, "/ui/tools", OnGetToolsUI, this);
+    // handle favicon to avoid 404 noise in console
+    mg_set_request_handler(ServerContext, "/favicon.ico", OnGetFavicon, this);
 
     // UE_LOG(LogTemp, Log, TEXT("SSE :server:start，Port：8080"));
 
@@ -1140,11 +1150,12 @@ UMCPToolProperty* UMCPToolPropertyString::CreateStringProperty(FString InName,
 
 TSharedPtr<FJsonObject> UMCPToolPropertyString::GetJsonObject()
 {
-	//创建，并读取自身的属性补全json
+	// JSON Schema fragment for this parameter
 	TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
-	RootObject->SetStringField("name", Name);
+	// Use JSON Schema fields: type/description/title
 	RootObject->SetStringField("type", StaticEnum<EMCPJsonType>()->GetNameStringByValue(static_cast<int64>(Type)));
 	RootObject->SetStringField("description", Description);
+	RootObject->SetStringField("title", Name);
 	return RootObject;
 }
 
@@ -1215,11 +1226,13 @@ UMCPToolProperty* UMCPToolPropertyNumber::CreateNumberProperty(FString InName,FS
 TSharedPtr<FJsonObject> UMCPToolPropertyNumber::GetJsonObject()
 {
 	TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
-	RootObject->SetStringField("name", Name);
+	// JSON Schema numeric type
 	RootObject->SetStringField("type", StaticEnum<EMCPJsonType>()->GetNameStringByValue(static_cast<int64>(Type)));
 	RootObject->SetStringField("description", Description);
+	RootObject->SetStringField("title", Name);
 	RootObject->SetNumberField("minimum", Min);
 	RootObject->SetNumberField("maximum", Max);
+	RootObject->SetNumberField("default", Default);
 	return RootObject;
 }
 
@@ -1287,9 +1300,9 @@ UMCPToolProperty* UMCPToolPropertyInt::CreateIntProperty(FString InName, FString
 TSharedPtr<FJsonObject> UMCPToolPropertyInt::GetJsonObject()
 {
 	TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
-	RootObject->SetStringField("name", Name);
 	RootObject->SetStringField("type", StaticEnum<EMCPJsonType>()->GetNameStringByValue(static_cast<int64>(Type)));
 	RootObject->SetStringField("description", Description);
+	RootObject->SetStringField("title", Name);
 	RootObject->SetNumberField("minimum", Min);
 	RootObject->SetNumberField("maximum", Max);
 	return RootObject;
@@ -1415,16 +1428,18 @@ UMCPToolProperty* UMCPToolPropertyActorPtr::CreateActorPtrProperty(FString InNam
 TSharedPtr<FJsonObject> UMCPToolPropertyActorPtr::GetJsonObject()
 {
 	TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
-	RootObject->SetStringField("name", Name);
 	RootObject->SetStringField("type", StaticEnum<EMCPJsonType>()->GetNameStringByValue(static_cast<int64>(Type)));
 	RootObject->SetStringField("description", Description);
-	// jsonschemer,这里用enum限制参数
+	RootObject->SetStringField("title", Name);
+	// Use enum to constrain to available actor labels (if populated)
 	TArray<TSharedPtr<FJsonValue>> EnumArray;
 	for (auto i : ActorMap) {
 		TSharedPtr<FJsonValue> EnumValue = MakeShareable(new FJsonValueString(i.Key));
 		EnumArray.Add(EnumValue);
 	}
-	RootObject->SetArrayField("enum", EnumArray);
+	if (EnumArray.Num() > 0) {
+		RootObject->SetArrayField("enum", EnumArray);
+	}
 	return RootObject;
 }
 
@@ -1501,25 +1516,15 @@ UMCPToolProperty* UMCPToolPropertyArray::CreateArrayProperty(FString InName, FSt
 
 TSharedPtr<FJsonObject> UMCPToolPropertyArray::GetJsonObject()
 {
-	/*
-	*"ids": {
-	  "type": "array",
-	  "items": { "type": "number" },
-	  "description": "ID 列表"
-	}
-	* 
-	 */
+	// JSON Schema for array parameter
 	TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
-
-	RootObject->SetStringField("name", Name);
-	RootObject->SetStringField("type", StaticEnum<EMCPJsonType>()->GetNameStringByValue(static_cast<int64>(Type)));
+	RootObject->SetStringField("type", "array");
 	RootObject->SetStringField("description", Description);
-	// jsonschemer
+	RootObject->SetStringField("title", Name);
 	TSharedPtr<FJsonObject> ItemsObject = MakeShareable(new FJsonObject);
 	ItemsObject->SetStringField("type", StaticEnum<EMCPJsonType>()->GetNameStringByValue(static_cast<int64>(Property->Type)));
 	RootObject->SetObjectField("items", ItemsObject);
 	return RootObject;
-	
 }
 
 bool UMCPToolBlueprintLibrary::GetIntValue(const FMCPTool& MCPTool, const FString& Name, const FString& InJson,int32& OutValue)
@@ -1746,4 +1751,381 @@ void UMCPToolHandle::ToolCallback(bool isError, TSharedPtr<FJsonObject> json)
 		MCPTransportSubsystem->SendSSE(SessionId, TEXT("message"), JsonMessage);
 
 	}
+}
+
+
+// ===== MCP ComponentPtr property implementation =====
+UMCPToolProperty* UMCPToolPropertyComponentPtr::CreateComponentPtrProperty(FString InName, FString InDescription, TSubclassOf<UMcpExposableBaseComponent> InComponentClass)
+{
+	UMCPToolPropertyComponentPtr* Property = NewObject<UMCPToolPropertyComponentPtr>();
+	Property->Name = InName;
+	Property->Type = EMCPJsonType::String;
+	Property->Description = InDescription;
+	Property->ComponentClass = InComponentClass;
+	// Pre-enumerate once
+	Property->GetAvailableTargets();
+	return Property;
+}
+
+static void BuildUniqueLabels(const TArray<UMcpExposableBaseComponent*>& Comps, TMap<FString, TWeakObjectPtr<UMcpExposableBaseComponent>>& OutMap)
+{
+	OutMap.Empty();
+	// Build a sortable list with base label and a stable tie-breaker to ensure deterministic numbering
+	struct FEntry { FString BaseLabel; FString TieBreaker; UMcpExposableBaseComponent* Comp; };
+	TArray<FEntry> Entries; Entries.Reserve(Comps.Num());
+	for (UMcpExposableBaseComponent* Comp : Comps)
+	{
+		if (!IsValid(Comp)) continue;
+		FString BaseLabel = Comp->GetMcpLabel();
+		if (BaseLabel.IsEmpty())
+		{
+			const AActor* Owner = Comp->GetOwner();
+			BaseLabel = FString::Printf(TEXT("%s • %s • %s"), Owner ? *Owner->GetName() : TEXT("<NoOwner>"), *Comp->GetClass()->GetName(), *Comp->GetName());
+		}
+		// Use object path as stable tie-breaker within a session
+		const FString Path = Comp->GetPathName();
+		Entries.Add({ BaseLabel, Path, Comp });
+	}
+	Entries.Sort([](const FEntry& A, const FEntry& B){
+		if (A.BaseLabel != B.BaseLabel) return A.BaseLabel < B.BaseLabel;
+		return A.TieBreaker < B.TieBreaker;
+	});
+	TMap<FString, int32> Counts;
+	for (const FEntry& E : Entries)
+	{
+		int32& C = Counts.FindOrAdd(E.BaseLabel);
+		C++;
+		const FString FinalLabel = (C > 1) ? FString::Printf(TEXT("%s #%d"), *E.BaseLabel, C) : E.BaseLabel;
+		OutMap.Add(FinalLabel, E.Comp);
+	}
+}
+
+TSharedPtr<FJsonObject> UMCPToolPropertyComponentPtr::GetJsonObject()
+{
+	// Build enum list from registry (if available on current thread)
+	GetAvailableTargets();
+	TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
+	RootObject->SetStringField("type", StaticEnum<EMCPJsonType>()->GetNameStringByValue(static_cast<int64>(Type)));
+	RootObject->SetStringField("description", Description);
+	RootObject->SetStringField("title", Name);
+
+	TArray<TSharedPtr<FJsonValue>> EnumArray;
+	for (const auto& KVP : ComponentMap)
+	{
+		EnumArray.Add(MakeShareable(new FJsonValueString(KVP.Key)));
+	}
+	if (EnumArray.Num() > 0) {
+		RootObject->SetArrayField("enum", EnumArray);
+	}
+	return RootObject;
+}
+
+TArray<FString> UMCPToolPropertyComponentPtr::GetAvailableTargets()
+{
+	ComponentMap.Empty();
+	// Find a valid game world
+	UWorld* World = nullptr;
+	if (GEngine)
+	{
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			if (Ctx.World() && Ctx.World()->IsGameWorld()) { World = Ctx.World(); break; }
+		}
+	}
+	TArray<FString> Labels;
+	if (!World) return Labels;
+	UMcpComponentRegistrySubsystem* Sys = World->GetSubsystem<UMcpComponentRegistrySubsystem>();
+	if (!Sys) return Labels;
+	TArray<UMcpExposableBaseComponent*> Comps;
+	TSubclassOf<UMcpExposableBaseComponent> BaseClassToUse = ComponentClass ? ComponentClass.Get() : UMcpExposableBaseComponent::StaticClass();
+	Sys->Enumerate(BaseClassToUse, Comps);
+	BuildUniqueLabels(Comps, ComponentMap);
+	for (const auto& KVP : ComponentMap)
+	{
+		if (KVP.Value.IsValid()) Labels.Add(KVP.Key);
+	}
+	return Labels;
+}
+
+UActorComponent* UMCPToolPropertyComponentPtr::GetComponentByLabel(const FString& InLabel)
+{
+	if (const TWeakObjectPtr<UMcpExposableBaseComponent>* Found = ComponentMap.Find(InLabel))
+	{
+		return Found->IsValid() ? Found->Get() : nullptr;
+	}
+	return nullptr;
+}
+
+UActorComponent* UMCPToolPropertyComponentPtr::GetValue(FString InJson)
+{
+	TSharedPtr<FJsonObject> JsonObject;
+	TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(InJson);
+	if (FJsonSerializer::Deserialize(JsonReader, JsonObject))
+	{
+		TSharedPtr<FJsonObject> ParamsObject = JsonObject->GetObjectField(TEXT("params"));
+		if (ParamsObject.IsValid())
+		{
+			TSharedPtr<FJsonObject> ArgumentsObject = ParamsObject->GetObjectField(TEXT("arguments"));
+			if (ArgumentsObject.IsValid())
+			{
+				const FString Label = ArgumentsObject->GetStringField(Name);
+				return GetComponentByLabel(Label);
+			}
+		}
+	}
+	return nullptr;
+}
+
+// === Blueprint library: GetComponentValue ===
+bool UMCPToolBlueprintLibrary::GetComponentValue(const FMCPTool& MCPTool, const FString& Name, const FString& InJson, UActorComponent*& OutValue)
+{
+	if (UMCPToolProperty* Property = GetProperty(MCPTool, Name))
+	{
+		if (UMCPToolPropertyComponentPtr* Prop = Cast<UMCPToolPropertyComponentPtr>(Property))
+		{
+			OutValue = Prop->GetValue(InJson);
+			return OutValue != nullptr;
+		}
+	}
+	OutValue = nullptr;
+	return false;
+}
+
+
+// === Introspection: list all registered tools with their params and available targets ===
+TSharedPtr<FJsonObject> UMCPTransportSubsystem::BuildAllRegisteredToolsJsonObject() const
+{
+	TSharedPtr<FJsonObject> Root = MakeShareable(new FJsonObject);
+	TArray<TSharedPtr<FJsonValue>> ToolsArray;
+
+	for (const TPair<FString, FMCPToolStorage>& Pair : MCPTools)
+	{
+		const FMCPTool& CanonTool = Pair.Value.MCPTool;
+		TSharedPtr<FJsonObject> ToolObj = MakeShareable(new FJsonObject);
+		ToolObj->SetStringField(TEXT("name"), CanonTool.Name);
+		ToolObj->SetStringField(TEXT("description"), CanonTool.Description);
+
+		// Legacy properties array (kept for backward compatibility)
+		TArray<TSharedPtr<FJsonValue>> PropArray;
+		// JSON Schema input schema
+		TSharedPtr<FJsonObject> InputSchema = MakeShareable(new FJsonObject);
+		InputSchema->SetStringField(TEXT("type"), TEXT("object"));
+		TSharedPtr<FJsonObject> PropertiesObject = MakeShareable(new FJsonObject);
+		TArray<TSharedPtr<FJsonValue>> RequiredArray;
+		for (UMCPToolProperty* Prop : CanonTool.Properties)
+		{
+			if (!Prop) { continue; }
+			TSharedPtr<FJsonObject> PropObj = Prop->GetJsonObject();
+			// Attach available targets (legacy) and merge into schema as enum when possible
+			TArray<FString> Targets;
+			if (IsInGameThread())
+			{
+				Targets = Prop->GetAvailableTargets();
+			}
+			if (Targets.Num() > 0)
+			{
+				TArray<TSharedPtr<FJsonValue>> TargetVals;
+				for (const FString& T : Targets)
+				{
+					TargetVals.Add(MakeShareable(new FJsonValueString(T)));
+				}
+				// legacy targets field
+				PropObj->SetArrayField(TEXT("targets"), TargetVals);
+				// schema enum
+				TSharedPtr<FJsonObject> SchemaFrag = MakeShareable(new FJsonObject);
+				// Start from Prop->GetJsonObject() to include type/desc/title
+				SchemaFrag = Prop->GetJsonObject();
+				SchemaFrag->SetArrayField(TEXT("enum"), TargetVals);
+				PropertiesObject->SetObjectField(Prop->Name, SchemaFrag);
+			}
+			else
+			{
+				PropertiesObject->SetObjectField(Prop->Name, Prop->GetJsonObject());
+			}
+			RequiredArray.Add(MakeShareable(new FJsonValueString(Prop->Name)));
+			PropArray.Add(MakeShareable(new FJsonValueObject(PropObj)));
+		}
+		InputSchema->SetObjectField(TEXT("properties"), PropertiesObject);
+		InputSchema->SetArrayField(TEXT("required"), RequiredArray);
+		ToolObj->SetObjectField(TEXT("inputSchema"), InputSchema);
+		ToolObj->SetArrayField(TEXT("properties"), PropArray);
+
+		// optionally include variant count
+		ToolObj->SetNumberField(TEXT("variantCount"), Pair.Value.MCPToolVariants.Num());
+
+		ToolsArray.Add(MakeShareable(new FJsonValueObject(ToolObj)));
+	}
+
+	Root->SetArrayField(TEXT("tools"), ToolsArray);
+	Root->SetNumberField(TEXT("count"), ToolsArray.Num());
+	return Root;
+}
+
+FString UMCPTransportSubsystem::GetAllRegisteredToolsJson()
+{
+	TSharedPtr<FJsonObject> Root = BuildAllRegisteredToolsJsonObject();
+	FString Out;
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
+	FJsonSerializer::Serialize(Root.ToSharedRef(), Writer);
+	Out.ReplaceInline(TEXT("\n"), TEXT(""));
+	Out.ReplaceInline(TEXT("\r"), TEXT(""));
+	Out.ReplaceInline(TEXT("\t"), TEXT(""));
+	return Out;
+}
+
+FString UMCPTransportSubsystem::GetAllRegisteredToolsJson_Safe()
+{
+	if (IsInGameThread())
+	{
+		return GetAllRegisteredToolsJson();
+	}
+	FString Result;
+	FEvent* Done = FPlatformProcess::GetSynchEventFromPool(false);
+	// 使用弱引用捕获，避免子系统销毁后悬空指针
+	TWeakObjectPtr<UMCPTransportSubsystem> WeakThis(this);
+	FFunctionGraphTask::CreateAndDispatchWhenReady([WeakThis, &Result, Done]()
+	{
+		if (WeakThis.IsValid())
+		{
+			Result = WeakThis->GetAllRegisteredToolsJson();
+		}
+		else
+		{
+			Result = TEXT("{\"count\":0,\"tools\":[]}");
+		}
+		Done->Trigger();
+	}, TStatId(), nullptr, ENamedThreads::GameThread);
+	// Avoid returning the FEvent to the pool before the GameThread task runs, which can crash when the
+	// lambda calls Done->Trigger() after a timeout-based early return. Block until signaled to ensure
+	// ownership remains valid and eliminate the use-after-free.
+	Done->Wait();
+	FPlatformProcess::ReturnSynchEventToPool(Done);
+	if (Result.IsEmpty())
+	{
+		TSharedPtr<FJsonObject> Root = MakeShareable(new FJsonObject);
+		TArray<TSharedPtr<FJsonValue>> ToolsArray;
+		for (const TPair<FString, FMCPToolStorage>& Pair : MCPTools)
+		{
+			const FMCPTool& CanonTool = Pair.Value.MCPTool;
+			TSharedPtr<FJsonObject> ToolObj = MakeShareable(new FJsonObject);
+			ToolObj->SetStringField(TEXT("name"), CanonTool.Name);
+			ToolObj->SetStringField(TEXT("description"), CanonTool.Description);
+			// Legacy properties array
+			TArray<TSharedPtr<FJsonValue>> PropArray;
+			// JSON Schema input schema
+			TSharedPtr<FJsonObject> InputSchema = MakeShareable(new FJsonObject);
+			InputSchema->SetStringField(TEXT("type"), TEXT("object"));
+			TSharedPtr<FJsonObject> PropertiesObject = MakeShareable(new FJsonObject);
+			TArray<TSharedPtr<FJsonValue>> RequiredArray;
+			for (UMCPToolProperty* Prop : CanonTool.Properties)
+			{
+				if (!Prop) continue;
+				TSharedPtr<FJsonObject> PropObj = Prop->GetJsonObject();
+				PropArray.Add(MakeShareable(new FJsonValueObject(PropObj)));
+				PropertiesObject->SetObjectField(Prop->Name, Prop->GetJsonObject());
+				RequiredArray.Add(MakeShareable(new FJsonValueString(Prop->Name)));
+			}
+			InputSchema->SetObjectField(TEXT("properties"), PropertiesObject);
+			InputSchema->SetArrayField(TEXT("required"), RequiredArray);
+			ToolObj->SetObjectField(TEXT("inputSchema"), InputSchema);
+			ToolObj->SetArrayField(TEXT("properties"), PropArray);
+			ToolObj->SetNumberField(TEXT("variantCount"), Pair.Value.MCPToolVariants.Num());
+			ToolsArray.Add(MakeShareable(new FJsonValueObject(ToolObj)));
+		}
+		Root->SetArrayField(TEXT("tools"), ToolsArray);
+		Root->SetNumberField(TEXT("count"), ToolsArray.Num());
+		FString Out;
+		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
+		FJsonSerializer::Serialize(Root.ToSharedRef(), Writer);
+		Out.ReplaceInline(TEXT("\n"), TEXT(""));
+		Out.ReplaceInline(TEXT("\r"), TEXT(""));
+		Out.ReplaceInline(TEXT("\t"), TEXT(""));
+		return Out;
+	}
+	return Result;
+}
+
+// === Added HTTP GET handlers for tools listing and simple UI ===
+int UMCPTransportSubsystem::OnGetTools(struct mg_connection* Connection, void* UserData)
+{
+	auto* This = static_cast<UMCPTransportSubsystem*>(UserData);
+	FString Json = This ? This->GetAllRegisteredToolsJson_Safe() : TEXT("{\"count\":0,\"tools\":[]}");
+	FTCHARToUTF8 JsonUtf8(*Json);
+	int32 Len = JsonUtf8.Length();
+	mg_printf(Connection,
+		"HTTP/1.1 200 OK\r\n"
+		"Content-Type: application/json; charset=utf-8\r\n"
+		"Access-Control-Allow-Origin: *\r\n"
+		"Content-Length: %d\r\n\r\n%.*s",
+		(int)Len, (int)Len, JsonUtf8.Get());
+	return 200;
+}
+
+int UMCPTransportSubsystem::OnGetToolsUI(struct mg_connection* Connection, void* UserData)
+{
+	static const char* Html = R"HTML(<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>MCP 工具监视器</title>
+	<style>
+	body{font-family:Segoe UI,Arial; margin:14px; background:transparent;}
+	.muted{color:#6b7280} .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef2ff;color:#4f46e5;margin-left:8px}
+	#grid{display:grid;grid-template-columns:1fr;gap:12px}
+	.card{border:1px solid #e5e7eb;border-radius:10px;padding:12px;background:#fff;box-shadow:0 4px 12px rgba(0,0,0,.04)}
+	pre{background:#0c0f14;color:#9fd;padding:10px;overflow:auto;max-height:64vh;border-radius:8px;font-size:12px}
+	button{padding:4px 10px;border:0;border-radius:8px;background:#3066ff;color:#fff;cursor:pointer;margin-right:6px} button.ghost{background:#eef2ff;color:#374151} button:hover{filter:brightness(1.06)}
+	input[type=text]{padding:6px 8px;border:1px solid #e5e7eb;border-radius:8px;width:220px}
+	details{border:1px solid #eef2ff;border-radius:8px;margin:6px 0;background:#fafbff} details>summary{padding:8px 10px;cursor:pointer;list-style:none;font-weight:600} details[open]>summary{border-bottom:1px solid #eef2ff}
+	.tool-head{display:flex;align-items:center;gap:8px} .tool-desc{font-size:12px;margin:4px 0 8px 0;color:#6b7280}
+	.prop{display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px dashed #eef2ff} .prop:last-child{border-bottom:0}
+	.type{font-size:12px;padding:1px 6px;border-radius:999px;background:#f3f4f6;color:#374151} .chip{display:inline-block;background:#f0f3ff;border:1px solid #d9e2ff;color:#334155;border-radius:999px;padding:2px 8px;margin:2px 4px;font-size:12px}
+	.targets{padding:4px 0 0 0} .tg summary{font-size:12px;color:#4f46e5} .right{float:right;color:#94a3b8;font-weight:500}
+	.toolbar{display:flex;align-items:center;gap:8px;margin:6px 0 10px 0}
+	</style></head><body>
+	<div class="toolbar">
+	  <input id="filter" type="text" placeholder="过滤工具名称...">
+	  <span class="muted" id="ts" style="margin-left:auto"></span>
+	</div>
+	<div id="grid">
+	  <div class="card"><h3 style="margin:6px 0 10px 0">工具</h3><div id="tools"></div></div>
+	</div>
+	<script>
+	var OPEN = {}; function saveOpen(){ var o={}; Array.prototype.forEach.call(document.querySelectorAll('details.tool'), function(d){ if(d.open){o[d.getAttribute('data-name')] = 1;} }); OPEN=o; }
+	function restoreOpen(){ Array.prototype.forEach.call(document.querySelectorAll('details.tool'), function(d){ var n=d.getAttribute('data-name'); if(OPEN[n]) d.open=true; }); }
+	function esc(s){ return (s||'').toString().replace(/[&<>"']/g, function(c){return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c]);}); }
+	function renderTargets(arr){ if(!arr||!arr.length) return '<span class="muted">-</span>'; var first=arr.slice(0,5).map(function(t){return '<span class="chip">'+esc(t)+'</span>';}).join(''); if(arr.length<=5) return first; var rest=arr.slice(5).map(function(t){return '<span class="chip">'+esc(t)+'</span>';}).join(''); return first + '<details class="tg"><summary>展开其余 '+(arr.length-5)+' 个</summary>'+rest+'</details>'; }
+	function propRow(name, schema, legacy){ var typ=esc((schema && schema.type) || ''), desc=esc((schema && schema.description) || ''), title=esc((schema && schema.title) || name); var def=(schema&&schema.default!==undefined)?(' 默认: '+esc(schema.default)):''; var range=''; if(schema){ if(schema.minimum!==undefined||schema.maximum!==undefined){ range=' 范围: '+(schema.minimum!==undefined?schema.minimum:'-∞')+' ~ '+(schema.maximum!==undefined?schema.maximum:'+∞'); } }
+	  var hasEnum = !!(schema && Array.isArray(schema.enum) && schema.enum.length);
+	  var enumHtml=''; if(hasEnum){ enumHtml = '<div>可选值：'+schema.enum.map(function(v){ return '<span class="chip">'+esc(v)+'</span>'; }).join('')+'</div>'; }
+	  var tgHtml=''; if(!hasEnum && legacy && Array.isArray(legacy.targets) && legacy.targets.length){ tgHtml = '<div class="targets">'+renderTargets(legacy.targets)+'</div>'; }
+	  return '<div class="prop"><div><strong>'+title+'</strong> <span class="type">'+typ+'</span><div class="muted">'+desc+def+range+'</div>'+enumHtml+tgHtml+'</div></div>'; }
+	function toolBlock(t){ var name=esc(t.name), desc=esc(t.description||''); var schema=t.inputSchema||{}; var propsObj=(schema.properties)||{}; var keys=Object.keys(propsObj); var body=''; if(keys.length){ body = keys.map(function(k){ return propRow(k, propsObj[k], (t.properties||[]).find(function(p){return p.title===k||p.name===k;})||{} ); }).join(''); } else { body='<div class="muted" style="padding:8px 10px">无参数</div>'; } return '<details class="tool" data-name="'+name+'"><summary><span class="tool-head">'+name+'<span class="right">' + keys.length + ' 参数</span></span></summary><div class="tool-desc">'+desc+'</div>'+body+'</details>'; }
+	function applyFilter(){ var kw=(document.getElementById('filter').value||'').toLowerCase(); Array.prototype.forEach.call(document.querySelectorAll('details.tool'), function(d){ var n=(d.getAttribute('data-name')||'').toLowerCase(); d.style.display = (!kw || n.indexOf(kw)>=0) ? '' : 'none'; }); }
+	async function refresh(){
+	  try{ var r = await fetch('/tools'); var j = await r.json();
+	    document.getElementById('ts').textContent = new Date().toLocaleTimeString();
+	    var cont = document.getElementById('tools'); saveOpen(); cont.innerHTML='';
+	    var tools = j.tools||[]; if(!tools.length){ cont.innerHTML = '<div class=\"muted\">暂无工具</div>'; } else { for(var i=0;i<tools.length;i++){ var t=tools[i]; var div=document.createElement('div'); div.innerHTML = toolBlock(t); cont.appendChild(div.firstChild); } }
+	    restoreOpen(); applyFilter();
+	  }catch(e){ document.getElementById('ts').textContent = '加载失败: '+e; }
+	}
+	document.getElementById('filter').addEventListener('input', applyFilter);
+	refresh(); setInterval(refresh, 1500);
+	</script></body></html>)HTML";
+	mg_printf(Connection,
+		"HTTP/1.1 200 OK\r\n"
+		"Content-Type: text/html; charset=utf-8\r\n"
+		"Access-Control-Allow-Origin: *\r\n\r\n%s", Html);
+	return 200;
+}
+
+
+// Minimal favicon handler to avoid 404 noise in browser consoles
+static int OnGetFavicon(struct mg_connection* Connection, void* UserData)
+{
+	(void)UserData;
+	mg_printf(Connection,
+		"HTTP/1.1 204 No Content\r\n"
+		"Content-Length: 0\r\n"
+		"Access-Control-Allow-Origin: *\r\n\r\n");
+	return 204;
 }

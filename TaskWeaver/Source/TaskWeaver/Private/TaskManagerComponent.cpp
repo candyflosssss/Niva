@@ -152,25 +152,42 @@ void UTaskManagerComponent::ReportProgress(UTaskBase* Task, float Percent, const
 
 	if (Percent >= 0.f) { Ctx->LastPercent = Percent; }
 
-	// 组织紧凑 JSON 文本作为 message
-	TMap<FString,FString> KVs;
-	KVs.Add(TEXT("type"), TEXT("progress"));
-	KVs.Add(TEXT("taskId"), Ctx->TaskId.ToString(EGuidFormats::DigitsWithHyphensInBraces));
-	KVs.Add(TEXT("tool"), Ctx->ToolName);
-	KVs.Add(TEXT("owner"), Ctx->OwnerDisplay);
-	if (Percent >= 0.f)
-	{
-		KVs.Add(TEXT("percent"), FString::SanitizeFloat(Percent));
-	}
-	KVs.Add(TEXT("message"), Message);
-	for (const auto& It : ExtraKVs) { KVs.Add(It.Key, It.Value); }
-	const FString Msg = TW_KvToJsonObject(KVs);
+	// 仅传递人类可读文本到 MCP 的 params.message，避免将 JSON 字符串再次包裹造成转义
+	const FString Msg = Message;
 
 	int32 Completed = -1, Total = -1;
 	if (Percent >= 0.f)
 	{
+		// 百分比路径：映射为 0..100 / 100
 		Completed = FMath::Clamp<int32>(FMath::RoundToInt(Percent), 0, 100);
 		Total = 100;
+	}
+	else
+	{
+		// 无百分比时，尝试用阶段状态补足离散进度（1/3、2/3、3/3）
+		FString StatusLower;
+		if (ExtraKVs.Contains(TEXT("status")))
+		{
+			StatusLower = ExtraKVs[TEXT("status")].ToLower();
+		}
+		if (StatusLower == TEXT("queued"))
+		{
+			Completed = 1; Total = 3;
+		}
+		else if (StatusLower == TEXT("running"))
+		{
+			Completed = 2; Total = 3;
+		}
+		else if (StatusLower == TEXT("completed") || StatusLower == TEXT("done") || StatusLower == TEXT("finished"))
+		{
+			Completed = 3; Total = 3;
+		}
+		else
+		{
+			// 退化：根据消息文本简单推断
+			if (Message.Equals(TEXT("queued"), ESearchCase::IgnoreCase)) { Completed = 1; Total = 3; }
+			else if (Message.Equals(TEXT("running"), ESearchCase::IgnoreCase)) { Completed = 2; Total = 3; }
+		}
 	}
 	Handle->ToolCallbackRaw(false, Msg, /*bFinal=*/false, Completed, Total);
 }

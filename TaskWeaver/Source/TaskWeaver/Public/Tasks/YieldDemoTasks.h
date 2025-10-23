@@ -50,7 +50,7 @@ public:
 	virtual void BuildVisualizationPairs_Implementation(TMap<FString, FString>& OutKVs) const override;
 
 	// 作为 MCP 工具导出（仅包含 Owner 参数；最小实现用于验证通道复用）
-	virtual bool ShouldCreateMcpTool_Implementation(UTaskManagerComponent* /*Manager*/) const override { return true; }
+	virtual bool ShouldCreateMcpTool_Implementation(UTaskManagerComponent* /*Manager*/) const override { return false; }
 
 private:
 	// 内部用于模拟恢复后的耗时工作

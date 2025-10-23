@@ -24,7 +24,7 @@ public:
 	virtual void BuildVisualizationPairs_Implementation(TMap<FString, FString>& OutKVs) const override;
 
 	// 作为 MCP 工具导出，便于从 MCP 客户端直接发起测试
-	virtual bool ShouldCreateMcpTool_Implementation(UTaskManagerComponent* /*Manager*/) const override { return true; }
+	virtual bool ShouldCreateMcpTool_Implementation(UTaskManagerComponent* /*Manager*/) const override { return false; }
 
 private:
 	float Elapsed = 0.f;

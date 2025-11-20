@@ -878,6 +878,8 @@ private:
 	// 新增：GET /tools 与 /ui/tools 处理器
 	static int OnGetTools(struct mg_connection* Connection, void* UserData);
 	static int OnGetToolsUI(struct mg_connection* Connection, void* UserData);
+	// 版本探针：仅返回当前工具数据的版本号（哈希）
+	static int OnGetToolsVersion(struct mg_connection* Connection, void* UserData);
 
 	/**
 	 * @brief 生成唯一的会话标识符。

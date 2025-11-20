@@ -977,6 +977,7 @@ void UMCPTransportSubsystem::StartMCPServer()
     mg_set_request_handler(ServerContext, "/sse", OnSSE, this);
     // 新增：工具可视化 API 与简单 UI
     mg_set_request_handler(ServerContext, "/tools", OnGetTools, this);
+    mg_set_request_handler(ServerContext, "/tools/version", OnGetToolsVersion, this);
     mg_set_request_handler(ServerContext, "/ui/tools", OnGetToolsUI, this);
     // handle favicon to avoid 404 noise in console
     mg_set_request_handler(ServerContext, "/favicon.ico", OnGetFavicon, this);
@@ -2061,6 +2062,24 @@ int UMCPTransportSubsystem::OnGetTools(struct mg_connection* Connection, void* U
 	return 200;
 }
 
+int UMCPTransportSubsystem::OnGetToolsVersion(struct mg_connection* Connection, void* UserData)
+{
+	auto* This = static_cast<UMCPTransportSubsystem*>(UserData);
+	FString Json = This ? This->GetAllRegisteredToolsJson_Safe() : TEXT("{}");
+	uint32 Hash = GetTypeHash(Json);
+	FString Version = FString::Printf(TEXT("%u"), Hash);
+	FString Body = FString::Printf(TEXT("{\"version\":\"%s\"}"), *Version);
+	FTCHARToUTF8 BodyUtf8(*Body);
+	int32 Len = BodyUtf8.Length();
+	mg_printf(Connection,
+		"HTTP/1.1 200 OK\r\n"
+		"Content-Type: application/json; charset=utf-8\r\n"
+		"Access-Control-Allow-Origin: *\r\n"
+		"Content-Length: %d\r\n\r\n%.*s",
+		(int)Len, (int)Len, BodyUtf8.Get());
+	return 200;
+}
+
 int UMCPTransportSubsystem::OnGetToolsUI(struct mg_connection* Connection, void* UserData)
 {
 	static const char* Html = R"HTML(<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -2109,7 +2128,19 @@ int UMCPTransportSubsystem::OnGetToolsUI(struct mg_connection* Connection, void*
 	  }catch(e){ document.getElementById('ts').textContent = '加载失败: '+e; }
 	}
 	document.getElementById('filter').addEventListener('input', applyFilter);
-	refresh(); setInterval(refresh, 1500);
+	let lastVersion = null; let base=15000, max=60000, cur=base; let paused=false;
+	async function checkVersion(){
+	  if(paused){ setTimeout(checkVersion, cur); return; }
+	  try{
+	    const r = await fetch('/tools/version'); if(!r.ok) throw new Error(r.status);
+	    const j = await r.json();
+	    if(j && j.version !== lastVersion){ lastVersion = j.version; await refresh(); cur = base; }
+	    else { cur = base; }
+	  }catch(e){ cur = Math.min(max, cur*2); }
+	  setTimeout(checkVersion, cur);
+	}
+	document.addEventListener('visibilitychange', function(){ paused = document.hidden; if(!paused){ cur=100; checkVersion(); }});
+	refresh(); checkVersion();
 	</script></body></html>)HTML";
 	mg_printf(Connection,
 		"HTTP/1.1 200 OK\r\n"

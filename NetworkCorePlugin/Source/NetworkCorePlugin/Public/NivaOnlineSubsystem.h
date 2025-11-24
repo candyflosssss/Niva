@@ -7,7 +7,11 @@
 #include "Subsystems/WorldSubsystem.h"
 #include "Engine/World.h"
 #include "NetworkCoreSubsystem.h"
+#include "OnlineSubsystem.h"
+#include "Interfaces/OnlineIdentityInterface.h"
 #include "NivaOnlineSubsystem.generated.h"
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FNivaOnLoginComplete, bool, bWasSuccessful, const FString&, Error);
 
 /**
  * 
@@ -41,6 +45,50 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "NivaOnline|Niva")
 	void SetIsServer(bool InIsServer) { isServer = InIsServer; }
+
+	// Blueprint 可调用：尝试 DeviceID 登录（异步）
+ UFUNCTION(BlueprintCallable, Category="Niva|Online")
+ bool LoginWithDeviceID();
+
+	// 如果需要，暴露登出
+	UFUNCTION(BlueprintCallable, Category="Niva|Online")
+	void Logout();
+
+	// 登录完成事件（蓝图可绑定）
+	UPROPERTY(BlueprintAssignable, Category="Niva|Online")
+	FNivaOnLoginComplete OnLoginComplete;
+
+protected:
+    // Login 回调
+    void HandleOnLoginComplete(int32 LocalUserNum, bool bWasSuccessful, const FUniqueNetId& UserId, const FString& Error);
+
+	// Logout 回调（可选）
+	void HandleOnLogoutComplete(int32 LocalUserNum, bool bWasSuccessful);
+
+	// 辅助：读取或生成 device id（并持久化）
+	FString GetOrCreateDeviceId();
+
+ // 保存 DeviceId（如果你想）
+ void SaveDeviceId(const FString& DeviceId);
+
+ // 使用不同凭证类型按序尝试 DeviceId 登录（失败时回退）
+ void TryLoginWithDeviceIdNextType();
+
+private:
+    IOnlineIdentityPtr IdentityInterface;
+    FDelegateHandle OnLoginCompleteDelegateHandle;
+    FDelegateHandle OnLogoutCompleteDelegateHandle;
+
+	// 本地 user index（通常 0）
+	static constexpr int32 LocalUserIndex = 0;
+
+ // 保存的键名
+ const FString DeviceIdKey = TEXT("NivaDeviceID");
+    
+ // 登录重试相关状态
+ int32 RetryIndex = 0; // 当前尝试到的凭证类型索引
+ bool bTriedAutoLogin = false; // 是否已尝试过 AutoLogin
+	
 };
 
 

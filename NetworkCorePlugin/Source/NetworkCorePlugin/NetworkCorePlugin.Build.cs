@@ -43,25 +43,30 @@ public class NetworkCorePlugin : ModuleRules
 			);
 			
 		
-		PrivateDependencyModuleNames.AddRange(
-			new string[]
-			{
-				"CoreUObject",
-				"Engine",
-				"Slate",
-				"SlateCore",
+  PrivateDependencyModuleNames.AddRange(
+            new string[]
+            {
+                "CoreUObject",
+                "Engine",
+                "Slate",
+                "SlateCore",
                 "HTTPServer",
-				"Networking",
-				"Sockets",
+                "Networking",
+                "Sockets",
                 "DeveloperSettings",
-				"HTTP",
+                "HTTP",
                 "Json",
                 "JsonUtilities",
-				"AudioMixer",
-				"WebSockets"
-				// ... add private dependencies that you statically link with here ...	
-			}
-			);
+                "AudioMixer",
+                "WebSockets",
+                // Online Subsystem for login/session
+                "OnlineSubsystem",
+                "OnlineSubsystemUtils",
+                // Access EOS settings API to enforce Connect-only at runtime
+                "OnlineSubsystemEOS"
+                // ... add private dependencies that you statically link with here ... 
+            }
+            );
 
         DynamicallyLoadedModuleNames.AddRange(
 			new string[]

@@ -1,6 +1,6 @@
 ﻿#include "McpTwoPointComponentVisualizer.h"
 
-#include "McpTwoPointComponent.h"
+#include "Components/Spatial/McpTwoPointComponent.h"
 
 #include "SceneManagement.h" // PDI helpers
 #include "UnrealEdGlobals.h"

@@ -2,13 +2,14 @@
 
 
 #include "NetworkCoreSubsystem.h"
+#include "MCP/MCPTransportSubsystem.h" // 新增：按功能分类后的 MCP 传输子系统头
 #include "HAL/PlatformProcess.h"
 #include "Async/Async.h"
 #include "Misc/OutputDeviceDebug.h"
 #include "Delegates/Delegate.h"
 #include "Kismet/GameplayStatics.h"
-#include "McpComponentRegistrySubsystem.h"
-#include "McpExposableBaseComponent.h"
+#include "Subsystems/McpComponentRegistrySubsystem.h"
+#include "Components/Base/McpExposableBaseComponent.h"
 
 void UNetworkCoreSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
@@ -128,20 +129,7 @@ FNivaHttpResponse UNetworkCoreSubsystem::MakeResponse(FString Text, FString Cont
 	return HttpServerResponse;
 }
 
-void UNetworkCoreSubsystem::CheckAudioDevice()
-{
-#ifdef USE_ANDROID_AUDIO
-#if USE_ANDROID_AUDIO
-	UE_LOG(LogTemp, Warning, TEXT("USE_ANDROID_AUDIO is enabled!"));
-#else
-	UE_LOG(LogTemp, Warning, TEXT("USE_ANDROID_AUDIO is disabled!"));
-#endif
-	// 如果没定义
-#else
-	UE_LOG(LogTemp, Warning, TEXT("USE_ANDROID_AUDIO is not defined!"));
-#endif
 
-}
 
 
 

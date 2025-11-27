@@ -4,9 +4,9 @@
 #include "ComponentVisualizer.h"
 
 #include "McpTwoPointComponentVisualizer.h"
-#include "McpTwoPointComponent.h"
+#include "Components/Spatial/McpTwoPointComponent.h"
 #include "McpSitComponentVisualizer.h"
-#include "McpSitComponent.h"
+#include "Components/Interaction/McpSitComponent.h"
 
 class FNetworkCorePluginEditorModule : public IModuleInterface
 {

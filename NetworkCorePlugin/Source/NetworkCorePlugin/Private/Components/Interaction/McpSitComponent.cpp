@@ -1,4 +1,4 @@
-﻿#include "McpSitComponent.h"
+﻿#include "Components/Interaction/McpSitComponent.h"
 #include "GameFramework/Actor.h"
 
 UMcpSitComponent::UMcpSitComponent()

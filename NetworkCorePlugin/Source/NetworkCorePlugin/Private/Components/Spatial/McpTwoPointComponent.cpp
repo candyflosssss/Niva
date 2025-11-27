@@ -1,4 +1,4 @@
-﻿#include "McpTwoPointComponent.h"
+﻿#include "Components/Spatial/McpTwoPointComponent.h"
 #include "GameFramework/Actor.h"
 
 UMcpTwoPointComponent::UMcpTwoPointComponent()

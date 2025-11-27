@@ -2,6 +2,7 @@
 
 
 #include "NivaOnlineSubsystem.h" // 添加这个包含
+#include "MCP/MCPTransportSubsystem.h" // 新增：分类后的 MCP 传输子系统头，供 UAgentSystemSubsystem 使用
 #include "CoreMinimal.h"
 #include "Subsystems/WorldSubsystem.h"
 #include "Engine/World.h"

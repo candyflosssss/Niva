@@ -1,6 +1,6 @@
 ﻿#include "McpSitComponentVisualizer.h"
 
-#include "McpSitComponent.h"
+#include "Components/Interaction/McpSitComponent.h"
 
 #include "Editor.h"
 #include "Editor/UnrealEdEngine.h"

@@ -5,7 +5,6 @@
 #include "CoreMinimal.h"
 #include "Engine/DeveloperSettings.h"
 #include "HttpServerResponse.h"
-#include "HttpServerRequest.h"
 #include "NivaNetworkCoreSettings.generated.h"
 
 

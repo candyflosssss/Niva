@@ -4,8 +4,11 @@
 
 #include "CoreMinimal.h"
 #include "Engine/DeveloperSettings.h"
+#include "HttpServerRequest.h"
 #include "HttpServerResponse.h"
 #include "NivaNetworkCoreSettings.generated.h"
+
+// 注意：generated.h 必须是最后一个包含；此处已经显式包含 HttpServerRequest.h
 
 
 /**

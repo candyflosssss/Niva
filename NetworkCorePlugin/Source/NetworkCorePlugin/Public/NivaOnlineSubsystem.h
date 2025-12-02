@@ -34,8 +34,8 @@ class NETWORKCOREPLUGIN_API UNivaOnlineSubsystem : public UGameInstanceSubsystem
 public:
 	UPROPERTY(BlueprintReadOnly, Category = "NivaOnline|Niva")
 	FString DesiredPawn;
- UPROPERTY(BlueprintReadOnly, Category = "NivaOnline|Niva")
- FString Platform;
+	UPROPERTY(BlueprintReadOnly, Category = "NivaOnline|Niva")
+	FString Platform;
 	UPROPERTY(BlueprintReadOnly, Category = "NivaOnline|Niva")
 	bool isServer = false;
 

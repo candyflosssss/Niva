@@ -25,22 +25,22 @@ public class NetworkCorePlugin : ModuleRules
 			);
 				
 		
-		PrivateIncludePaths.AddRange(
-			new string[] {
-				// ... add other private include paths required here ...
-			}
-			);
+  PrivateIncludePaths.AddRange(
+            new string[] {
+                // ... add other private include paths required here ...
+            }
+            );
 			
 		
-		PublicDependencyModuleNames.AddRange(
-			new string[]
-			{
-				"Core",
-				"HTTPServer",
-				"HTTP",
-				// ... add other public dependencies that you statically link with here ...
-			}
-			);
+  PublicDependencyModuleNames.AddRange(
+            new string[]
+            {
+                "Core",
+                "HTTPServer",
+                "HTTP",
+                // ... add other public dependencies that you statically link with here ...
+            }
+            );
 			
 		
   PrivateDependencyModuleNames.AddRange(
@@ -59,6 +59,8 @@ public class NetworkCorePlugin : ModuleRules
                 "JsonUtilities",
                 "AudioMixer",
                 "WebSockets",
+                // CoreManager provides the logging subsystem we depend on
+                "CoreManager",
                 // Online Subsystem for login/session
                 "OnlineSubsystem",
                 "OnlineSubsystemUtils",

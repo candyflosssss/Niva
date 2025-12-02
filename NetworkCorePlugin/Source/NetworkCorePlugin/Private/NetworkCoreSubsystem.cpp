@@ -10,6 +10,20 @@
 #include "Kismet/GameplayStatics.h"
 #include "Subsystems/McpComponentRegistrySubsystem.h"
 #include "Components/Base/McpExposableBaseComponent.h"
+// CoreManager Log subsystem
+#include "Log/CoreLogSubsystem.h"
+
+// Local helper to send logs via CoreManager
+namespace
+{
+    inline void MCPLog(UObject* WorldContext, FName Category2, ECoreLogSeverity Severity, const FString& Message, const TMap<FString, FString>& Data = TMap<FString, FString>())
+    {
+        if (UCoreLogSubsystem* LogSys = UCoreLogSubsystem::Get(WorldContext))
+        {
+            LogSys->Log(TEXT("MCP"), Category2, Severity, Message, Data);
+        }
+    }
+}
 
 void UNetworkCoreSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
@@ -175,7 +189,7 @@ FNivaHttpRequest::FNivaHttpRequest(const FHttpServerRequest& Request)
 void UMCPTransportSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
-
+    MCPLog(this, TEXT("Init"), ECoreLogSeverity::Normal, TEXT("UMCPTransportSubsystem Initialize"));
 }
 
 // 停止 CivetWeb 服务器并清理资源
@@ -188,12 +202,26 @@ void UMCPTransportSubsystem::Deinitialize()
         mg_stop(ServerContext);
         ServerContext = nullptr;
     }
+    MCPLog(this, TEXT("Init"), ECoreLogSeverity::Normal, TEXT("UMCPTransportSubsystem Deinitialize"));
     Super::Deinitialize();
 }
 
 bool UMCPTransportSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 {
-    return true;
+    const bool bCreate = true;
+    // Note: can't call non-const helper; use UE_LOG fallback for const method
+    if (const UWorld* World = Outer ? Outer->GetWorld() : nullptr)
+    {
+        if (UGameInstance* GI = World->GetGameInstance())
+        {
+            if (UCoreLogSubsystem* LogSys = GI->GetSubsystem<UCoreLogSubsystem>())
+            {
+                const TMap<FString,FString> Data; // empty
+                LogSys->Log(TEXT("MCP"), TEXT("Init"), ECoreLogSeverity::Normal, FString::Printf(TEXT("ShouldCreateSubsystem=%s"), bCreate ? TEXT("true") : TEXT("false")), Data);
+            }
+        }
+    }
+    return bCreate;
 }
 // 生成新的唯一会话 ID（GUID）
 FString UMCPTransportSubsystem::GenerateSessionId() const
@@ -203,18 +231,19 @@ FString UMCPTransportSubsystem::GenerateSessionId() const
 
 void UMCPTransportSubsystem::ParseJsonRPC(const FString& JsonString, FString& Method, TSharedPtr<FJsonObject>& Params, int& ID, TSharedPtr<FJsonObject>& JsonObject)
 {
-	TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(JsonString);
-	JsonObject = MakeShareable(new FJsonObject());
-	if (FJsonSerializer::Deserialize(JsonReader, JsonObject))
-	{
-		Method = JsonObject->GetStringField(TEXT("method"));
-		Params = JsonObject->GetObjectField(TEXT("params"));
-		ID = JsonObject->GetNumberField(TEXT("id"));
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("SSE:JSONRPC : %s"), *JsonString);
-	}
+    TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(JsonString);
+    JsonObject = MakeShareable(new FJsonObject());
+    if (FJsonSerializer::Deserialize(JsonReader, JsonObject))
+    {
+        Method = JsonObject->GetStringField(TEXT("method"));
+        Params = JsonObject->GetObjectField(TEXT("params"));
+        ID = JsonObject->GetNumberField(TEXT("id"));
+        UE_LOG(LogTemp, Verbose, TEXT("JSONRPC parse success: method=%s id=%d"), *Method, ID);
+    }
+    else
+    {
+        UE_LOG(LogTemp, Warning, TEXT("JSONRPC parse failed. payload(head)=%s"), *JsonString.Left(256));
+    }
 }
 
 void UMCPTransportSubsystem::RegisterToolProperties(FMCPTool tool, FMCPRouteDelegate MCPRouteDelegate)
@@ -267,7 +296,7 @@ void UMCPTransportSubsystem::RegisterToolProperties(FMCPTool tool, FMCPRouteDele
 		return MaybeChild->IsChildOf(MaybeParent);
 	};
 
-	if (Storage.MCPTool.Properties.Num() == 0)
+ if (Storage.MCPTool.Properties.Num() == 0)
 	{
 		// 首次注册：直接采用该定义作为规范定义
 		Storage.MCPTool = tool;
@@ -291,20 +320,28 @@ void UMCPTransportSubsystem::RegisterToolProperties(FMCPTool tool, FMCPRouteDele
 		// 若两者都没有 OwnerClass，保持现有规范定义不变
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("RegisterToolProperties: %s (TotalRoutes=%d, TotalRegs=%d, Variants=%d, CanonOwner=%s, IncomingOwner=%s)"),
-		*tool.Name,
-		Storage.RouteDelegates.Num(),
-		Storage.ToolNum,
-		Storage.MCPToolVariants.Num(),
-		*GetNameSafe(GetOwnerClassFromTool(Storage.MCPTool)),
-		*GetNameSafe(GetOwnerClassFromTool(tool)));
+    UE_LOG(LogTemp, Log, TEXT("RegisterToolProperties: %s (TotalRoutes=%d, TotalRegs=%d, Variants=%d, CanonOwner=%s, IncomingOwner=%s)"),
+        *tool.Name,
+        Storage.RouteDelegates.Num(),
+        Storage.ToolNum,
+        Storage.MCPToolVariants.Num(),
+        *GetNameSafe(GetOwnerClassFromTool(Storage.MCPTool)),
+        *GetNameSafe(GetOwnerClassFromTool(tool)));
+    {
+        TMap<FString,FString> LogData;
+        LogData.Add(TEXT("ToolName"), tool.Name);
+        LogData.Add(TEXT("Routes"), FString::FromInt(Storage.RouteDelegates.Num()));
+        LogData.Add(TEXT("Registrations"), FString::FromInt(Storage.ToolNum));
+        MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Normal, TEXT("Registered tool route"), LogData);
+    }
 }
 
 TSharedPtr<FJsonObject> UMCPTransportSubsystem::GetToolbyTarget(FString ActorName)
 {
-	// 用json来存储结果
-	TSharedPtr<FJsonObject> result = MakeShareable(new FJsonObject);
-	TArray<TSharedPtr<FJsonValue>> ToolsArray;
+    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Normal, FString::Printf(TEXT("Query tools by target: %s"), *ActorName));
+    // 用json来存储结果
+    TSharedPtr<FJsonObject> result = MakeShareable(new FJsonObject);
+    TArray<TSharedPtr<FJsonValue>> ToolsArray;
 	for (auto i : MCPTools)
 	{
 		for (auto j : i.Value.MCPTool.Properties)
@@ -325,12 +362,14 @@ TSharedPtr<FJsonObject> UMCPTransportSubsystem::GetToolbyTarget(FString ActorNam
 	// 将json数组添加到根对象
 	result->SetArrayField("tools", ToolsArray);
 	
-	return result;
+    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Normal, FString::Printf(TEXT("Query tools by target done: %d items"), ToolsArray.Num()));
+    return result;
 }
 
 TSharedPtr<FJsonObject> UMCPTransportSubsystem::GetToolTargets(FString ToolName)
 {
-	// 通过json来存储结果
+    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Normal, FString::Printf(TEXT("Query targets by tool: %s"), *ToolName));
+    // 通过json来存储结果
     // 构建一个JSON对象
     TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
     TArray<TSharedPtr<FJsonValue>> TargetsArray;
@@ -378,6 +417,7 @@ TSharedPtr<FJsonObject> UMCPTransportSubsystem::GetToolTargets(FString ToolName)
 
     // 设置根对象
     RootObject->SetArrayField("targets", TargetsArray);
+    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Normal, FString::Printf(TEXT("Query targets by tool done: %d items"), TargetsArray.Num()));
     return RootObject;
 }
 
@@ -451,11 +491,16 @@ void UMCPTransportSubsystem::SendSSE(const FString& SessionId, const FString& Ev
         FString Msg = FString::Printf(TEXT("event: %s\n"), *Event) +
             FString::Printf(TEXT("data: %s\n\n"), *Data);
         Sessions[SessionId]->Enqueue(Msg);
-        UE_LOG(LogTemp, Verbose, TEXT("sendSSE: Queued: message for session %s: %s"), *SessionId, *Msg);
+        TMap<FString,FString> LogData;
+        LogData.Add(TEXT("SessionId"), SessionId);
+        LogData.Add(TEXT("Event"), Event);
+        MCPLog(this, TEXT("SSE"), ECoreLogSeverity::Normal, TEXT("Queued SSE message"), LogData);
     }
     else
     {
-        UE_LOG(LogTemp, Warning, TEXT("sendSSE: UNKNOW session %s"), *SessionId);
+        TMap<FString,FString> LogData;
+        LogData.Add(TEXT("SessionId"), SessionId);
+        MCPLog(this, TEXT("SSE"), ECoreLogSeverity::Warning, TEXT("Unknown session for SSE"), LogData);
     }
 }
 
@@ -463,7 +508,11 @@ void UMCPTransportSubsystem::SendSSE(const FString& SessionId, const FString& Ev
 void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const FString& SessionId)
 {
     // 解析 JSON 或根据方法执行操作
-    UE_LOG(LogTemp, Log, TEXT("Post: SSE: PostRequest: for session %s: %s"), *SessionId, *Request.Json);
+    {
+        TMap<FString,FString> LogData;
+        LogData.Add(TEXT("SessionId"), SessionId);
+        MCPLog(this, TEXT("Message"), ECoreLogSeverity::Normal, TEXT("HandlePostRequest received"), LogData);
+    }
 
 
     // 解析参数
@@ -473,6 +522,12 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
     TSharedPtr<FJsonObject> JsonObject;
 
     ParseJsonRPC(Request.Json, Method, Params, id, JsonObject);
+    {
+        TMap<FString,FString> LogData;
+        LogData.Add(TEXT("SessionId"), SessionId);
+        LogData.Add(TEXT("Method"), Method);
+        MCPLog(this, TEXT("Message"), ECoreLogSeverity::Normal, TEXT("Parsed JSON-RPC"), LogData);
+    }
 
 
     if (Method == "initialize") {
@@ -929,8 +984,11 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
 		SendSSE(SessionId, TEXT("message"), PingMessage);
     }
     else {
-		UE_LOG(LogTemp, Warning, TEXT("post: SSE: UNKNOW method: %s"), *Method);
-	}
+        TMap<FString,FString> LogData;
+        LogData.Add(TEXT("Method"), Method);
+        LogData.Add(TEXT("SessionId"), SessionId);
+        MCPLog(this, TEXT("Message"), ECoreLogSeverity::Warning, TEXT("Unknown JSON-RPC method"), LogData);
+    }
 }
 
 // forward declaration for favicon handler
@@ -952,7 +1010,17 @@ void UMCPTransportSubsystem::StartMCPServer()
     FTCHARToUTF8 PortUtf8(*Port);
     const char* Options[] = { "listening_ports", PortUtf8.Get(), nullptr };
     ServerContext = mg_start(nullptr, this, Options);
-    check(ServerContext);
+    if (!ServerContext)
+    {
+        TMap<FString,FString> LogData; LogData.Add(TEXT("Port"), Port);
+        MCPLog(this, TEXT("Server"), ECoreLogSeverity::Error, TEXT("Failed to start MCP server"), LogData);
+        return;
+    }
+    else
+    {
+        TMap<FString,FString> LogData; LogData.Add(TEXT("Port"), Port);
+        MCPLog(this, TEXT("Server"), ECoreLogSeverity::Normal, TEXT("MCP server started"), LogData);
+    }
 
     //AI写的 不知道干嘛用的
     // mg_set_request_handler(This->ServerContext, "/connect", OnConnect, This);
@@ -970,7 +1038,8 @@ void UMCPTransportSubsystem::StartMCPServer()
     // handle favicon to avoid 404 noise in console
     mg_set_request_handler(ServerContext, "/favicon.ico", OnGetFavicon, this);
 
-    // UE_LOG(LogTemp, Log, TEXT("SSE :server:start，Port：8080"));
+    // log handlers registered
+    MCPLog(this, TEXT("Server"), ECoreLogSeverity::Normal, TEXT("Handlers registered: /message, /sse, /tools, /tools/version, /ui/tools"));
 
 
 

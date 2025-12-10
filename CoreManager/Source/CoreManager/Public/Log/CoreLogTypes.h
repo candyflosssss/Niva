@@ -7,19 +7,24 @@
 #include "UObject/ScriptMacros.h"
 #include "CoreLogTypes.generated.h"
 
-// 严重级别
+// 严重级别（从 3 级扩展为 7 级）
 UENUM(BlueprintType)
 enum class ECoreLogSeverity : uint8
 {
-    Normal,
-    Warning,
-    Error
+    // 细粒度等级
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+    Fatal,
+    Off
 };
 
 // 额外数据由键值表承载（蓝图/C++ 统一使用 TMap<String, String>）
 
 // 一条日志记录
-USTRUCT(BlueprintType)
+USTRUCT(BlueprintType)  
 struct COREMANAGER_API FCoreLogEntry
 {
     GENERATED_BODY()
@@ -32,9 +37,9 @@ struct COREMANAGER_API FCoreLogEntry
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CoreLog")
     FName Category2;
 
-    // 严重级别
+    // 严重级别（默认 Info）
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CoreLog")
-    ECoreLogSeverity Severity = ECoreLogSeverity::Normal;
+    ECoreLogSeverity Severity = ECoreLogSeverity::Info;
 
     // 主要文本
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "CoreLog")

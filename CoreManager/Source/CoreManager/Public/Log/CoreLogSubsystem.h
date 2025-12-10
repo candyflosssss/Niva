@@ -11,7 +11,7 @@
 
 /**
  * Core 日志 GI 子系统
- * - 支持：一级分类、二级分类、Normal/Warning/Error
+ * - 支持：一级分类、二级分类、Trace/Debug/Info/Warn/Error/Fatal/Off
  * - 数据：FString 消息 + 键值表（蓝图/C++ 统一使用 TMap<FString,FString>）
  * - 调用：蓝图/C++
  * - 订阅：蓝图（动态多播）/C++（原生多播）

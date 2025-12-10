@@ -46,12 +46,19 @@ void UCoreLogSubsystem::Log(FName Category1, FName Category2, ECoreLogSeverity S
     // 输出到 UE 控制台（可按需调整）
     switch (Severity)
     {
+    case ECoreLogSeverity::Off:
+        // 不输出
+        break;
+    case ECoreLogSeverity::Fatal:
     case ECoreLogSeverity::Error:
         UE_LOG(LogCoreManagerLog, Error, TEXT("[%s/%s] %s | %s"), *Category1.ToString(), *Category2.ToString(), *Message, *DataStr);
         break;
-    case ECoreLogSeverity::Warning:
+    case ECoreLogSeverity::Warn:
         UE_LOG(LogCoreManagerLog, Warning, TEXT("[%s/%s] %s | %s"), *Category1.ToString(), *Category2.ToString(), *Message, *DataStr);
         break;
+    case ECoreLogSeverity::Trace:
+    case ECoreLogSeverity::Debug:
+    case ECoreLogSeverity::Info:
     default:
         UE_LOG(LogCoreManagerLog, Log, TEXT("[%s/%s] %s | %s"), *Category1.ToString(), *Category2.ToString(), *Message, *DataStr);
         break;

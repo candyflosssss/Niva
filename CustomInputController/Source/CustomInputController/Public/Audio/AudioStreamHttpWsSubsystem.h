@@ -12,6 +12,8 @@
 #include "AudioStreamSettings.h"
 #include "AudioStreamHttpWsSubsystem.generated.h"
 
+DECLARE_LOG_CATEGORY_EXTERN(LogAudioStreamWs, Log, All);
+
 class UAudioStreamHttpWsComponent;
 class UUDPHandler;
 
@@ -115,6 +117,10 @@ private:
     // 新增：第3步：向 /stream/{task_id} 推送文本块
     UFUNCTION(BlueprintCallable, Category="AudioStream")
     void PostStreamText(const FString& Text);
+
+    // 新增：第4步：通知服务器流已结束（POST /end-stream/{task_id}）
+    UFUNCTION(BlueprintCallable, Category="AudioStream")
+    void PostEndStream();
 
     // 统计
     void UpdateStats(int32 PcmBytes, int32 SampleRate, int32 Channels);

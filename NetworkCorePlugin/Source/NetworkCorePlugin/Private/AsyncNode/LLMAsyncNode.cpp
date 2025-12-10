@@ -1,6 +1,8 @@
 ﻿#include "AsyncNode/LLMAsyncNode.h"
 // CoreManager Log
 #include "Log/CoreLogSubsystem.h"
+#include "Engine/Engine.h" // for GEngine and world contexts fallback
+#include "Engine/GameInstance.h"
 
 
 
@@ -9,25 +11,48 @@ namespace
     // 统一封装 CoreManager 日志调用，避免重复空指针判断
     inline void NC_CoreLog(const UObject* WorldContext, FName Category2, ECoreLogSeverity Severity, const FString& Message, const TMap<FString,FString>& Data = TMap<FString,FString>{})
     {
+        // 首先尝试常规路径（若传入的 WorldContext 能解析到 World/GameInstance）
         if (const UCoreLogSubsystem* LogSS = UCoreLogSubsystem::Get(WorldContext))
         {
             const_cast<UCoreLogSubsystem*>(LogSS)->Log(TEXT("NetworkCore"), Category2, Severity, Message, Data);
+            return;
         }
-        else
+
+        // 如果常规路径失败，尝试通过 GEngine 的 WorldContexts 查找任意有效的 CoreLogSubsystem（针对没有 World 的 UObject，例如异步节点/请求）
+        if (GEngine)
         {
-            // 回退到 UE_LOG，保证在早期阶段也能看到信息
-            switch (Severity)
+            for (const FWorldContext& WC : GEngine->GetWorldContexts())
             {
-            case ECoreLogSeverity::Error:
-                UE_LOG(LogTemp, Error, TEXT("[NetworkCore/%s] %s"), *Category2.ToString(), *Message);
-                break;
-            case ECoreLogSeverity::Warning:
-                UE_LOG(LogTemp, Warning, TEXT("[NetworkCore/%s] %s"), *Category2.ToString(), *Message);
-                break;
-            default:
-                UE_LOG(LogTemp, Log, TEXT("[NetworkCore/%s] %s"), *Category2.ToString(), *Message);
-                break;
+                UWorld* World = WC.World();
+                if (!World) continue;
+                UGameInstance* GI = World->GetGameInstance();
+                if (!GI) continue;
+                if (UCoreLogSubsystem* Found = GI->GetSubsystem<UCoreLogSubsystem>())
+                {
+                    Found->Log(TEXT("NetworkCore"), Category2, Severity, Message, Data);
+                    return;
+                }
             }
+        }
+
+        // 回退到 UE_LOG，保证在早期阶段也能看到信息
+        switch (Severity)
+        {
+        case ECoreLogSeverity::Off:
+            break;
+        case ECoreLogSeverity::Fatal:
+        case ECoreLogSeverity::Error:
+            UE_LOG(LogTemp, Error, TEXT("[NetworkCore/%s] %s"), *Category2.ToString(), *Message);
+            break;
+        case ECoreLogSeverity::Warn:
+            UE_LOG(LogTemp, Warning, TEXT("[NetworkCore/%s] %s"), *Category2.ToString(), *Message);
+            break;
+        case ECoreLogSeverity::Trace:
+        case ECoreLogSeverity::Debug:
+        case ECoreLogSeverity::Info:
+        default:
+            UE_LOG(LogTemp, Log, TEXT("[NetworkCore/%s] %s"), *Category2.ToString(), *Message);
+            break;
         }
     }
 
@@ -42,33 +67,47 @@ namespace
         default: return TEXT("None");
         }
     }
+
+    // 新增：对于上述散落在多个 init/子类中的日志，集中成一条汇总日志，放在匿名命名空间中（不属于 UNivaLLMRequest 子类）
+    inline void NC_CoreLog_LLMInitSummary(const UObject* WorldContext, ENivaLLM Engine, int32 ChatLen, int32 HistoryCount, const FString& Url, bool bRequestValid, int32 BodyLen = 0, const FString& BodyPreview = TEXT(""))
+    {
+        TMap<FString, FString> Meta;
+        Meta.Add(TEXT("Engine"), NC_LLMToName(Engine).ToString());
+        Meta.Add(TEXT("ChatLen"), FString::FromInt(ChatLen));
+        Meta.Add(TEXT("HistoryCount"), FString::FromInt(HistoryCount));
+        Meta.Add(TEXT("URL"), Url);
+        Meta.Add(TEXT("RequestValid"), bRequestValid ? TEXT("true") : TEXT("false"));
+        Meta.Add(TEXT("BodyLen"), FString::FromInt(BodyLen));
+        Meta.Add(TEXT("BodyPreview"), BodyPreview.Left(512));
+
+        FString Msg = FString::Printf(TEXT("LLM Init Summary -> engine=%s chatLen=%d history=%d url=%s valid=%s bodyLen=%d"),
+            *NC_LLMToName(Engine).ToString(), ChatLen, HistoryCount, *Url, bRequestValid ? TEXT("true") : TEXT("false"), BodyLen);
+
+        NC_CoreLog(WorldContext, TEXT("LLM.Summary"), ECoreLogSeverity::Info, Msg, Meta);
+    }
 }
 
 UBlueprintAsyncNode* UBlueprintAsyncNode::LLMChat(
-	//NivaHttpRequest Request,
-	TMap<FString/*user*/, FString/*assistant*/> Chatted,
-	FString Chat
+    //NivaHttpRequest Request,
+    TMap<FString/*user*/, FString/*assistant*/> Chatted,
+    FString Chat
 )
 {
-	// 创建一个新���异步节点
-	UBlueprintAsyncNode* AsyncNode = NewObject<UBlueprintAsyncNode>();
+    // 创建一个新异步节点
+    UBlueprintAsyncNode* AsyncNode = NewObject<UBlueprintAsyncNode>();
+
+    // 从setting读取配置
+    ENivaLLM NivaLLMRequestType = GetDefault<UNivaNetworkCoreSettings>()->LLM;
+
+    AsyncNode->LLMRequest = nullptr;
 
 
-	// 从setting读取配置
-	// Update the variable type to match the enum type
- ENivaLLM NivaLLMRequestType = GetDefault<UNivaNetworkCoreSettings>()->LLM;
- NC_CoreLog(AsyncNode, TEXT("LLMChat"), ECoreLogSeverity::Normal, TEXT("LLMChat start"), {
-     {TEXT("LLM"), NC_LLMToName(NivaLLMRequestType).ToString()},
- });
-	AsyncNode->LLMRequest = nullptr;
+	switch (NivaLLMRequestType) {
+	case ENivaLLM::LLM_NONE:
+	case ENivaLLM::LLM_OLLAMA:
 
-
- switch (NivaLLMRequestType) {
- case ENivaLLM::LLM_NONE:
- case ENivaLLM::LLM_OLLAMA:
-
-     AsyncNode->LLMRequest = NewObject<UNivaLLMRequest>(AsyncNode);
-     break;
+	    AsyncNode->LLMRequest = NewObject<UNivaLLMRequest>(AsyncNode);
+	    break;
 	case ENivaLLM::LLM_ALIYUN:
 
 		AsyncNode->LLMRequest = NewObject<UNivaAliyunLLMRequest>(AsyncNode);
@@ -99,14 +138,27 @@ UBlueprintAsyncNode* UBlueprintAsyncNode::LLMChat(
 	// AsyncNode->LLMRequest->OnNivaAsyncLLMRequestComplete.BindUObject(AsyncNode, &UBlueprintAsyncNode::OnCompleteDelegate);
 
 
- AsyncNode->LLMRequest->init(
+	AsyncNode->LLMRequest->init(
         Chatted,
         Chat
     );
-    NC_CoreLog(AsyncNode, TEXT("LLMChat"), ECoreLogSeverity::Normal, TEXT("LLMChat request initialized"), {
-        {TEXT("ChatLen"), FString::FromInt(Chat.Len())},
-        {TEXT("HistoryCount"), FString::FromInt(Chatted.Num())}
-    });
+
+    // Remove the previous per-location "Initialized LLM request -> chatLen=.. history=.." log and other scattered init logs.
+    // Instead, produce one consolidated summary log here (not inside UNivaLLMRequest or its subclasses).
+    {
+        FString Url = TEXT("");
+        bool bRequestValid = false;
+        int32 BodyLen = 0;
+        FString BodyPreview = TEXT("");
+        if (AsyncNode->LLMRequest && AsyncNode->LLMRequest->LLMRequest.IsValid())
+        {
+            Url = AsyncNode->LLMRequest->LLMRequest->GetURL();
+            bRequestValid = true;
+            // cannot reliably read request body from FHttpRequestInterface; avoid calling non-existent getters
+            // keep BodyLen/BodyPreview empty to avoid compile errors
+        }
+        NC_CoreLog_LLMInitSummary(AsyncNode, NivaLLMRequestType, Chat.Len(), Chatted.Num(), Url, bRequestValid, BodyLen, BodyPreview);
+    }
 
 	return AsyncNode;
 }
@@ -114,34 +166,39 @@ UBlueprintAsyncNode* UBlueprintAsyncNode::LLMChat(
 void UNivaLLMRequest::OnCompleteDelegate(FHttpRequestPtr Request, FHttpResponsePtr ResponsePtr, bool a)
 {
     if (a) {
-        UE_LOG(LogTemp, Warning, TEXT("NetCore:Request Compelete"));
-        const int32 StatusCode = ResponsePtr.IsValid() ? ResponsePtr->GetResponseCode() : -1;
-        NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Normal, TEXT("Request complete"), {
-            {TEXT("Status"), FString::FromInt(StatusCode)}
-        });
-    }
-    else {
-        UE_LOG(LogTemp, Warning, TEXT("NetCore:Request failed "));
-        int32 StatusCode = -1;
-        FString ErrText = TEXT("unknown");
-        if (ResponsePtr.IsValid())
-        {
-            StatusCode = ResponsePtr->GetResponseCode();
-            ErrText = ResponsePtr->GetContentAsString().Left(256);
-        }
-        NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Error, TEXT("Request failed"), {
-            {TEXT("Status"), FString::FromInt(StatusCode)},
-            {TEXT("Error"), ErrText}
-        });
+        // Success: structured log already emitted below including status/url/preview
+         const int32 StatusCode = ResponsePtr.IsValid() ? ResponsePtr->GetResponseCode() : -1;
+         FString Url = Request.IsValid() ? Request->GetURL() : TEXT("");
+         FString RespPreview = ResponsePtr.IsValid() ? ResponsePtr->GetContentAsString().Left(512) : TEXT("");
+         TMap<FString,FString> Meta;
+         Meta.Add(TEXT("Status"), FString::FromInt(StatusCode));
+         Meta.Add(TEXT("URL"), Url);
+         Meta.Add(TEXT("RespPreview"), RespPreview);
+        NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Debug, FString::Printf(TEXT("Request completed -> status=%d url=%s"), StatusCode, *Url), Meta);
+     }
+     else {
+        // Failure: we will emit structured error below
+         int32 StatusCode = -1;
+         FString ErrText = TEXT("unknown");
+         if (ResponsePtr.IsValid())
+         {
+             StatusCode = ResponsePtr->GetResponseCode();
+             ErrText = ResponsePtr->GetContentAsString().Left(256);
+         }
+         FString Url = Request.IsValid() ? Request->GetURL() : TEXT("");
+         TMap<FString,FString> Meta;
+         Meta.Add(TEXT("Status"), FString::FromInt(StatusCode));
+         Meta.Add(TEXT("Error"), ErrText);
+         Meta.Add(TEXT("URL"), Url);
+         NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Error, FString::Printf(TEXT("Request failed -> status=%d err=%s url=%s"), StatusCode, *ErrText.Left(120), *Url), Meta);
 
         return;
     }
 
-	// 以供直接在蓝图中使用
-	OnNivaLLMRequestComplete.IsBound() ? OnNivaLLMRequestComplete.Broadcast(a, ResponsePtr->GetContentAsString()) : void();
-	// 以供异��节点使用
-	OnNivaAsyncLLMRequestComplete.IsBound() ? OnNivaAsyncLLMRequestComplete.Execute(a, ResponsePtr->GetContentAsString()) : void();
-
+    // 以供直接在蓝图中使用
+    OnNivaLLMRequestComplete.IsBound() ? OnNivaLLMRequestComplete.Broadcast(a, ResponsePtr.IsValid() ? ResponsePtr->GetContentAsString() : FString()) : void();
+    // 以供异步节点使用
+    OnNivaAsyncLLMRequestComplete.IsBound() ? OnNivaAsyncLLMRequestComplete.Execute(a, ResponsePtr.IsValid() ? ResponsePtr->GetContentAsString() : FString()) : void();
 }
 
 
@@ -149,10 +206,10 @@ void UNivaLLMRequest::OnProgressDelegate(FHttpRequestPtr Request, uint64 BytesSe
 {
 
 
-	// 安全检查
-	if (!Request.IsValid() || !Request->GetResponse().IsValid())
-	{
-		// 分辨一���是哪个无效
+    // 安全检查
+    if (!Request.IsValid() || !Request->GetResponse().IsValid())
+    {
+        // 分辨一下是哪个无效
         if (!Request.IsValid())
         {
             UE_LOG(LogTemp, Error, TEXT("NetCore: OnProgressDelegate: Request is invalid"));
@@ -202,7 +259,7 @@ void UNivaLLMRequest::OnProgressDelegate(FHttpRequestPtr Request, uint64 BytesSe
 		}
 	}
  // 记录一次进度（避免刷屏，仅记录长度）
- NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Normal, TEXT("OnProgress"), {
+ NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Trace, FString::Printf(TEXT("Progress update -> sent=%llu recv=%llu chunk=%d"), BytesSent, BytesReceived, NewContent.Len()), {
      {TEXT("BytesSent"), FString::Printf(TEXT("%llu"), BytesSent)},
      {TEXT("BytesRecv"), FString::Printf(TEXT("%llu"), BytesReceived)},
      {TEXT("ChunkLen"), FString::FromInt(NewContent.Len())}
@@ -263,6 +320,9 @@ bool UNivaLLMRequest::ProcessBuffer(const FString& NewContent, int32 BaseOffset,
 					JsonEnd = i;
 					break;
 				}
+				break;
+			default:
+				// 非结构化字符：无操作
 				break;
 			}
 
@@ -398,39 +458,42 @@ FString UNivaLLMRequest::EscapeChatContent(const FString& Content)
 
 void UNivaLLMRequest::init( TMap<FString, FString> Chated, FString Chat)
 {
-    // 创建 HTTP 请求
-    LLMRequest = FHttpModule::Get().CreateRequest();
-    if (LLMRequest)
-    {
-        // 设置请求的URL
-        FString LLMUrl = GetDefault<UNivaNetworkCoreSettings>()->LLMOllamaURL;
-        LLMRequest->SetURL(LLMUrl);
-		// 设置请求的HTTP方法
-		LLMRequest->SetVerb(TEXT("POST"));
-		LLMRequest->SetHeader(TEXT("Connection"), TEXT("keep-alive"));
-		LLMRequest->SetHeader("Content-Type", "application/json");
+	const UNivaNetworkCoreSettings* Settings = GetDefault<UNivaNetworkCoreSettings>();
+	if (!Settings)
+	{
+		UE_LOG(LogTemp, Error, TEXT("UNivaRunnerLLMRequest::init - 无法获取网络核心设置"));
+		NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Error, TEXT("missing NetworkCore settings"));
+		return;
+	}
+
+	LLMRequest = FHttpModule::Get().CreateRequest();
+	if (!LLMRequest.IsValid())
+	{
+		UE_LOG(LogTemp, Error, TEXT("UNivaRunnerLLMRequest::init - 无法创建HTTP请求"));
+		NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Error, TEXT("create HTTP request failed"));
+		return;
+	}
+    // 设置请求的URL
+    FString LLMUrl = Settings->LLMOllamaURL;
+    LLMRequest->SetURL(LLMUrl);
+	// 设置请求的HTTP方法
+	LLMRequest->SetVerb(TEXT("POST"));
+	LLMRequest->SetHeader(TEXT("Connection"), TEXT("keep-alive"));
+	LLMRequest->SetHeader("Content-Type", "application/json");
 
 
-  // 预制对话
-  FString MessagesArray = BuildChatRequestJson(Chated, Chat);
+	// 预制对话
+	FString MessagesArray = BuildChatRequestJson(Chated, Chat);
 
-		// 用UELOG看一眼
-		UE_LOG(LogTemp, Warning, TEXT("NetCore:Content: %s"), *MessagesArray);
-		// 遍历Chat，并填入content。
-		// 设置请求的body
-		LLMRequest->SetContentAsString(MessagesArray);
+	// 设置请求的body
+	LLMRequest->SetContentAsString(MessagesArray);
 
 
-		// 绑定返回事件 
-		LLMRequest->OnProcessRequestComplete().BindUObject(this, &UNivaLLMRequest::OnCompleteDelegate);
-		LLMRequest->OnRequestProgress64().BindUObject(this, &UNivaLLMRequest::OnProgressDelegate);
+	// 绑定返回事件 
+	LLMRequest->OnProcessRequestComplete().BindUObject(this, &UNivaLLMRequest::OnCompleteDelegate);
+	LLMRequest->OnRequestProgress64().BindUObject(this, &UNivaLLMRequest::OnProgressDelegate);
 
-        LLMRequest->ProcessRequest();
-        NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Normal, TEXT("Base init sent"), {
-            {TEXT("URL"), LLMUrl},
-            {TEXT("BodyLen"), FString::FromInt(MessagesArray.Len())}
-        });
-    };
+    LLMRequest->ProcessRequest();
 }
 
 void UNivaLLMRequest::CancelRequest()
@@ -439,7 +502,7 @@ void UNivaLLMRequest::CancelRequest()
     {
         LLMRequest->CancelRequest();
         LLMRequest->OnProcessRequestComplete().Unbind();
-        NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Warning, TEXT("Request canceled"));
+        NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Warn, TEXT("Request canceled"));
     }
 }
 
@@ -450,49 +513,52 @@ UNivaLLMRequest* UNivaLLMRequest::CreateLLMRequest()
     FString Chat = "hello";
     Chated.Add(TEXT("user"), TEXT("assistant"));
     NivaLLMRequest->init(Chated, Chat);
-    NC_CoreLog(NivaLLMRequest, TEXT("LLM"), ECoreLogSeverity::Normal, TEXT("CreateLLMRequest test created"));
+    NC_CoreLog(NivaLLMRequest, TEXT("LLM"), ECoreLogSeverity::Info, TEXT("CreateLLMRequest test created"));
     return NivaLLMRequest;
 }
 
 void UNivaAliyunLLMRequest::init(TMap<FString, FString> Chated, FString Chat)
 {
 
-	// 创建 HTTP 请求
-	LLMRequest = FHttpModule::Get().CreateRequest();
-	if (LLMRequest)
+	const UNivaNetworkCoreSettings* Settings = GetDefault<UNivaNetworkCoreSettings>();
+	if (!Settings)
 	{
-		// 设置请求的URL
-		FString LLMUrl = GetDefault<UNivaNetworkCoreSettings>()->LLMAliyunURL;
-		LLMRequest->SetURL(LLMUrl);
-		// 设置请求的HTTP方法
-		LLMRequest->SetVerb(TEXT("POST"));
-		LLMRequest->SetHeader(TEXT("Connection"), TEXT("keep-alive"));
-		LLMRequest->SetHeader("Content-Type", "application/json");
-		// 设置apikey,格式： "Bearer " + APIKey
-		LLMRequest->SetHeader("Authorization", "Bearer " + GetDefault<UNivaNetworkCoreSettings>()->LLMAliyunAccessKey);
+		UE_LOG(LogTemp, Error, TEXT("UNivaRunnerLLMRequest::init - 无法获取网络核心设置"));
+		NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Error, TEXT("Runner init - missing NetworkCore settings"));
+		return;
+	}
+
+	LLMRequest = FHttpModule::Get().CreateRequest();
+	if (!LLMRequest.IsValid())
+	{
+		UE_LOG(LogTemp, Error, TEXT("UNivaRunnerLLMRequest::init - 无法创建HTTP请求"));
+		NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Error, TEXT("Runner init - create HTTP request failed"));
+		return;
+	}
+	// 设置请求的URL
+	FString LLMUrl = Settings->LLMAliyunURL;
+	LLMRequest->SetURL(LLMUrl);
+	// 设置请求的HTTP方法
+	LLMRequest->SetVerb(TEXT("POST"));
+	LLMRequest->SetHeader(TEXT("Connection"), TEXT("keep-alive"));
+	LLMRequest->SetHeader("Content-Type", "application/json");
+	// 设置apikey,格式： "Bearer " + APIKey
+	LLMRequest->SetHeader("Authorization", "Bearer " + Settings->LLMAliyunAccessKey);
 
 
 
-		// 预制对话
-		FString MessagesArray = BuildChatRequestJson(Chated, Chat);
+	// 预制对话
+	FString MessagesArray = BuildChatRequestJson(Chated, Chat);
 
-		// 用UELOG看一眼
-		UE_LOG(LogTemp, Warning, TEXT("NetCore:Content: %s"), *MessagesArray);
-		// 遍历Chat，并填入content。
-		// 设置请求的body
-		LLMRequest->SetContentAsString(MessagesArray);
+	// 设置请求的body
+	LLMRequest->SetContentAsString(MessagesArray);
 
 
-		// 绑定返回事件 
-		LLMRequest->OnProcessRequestComplete().BindUObject(this, &UNivaLLMRequest::OnCompleteDelegate);
-		LLMRequest->OnRequestProgress64().BindUObject(this, &UNivaLLMRequest::OnProgressDelegate);
+	// 绑定返回事件 
+	LLMRequest->OnProcessRequestComplete().BindUObject(this, &UNivaLLMRequest::OnCompleteDelegate);
+	LLMRequest->OnRequestProgress64().BindUObject(this, &UNivaLLMRequest::OnProgressDelegate);
 
-        LLMRequest->ProcessRequest();
-        NC_CoreLog(this, TEXT("LLM.Aliyun"), ECoreLogSeverity::Normal, TEXT("Aliyun init sent"), {
-            {TEXT("URL"), LLMUrl},
-            {TEXT("BodyLen"), FString::FromInt(MessagesArray.Len())}
-        });
-    };
+    LLMRequest->ProcessRequest();
 }
 
 FString UNivaAliyunLLMRequest::BuildChatRequestJson(const TMap<FString, FString>& ChatHistory, FString Chat)
@@ -583,22 +649,22 @@ void UNivaAliyunLLMRequest::OnProgressDelegate(FHttpRequestPtr Request, uint64 B
 {
 
 
-
-	// 安全检查
-	if (!Request.IsValid() || !Request->GetResponse().IsValid())
-	{
-		// 分辨一下是哪个无效
-		if (!Request.IsValid())
-		{
-			UE_LOG(LogTemp, Error, TEXT("NetCore: OnProgressDelegate: Request is invalid"));
-		}
-		else
-		{
-			UE_LOG(LogTemp, Error, TEXT("NetCore: OnProgressDelegate: Response is invalid"));
-		}
-		// UE_LOG(LogTemp, Error, TEXT("NetCore: OnProgressDelegate: Invalid request or response"));
-		return;
-	}
+    // 安全检查
+    if (!Request.IsValid() || !Request->GetResponse().IsValid())
+    {
+        // 分辨一下是哪个无效
+        if (!Request.IsValid())
+        {
+            UE_LOG(LogTemp, Error, TEXT("NetCore: OnProgressDelegate: Request is invalid"));
+            NC_CoreLog(this, TEXT("LLM.Aliyun"), ECoreLogSeverity::Error, TEXT("OnProgress: Request invalid"));
+        }
+        else
+        {
+            UE_LOG(LogTemp, Error, TEXT("NetCore: OnProgressDelegate: Response is invalid"));
+            NC_CoreLog(this, TEXT("LLM.Aliyun"), ECoreLogSeverity::Error, TEXT("OnProgress: Response invalid"));
+        }
+        return;
+    }
 
 	// 获取当前完整内容
 	FString CurrentContent = Request->GetResponse()->GetContentAsString();
@@ -730,12 +796,12 @@ void UNivaAliyunLLMRequest::OnProgressDelegate(FHttpRequestPtr Request, uint64 B
 			}
 		}
 	}
- // 记录一次进度
- NC_CoreLog(this, TEXT("LLM.Aliyun"), ECoreLogSeverity::Normal, TEXT("OnProgress"), {
-     {TEXT("BytesSent"), FString::Printf(TEXT("%llu"), BytesSent)},
-     {TEXT("BytesRecv"), FString::Printf(TEXT("%llu"), BytesReceived)},
-     {TEXT("ChunkLen"), FString::FromInt(NewContent.Len())}
- });
+	// 记录一次进度
+	NC_CoreLog(this, TEXT("LLM.Aliyun"), ECoreLogSeverity::Trace, FString::Printf(TEXT("Progress update -> sent=%llu recv=%llu chunk=%d"), BytesSent, BytesReceived, NewContent.Len()), {
+	    {TEXT("BytesSent"), FString::Printf(TEXT("%llu"), BytesSent)},
+	    {TEXT("BytesRecv"), FString::Printf(TEXT("%llu"), BytesReceived)},
+	    {TEXT("ChunkLen"), FString::FromInt(NewContent.Len())}
+	});
 
 	// 更新记录
 	PreviousContent = CurrentContent;
@@ -746,251 +812,209 @@ void UNivaAliyunLLMRequest::OnProgressDelegate(FHttpRequestPtr Request, uint64 B
 
 void UNivaAgentLLMRequest::init(TMap<FString, FString> Chated, FString Chat)
 {
-	// 获取网络核心设置
 	const UNivaNetworkCoreSettings* Settings = GetDefault<UNivaNetworkCoreSettings>();
 	if (!Settings)
 	{
-		UE_LOG(LogTemp, Error, TEXT("UNivaAgentLLMRequest::init - 无法获取网络核心设置"));
+		UE_LOG(LogTemp, Error, TEXT("UNivaRunnerLLMRequest::init - 无法获取网络核心设置"));
+		NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Error, TEXT("init - missing NetworkCore settings"));
 		return;
 	}
 
-	// 创建HTTP请求
 	LLMRequest = FHttpModule::Get().CreateRequest();
 	if (!LLMRequest.IsValid())
 	{
-		UE_LOG(LogTemp, Error, TEXT("UNivaAgentLLMRequest::init - 无法创建HTTP请求"));
+		UE_LOG(LogTemp, Error, TEXT("UNivaRunnerLLMRequest::init - 无法创建HTTP请求"));
+		NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Error, TEXT("init - create HTTP request failed"));
 		return;
 	}
-	
-	// 设置请求URL - 假设智能体聊天API端点
-	FString AgentChatURL = Settings->AgentChatURL + TEXT("/chat/stream/");
-	LLMRequest->SetURL(AgentChatURL);
-    
-	// 设置请求方法
-	LLMRequest->SetVerb(TEXT("POST"));
-    
-	// 设置请求头
-	LLMRequest->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-	LLMRequest->SetHeader(TEXT("Accept"), TEXT("text/event-stream")); // 支持SSE流式响应
+    FString AgentChatURL = Settings->AgentChatURL + TEXT("/chat/stream/");
+    LLMRequest->SetURL(AgentChatURL);
+    LLMRequest->SetVerb(TEXT("POST"));
+    LLMRequest->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+    LLMRequest->SetHeader(TEXT("Accept"), TEXT("text/event-stream"));
 
-	// 构建请求体
-	FString RequestBody = UNivaAgentLLMRequest::BuildChatRequestJson(Chated, Chat);
-	LLMRequest->SetContentAsString(RequestBody);
+    FString RequestBody = UNivaAgentLLMRequest::BuildChatRequestJson(Chated, Chat);
+    LLMRequest->SetContentAsString(RequestBody);
 
-	// 绑定回调函数
-	LLMRequest->OnProcessRequestComplete().BindUObject(this, &UNivaAgentLLMRequest::OnCompleteDelegate);
-	LLMRequest->OnRequestProgress64().BindUObject(this, &UNivaAgentLLMRequest::OnProgressDelegate);
+    LLMRequest->OnProcessRequestComplete().BindUObject(this, &UNivaAgentLLMRequest::OnCompleteDelegate);
+    LLMRequest->OnRequestProgress64().BindUObject(this, &UNivaAgentLLMRequest::OnProgressDelegate);
 
-	// // 初始化状态
-	// AccumulatedResponse.Empty();
-	// bIsStreamingComplete = false;
-	// Completed = false;
-
-	// 发送请求
- if (!LLMRequest->ProcessRequest())
- {
-     UE_LOG(LogTemp, Error, TEXT("UNivaAgentLLMRequest::init - 发送请求失败"));
-     NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Error, TEXT("Agent init send failed"));
- }
- else
- {
-     UE_LOG(LogTemp, Log, TEXT("UNivaAgentLLMRequest::init - 智能体聊天请求已发送"));
-     NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Normal, TEXT("Agent init sent"), {
-         {TEXT("URL"), AgentChatURL},
-         {TEXT("BodyLen"), FString::FromInt(RequestBody.Len())}
-     });
- }
-
-	
+		
+    if (!LLMRequest->ProcessRequest())
+    {
+        // 移除重复的初始化日志（合并到汇总），仅保留 UE_LOG 错误以便排查
+        UE_LOG(LogTemp, Error, TEXT("UNivaAgentLLMRequest::init - Failed to send Agent request -> url=%s"), *AgentChatURL);
+    }
 }
 
 FString UNivaAgentLLMRequest::BuildChatRequestJson(const TMap<FString, FString>& ChatHistory, FString Chat)
 {
-	// 创建JSON对象
-	TSharedPtr<FJsonObject> JsonObject = MakeShareable(new FJsonObject);
+    // 创建JSON对象
+    TSharedPtr<FJsonObject> JsonObject = MakeShareable(new FJsonObject);
     
-	// 从ChatHistory中获取AgentId
-	// 默认值从setting里面取
-	const UNivaNetworkCoreSettings* Settings = GetDefault<UNivaNetworkCoreSettings>();
-	FString AgentId = Settings->DefaultAgentID;
-	if (const FString* FoundAgentId = ChatHistory.Find(TEXT("agent_id")))
-	{
-		AgentId = *FoundAgentId;
-	}
+    // 从ChatHistory中获取AgentId
+    // 默认值从setting里面取
+    const UNivaNetworkCoreSettings* Settings = GetDefault<UNivaNetworkCoreSettings>();
+    FString AgentId = Settings->DefaultAgentID;
+    if (const FString* FoundAgentId = ChatHistory.Find(TEXT("agent_id")))
+    {
+        AgentId = *FoundAgentId;
+    }
     
-	// 设置智能体ID
-	JsonObject->SetStringField(TEXT("agent_id"), AgentId);
+    // 设置智能体ID
+    JsonObject->SetStringField(TEXT("agent_id"), AgentId);
     
-	// 设置当前消息
-	JsonObject->SetStringField(TEXT("message"), Chat);
+    // 设置当前消息
+    JsonObject->SetStringField(TEXT("message"), Chat);
     
-	// 序列化JSON
-	FString OutputString;
-	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
-	FJsonSerializer::Serialize(JsonObject.ToSharedRef(), Writer);
+    // 序列化JSON
+    FString OutputString;
+    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
+    FJsonSerializer::Serialize(JsonObject.ToSharedRef(), Writer);
     
-	UE_LOG(LogTemp, Log, TEXT("UNivaAgentLLMRequest::BuildChatRequestJson - 请求体: %s"), *OutputString);
+    // 原先此处记录 BuildChatRequestJson produced body 的日志，已被整合到 LLMChat 的汇总日志，因此移除以避免重复。
     
-	return OutputString;
-
+    return OutputString;
 }
 
 void UNivaAgentLLMRequest::OnProgressDelegate(FHttpRequestPtr Request, uint64 BytesSent, uint64 BytesReceived)
 {
-	// 安全检查
-	if (!Request.IsValid() || !Request->GetResponse().IsValid())
-	{
-		// 分辨一下是哪个无效
-		if (!Request.IsValid())
-		{
-			UE_LOG(LogTemp, Error, TEXT("NetCore: OnProgressDelegate: Request is invalid"));
-		}
-		else
-		{
-			UE_LOG(LogTemp, Error, TEXT("NetCore: OnProgressDelegate: Response is invalid"));
-		}
-		// UE_LOG(LogTemp, Error, TEXT("NetCore: OnProgressDelegate: Invalid request or response"));
-		return;
-	}
-	
-	// 1. 获取到目前为止的所有内容
-	const FString Resp = Request->GetResponse() ? Request->GetResponse()->GetContentAsString() : TEXT("");
-	if (Resp.Len() <= ParseOffset) return;
+    // 安全检查
+    if (!Request.IsValid() || !Request->GetResponse().IsValid())
+    {
+        if (!Request.IsValid())
+        {
+            UE_LOG(LogTemp, Error, TEXT("NetCore: OnProgressDelegate: Request is invalid"));
+            NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Error, TEXT("OnProgress: Request invalid"));
+        }
+        else
+        {
+            UE_LOG(LogTemp, Error, TEXT("NetCore: OnProgressDelegate: Response is invalid"));
+            NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Error, TEXT("OnProgress: Response invalid"));
+        }
+        return;
+    }
 
-	// 2. 只取本次新收到的内容
-	FString NewChunk = Resp.Mid(ParseOffset);
-	ReceivedBuffer += NewChunk;
-	ParseOffset = Resp.Len();
+    // 1. 获取到目前为止的所有内容
+    const FString Resp = Request->GetResponse() ? Request->GetResponse()->GetContentAsString() : TEXT("");
+    if (Resp.Len() <= ParseOffset)
+    {
+        // 没有新的内容，输出 warn 日志并返回
+        NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Warn, TEXT("OnProgress: no new content"));
+        return;
+    }
 
-	// 3. 拆分并查找每个 data: ...，提取 content
-	TArray<FString> Lines;
-	ReceivedBuffer.ParseIntoArrayLines(Lines, true);
-	for (const FString& Line : Lines)
-	{
-		FString Prefix = TEXT("data: ");
-		if (Line.StartsWith(Prefix))
-		{
-			FString JsonPart = Line.Mid(Prefix.Len()).TrimStartAndEnd();
+    // 2. 只取本次新收到的内容
+    FString NewChunk = Resp.Mid(ParseOffset);
+    if (NewChunk.IsEmpty())
+    {
+        NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Warn, TEXT("OnProgress: new chunk is empty"));
+        return;
+    }
 
-				// UE_LOG 打印 data: 后所有内容
-				UE_LOG(LogTemp, Log, TEXT("Raw Data after 'data:': %s"), *JsonPart);
+    ReceivedBuffer += NewChunk;
+    ParseOffset = Resp.Len();
 
-            
-			// 解析JSON内容
-			TSharedPtr<FJsonObject> JsonObj;
-			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonPart);
-			if (FJsonSerializer::Deserialize(Reader, JsonObj) && JsonObj.IsValid())
-			{
-				UE_LOG(LogTemp, Log, TEXT("Streaming Data: %s"), *JsonPart);
-				/*
-				 * 输入有两种
-				 * {"role": "assistant", "content": "你的吗？"}
-				 * {"status": "processing"}
-				 *
-				 * 转换成
-				 *
-				 * 	{
-					"model": "qwen2.5:latest",
-					"created_at" : "2025-04-23T06:50:59.9432702Z",
-					"message" : {
-						"role": "assistant",
-						"content" : "我们"
-					},
-					"done" : false
-					}
-				 */
-				// 先提取status
-				// 处理 assistant content
-				// FString Role;
-				// FString Content;
-				// if (JsonObj->TryGetStringField(TEXT("role"), Role) && JsonObj->TryGetStringField(TEXT("content"), Content))
-				// {
-				// 	// 在这里将content返回给Blueprint或其它逻辑
-				// 	UE_LOG(LogTemp, Warning, TEXT("流式输出: %s"), *Content);
-				// 	// 可以广播一个代理（如OnReceiveContent.Broadcast(Content);）
-				// 	
-				// 	if (OnNivaAsyncLLMRequestProgress.IsBound()) {
-				// 		OnNivaAsyncLLMRequestProgress.Execute(false, Content);
-				// 	}
-				// 	
-				// }
-				// 解析新的 OpenAI 风格的流式返回：choices[0].delta.content 和 finish_reason
-				FString AssistantContent;
-				bool bDone = false;
-				// 默认角色为 assistant
-				FString AssistantRole = TEXT("assistant");
+    // 3. 拆分并查找每个 data: ...，提取 content
+    TArray<FString> Lines;
+    ReceivedBuffer.ParseIntoArrayLines(Lines, true);
+    for (const FString& Line : Lines)
+    {
+        FString Prefix = TEXT("data: ");
+        if (Line.StartsWith(Prefix))
+        {
+            FString JsonPart = Line.Mid(Prefix.Len()).TrimStartAndEnd();
 
-				const TArray<TSharedPtr<FJsonValue>>* ChoicesArrayPtr = nullptr;
-				if (JsonObj->TryGetArrayField(TEXT("choices"), ChoicesArrayPtr) && ChoicesArrayPtr && ChoicesArrayPtr->Num() > 0)
-				{
-					const TSharedPtr<FJsonObject>* FirstChoiceObjPtr = nullptr;
-					if ((*ChoicesArrayPtr)[0].IsValid() && (*ChoicesArrayPtr)[0]->TryGetObject(FirstChoiceObjPtr) && FirstChoiceObjPtr && (*FirstChoiceObjPtr).IsValid())
-					{
-						const TSharedPtr<FJsonObject> FirstChoiceObj = *FirstChoiceObjPtr;
-						// finish_reason 非空表示结束
-						FString FinishReason;
-						if (FirstChoiceObj->TryGetStringField(TEXT("finish_reason"), FinishReason))
-						{
-							bDone = !FinishReason.IsEmpty();
-						}
-						// 解析 delta.content
-						const TSharedPtr<FJsonObject>* DeltaObjPtr = nullptr;
-						if (FirstChoiceObj->TryGetObjectField(TEXT("delta"), DeltaObjPtr) && DeltaObjPtr && (*DeltaObjPtr).IsValid())
-						{
-							(*DeltaObjPtr)->TryGetStringField(TEXT("content"), AssistantContent);
-							// 如果服务端在 delta 中给了 role，也一并更新
-							(*DeltaObjPtr)->TryGetStringField(TEXT("role"), AssistantRole);
-						}
-					}
-				}
+            TSharedPtr<FJsonObject> JsonObj;
+            TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonPart);
+            if (FJsonSerializer::Deserialize(Reader, JsonObj) && JsonObj.IsValid())
+            {
+                FString AssistantContent;
+                bool bDone = false;
+                FString AssistantRole = TEXT("assistant");
 
-				// 构造最后结果的 json（保持下游兼容）
-				TSharedPtr<FJsonObject> OutJson = MakeShared<FJsonObject>();
-				// 如果上游给了 created 字段，可用；否则使用当前 UTC 时间
-				int64 CreatedUnix = 0;
-				if (JsonObj->TryGetNumberField(TEXT("created"), CreatedUnix))
-				{
-					// 将 Unix 秒转为 ISO8601
-					FDateTime Epoch(1970,1,1);
-					FDateTime CreatedDT = Epoch + FTimespan::FromSeconds(CreatedUnix);
-					OutJson->SetStringField(TEXT("created_at"), CreatedDT.ToIso8601());
-				}
-				else
-				{
-					OutJson->SetStringField(TEXT("created_at"), FDateTime::UtcNow().ToIso8601());
-				}
-				OutJson->SetBoolField(TEXT("done"), bDone);
+                const TArray<TSharedPtr<FJsonValue>>* ChoicesArrayPtr = nullptr;
+                if (JsonObj->TryGetArrayField(TEXT("choices"), ChoicesArrayPtr) && ChoicesArrayPtr && ChoicesArrayPtr->Num() > 0)
+                {
+                    const TSharedPtr<FJsonObject>* FirstChoiceObjPtr = nullptr;
+                    if ((*ChoicesArrayPtr)[0].IsValid() && (*ChoicesArrayPtr)[0]->TryGetObject(FirstChoiceObjPtr) && FirstChoiceObjPtr && (*FirstChoiceObjPtr).IsValid())
+                    {
+                        const TSharedPtr<FJsonObject> FirstChoiceObj = *FirstChoiceObjPtr;
+                        FString FinishReason;
+                        if (FirstChoiceObj->TryGetStringField(TEXT("finish_reason"), FinishReason))
+                        {
+                            bDone = !FinishReason.IsEmpty();
+                        }
+                        const TSharedPtr<FJsonObject>* DeltaObjPtr = nullptr;
+                        if (FirstChoiceObj->TryGetObjectField(TEXT("delta"), DeltaObjPtr) && DeltaObjPtr && (*DeltaObjPtr).IsValid())
+                        {
+                            (*DeltaObjPtr)->TryGetStringField(TEXT("content"), AssistantContent);
+                            (*DeltaObjPtr)->TryGetStringField(TEXT("role"), AssistantRole);
+                        }
+                    }
+                }
 
-				TSharedPtr<FJsonObject> MsgObj = MakeShared<FJsonObject>();
-				MsgObj->SetStringField(TEXT("role"), AssistantRole);
-				MsgObj->SetStringField(TEXT("content"), AssistantContent);
-				OutJson->SetObjectField(TEXT("message"), MsgObj);
+                // 构造最后结果的 json（保持下游兼容）
+                TSharedPtr<FJsonObject> OutJson = MakeShared<FJsonObject>();
+                int64 CreatedUnix = 0;
+                if (JsonObj->TryGetNumberField(TEXT("created"), CreatedUnix))
+                {
+                    FDateTime Epoch(1970,1,1);
+                    FDateTime CreatedDT = Epoch + FTimespan::FromSeconds(CreatedUnix);
+                    OutJson->SetStringField(TEXT("created_at"), CreatedDT.ToIso8601());
+                }
+                else
+                {
+                    OutJson->SetStringField(TEXT("created_at"), FDateTime::UtcNow().ToIso8601());
+                }
+                OutJson->SetBoolField(TEXT("done"), bDone);
 
-				// 转为字符串，log输出
-				FString OutStr;
-				TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&OutStr);
-				FJsonSerializer::Serialize(OutJson.ToSharedRef(), W);
-    UE_LOG(LogTemp, Log, TEXT("Final Composed Result: %s"), *OutStr);
-    NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Normal, TEXT("Streaming chunk"), {
-        {TEXT("Done"), bDone ? TEXT("true") : TEXT("false")},
-        {TEXT("Len"), FString::FromInt(OutStr.Len())}
-    });
-				// 广播
-				if (OnNivaAsyncLLMRequestProgress.IsBound()) {
-					OnNivaAsyncLLMRequestProgress.Execute(bDone, OutStr);
-				}
-				// 蓝图
-				if (OnNivaLLMRequestProgress.IsBound())
-				{
-					OnNivaLLMRequestProgress.Broadcast(0, 0, OutStr);
-				}
-				
-			}
-		}
-	}
-	// 若要避免重复解析，可将ReceivedBuffer置空或只保存未处理的残留
-	ReceivedBuffer.Empty();
+                TSharedPtr<FJsonObject> MsgObj = MakeShareable(new FJsonObject);
+                MsgObj->SetStringField(TEXT("role"), AssistantRole);
+                MsgObj->SetStringField(TEXT("content"), AssistantContent);
+                OutJson->SetObjectField(TEXT("message"), MsgObj);
+
+                FString OutStr;
+                TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&OutStr);
+                FJsonSerializer::Serialize(OutJson.ToSharedRef(), W);
+
+                // 如果构建后的消息为空则跳过广播
+                if (OutStr.IsEmpty() || AssistantContent.IsEmpty())
+                {
+                    NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Warn, TEXT("OnProgress: skipped broadcasting empty chunk"));
+                    continue;
+                }
+
+                // Put a short preview of OutStr into the message (prefixed), limit to 10 characters per requirement
+                const int32 PreviewMax = 10;
+                // Use only the assistant content (AssistantContent) for the message preview, remove CR/LF, then truncate
+                FString ContentNoNewline = AssistantContent;
+                ContentNoNewline.ReplaceInline(TEXT("\r"), TEXT(""));
+                ContentNoNewline.ReplaceInline(TEXT("\n"), TEXT(""));
+                const FString ContentPreview = ContentNoNewline.Left(PreviewMax);
+                NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Trace,
+                    FString::Printf(TEXT("%s | Streaming chunk -> done=%s len=%d"), *ContentPreview, bDone?TEXT("true"):TEXT("false"), OutStr.Len()),
+                    {
+                        {TEXT("Done"), bDone ? TEXT("true") : TEXT("false")},
+                        {TEXT("Len"), FString::FromInt(OutStr.Len())},
+                        {TEXT("Preview"), OutStr.Left(512)}
+                    });
+
+                if (OnNivaAsyncLLMRequestProgress.IsBound()) {
+                    OnNivaAsyncLLMRequestProgress.Execute(bDone, OutStr);
+                }
+                if (OnNivaLLMRequestProgress.IsBound())
+                {
+                    OnNivaLLMRequestProgress.Broadcast(0, 0, OutStr);
+                }
+            }
+        }
+    }
+
+    // 清空已处理缓冲，避免重复解析
+    ReceivedBuffer.Empty();
 }
+
 
 
 void UNivaAgentLLMRequest::OnCompleteDelegate(FHttpRequestPtr Request, FHttpResponsePtr ResponsePtr, bool bA)
@@ -998,11 +1022,16 @@ void UNivaAgentLLMRequest::OnCompleteDelegate(FHttpRequestPtr Request, FHttpResp
     Super::OnCompleteDelegate(Request, ResponsePtr, bA);
     if (bA)
     {
-        NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Normal, TEXT("Agent request complete"));
+        NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Info, TEXT("Agent request complete"));
     }
     else
     {
-        NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Error, TEXT("Agent request failed"));
+        FString Url = Request.IsValid() ? Request->GetURL() : TEXT("");
+        FString RespPreview = ResponsePtr.IsValid() ? ResponsePtr->GetContentAsString().Left(512) : TEXT("");
+        TMap<FString,FString> Meta;
+        Meta.Add(TEXT("URL"), Url);
+        Meta.Add(TEXT("respPreview"), RespPreview);
+        NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Error, TEXT("Agent request failed"), Meta);
     }
 }
 
@@ -1012,14 +1041,16 @@ void UNivaRunnerLLMRequest::init(TMap<FString, FString> Chated, FString Chat)
 	const UNivaNetworkCoreSettings* Settings = GetDefault<UNivaNetworkCoreSettings>();
 	if (!Settings)
 	{
-		UE_LOG(LogTemp, Error, TEXT("UNivaRunnerLLMRequest::init - 无法获取网络核心设置"));
+        UE_LOG(LogTemp, Error, TEXT("UNivaRunnerLLMRequest::init - 无法获取网络核心设置"));
+        NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Error, TEXT("init - missing NetworkCore settings"));
 		return;
 	}
 
 	LLMRequest = FHttpModule::Get().CreateRequest();
 	if (!LLMRequest.IsValid())
 	{
-		UE_LOG(LogTemp, Error, TEXT("UNivaRunnerLLMRequest::init - 无法创建HTTP请求"));
+        UE_LOG(LogTemp, Error, TEXT("UNivaRunnerLLMRequest::init - 无法创建HTTP请求"));
+        NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Error, TEXT("init - create HTTP request failed"));
 		return;
 	}
 
@@ -1031,7 +1062,7 @@ void UNivaRunnerLLMRequest::init(TMap<FString, FString> Chated, FString Chat)
 
 	// 构建 body
 	const FString Body = BuildChatRequestJson(Chated, Chat);
-	UE_LOG(LogTemp, Log, TEXT("UNivaRunnerLLMRequest Body: %s"), *Body);
+
 	LLMRequest->SetContentAsString(Body);
 
 	// 绑定
@@ -1040,11 +1071,6 @@ void UNivaRunnerLLMRequest::init(TMap<FString, FString> Chated, FString Chat)
 	LLMRequest->OnRequestProgress64().BindUObject(this, &UNivaLLMRequest::OnProgressDelegate);
 
     LLMRequest->ProcessRequest();
-    NC_CoreLog(this, TEXT("LLM.Runner"), ECoreLogSeverity::Normal, TEXT("Runner init sent"), {
-        {TEXT("URL"), Settings->LLMRunnerURL},
-        {TEXT("Type"), Settings->LLMRunnerType},
-        {TEXT("BodyLen"), FString::FromInt(Body.Len())}
-    });
 }
 
 FString UNivaRunnerLLMRequest::BuildChatRequestJson(const TMap<FString, FString>& ChatHistory, FString Chat)

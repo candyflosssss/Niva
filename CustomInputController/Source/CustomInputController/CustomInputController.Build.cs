@@ -50,21 +50,22 @@ public class CustomInputController : ModuleRules
 				"Engine",
 				"Slate",
 				"SlateCore",
-				"DeveloperSettings",
-				"InputCore",
-				"Json",
-				"JsonUtilities",
-				"Projects",
-				"Settings",
-				"OpenColorIOLib", 
-				"WebSockets",
-				"HTTP",
-				"AudioExtensions",
-				"AudioMixer",
-				"DeveloperSettings"
-				// ... add private dependencies that you statically link with here ...	
-			}
-			);
+    "DeveloperSettings",
+    "InputCore",
+    "Json",
+    "JsonUtilities",
+    "Projects",
+    "Settings",
+    "OpenColorIOLib", 
+    "WebSockets",
+    "HTTP",
+    "AudioExtensions",
+    "AudioMixer",
+    "DeveloperSettings",
+    "CoreManager"
+    // ... add private dependencies that you statically link with here ... 
+}
+);
 
 		if (Target.bBuildEditor)
 		{

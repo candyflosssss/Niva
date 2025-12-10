@@ -5,7 +5,6 @@
 #include "MCP/MCPTransportSubsystem.h" // 新增：按功能分类后的 MCP 传输子系统头
 #include "HAL/PlatformProcess.h"
 #include "Async/Async.h"
-#include "Misc/OutputDeviceDebug.h"
 #include "Delegates/Delegate.h"
 #include "Kismet/GameplayStatics.h"
 #include "Subsystems/McpComponentRegistrySubsystem.h"
@@ -189,7 +188,7 @@ FNivaHttpRequest::FNivaHttpRequest(const FHttpServerRequest& Request)
 void UMCPTransportSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
-    MCPLog(this, TEXT("Init"), ECoreLogSeverity::Normal, TEXT("UMCPTransportSubsystem Initialize"));
+    MCPLog(this, TEXT("Init"), ECoreLogSeverity::Info, TEXT("UMCPTransportSubsystem Initialize"));
 }
 
 // 停止 CivetWeb 服务器并清理资源
@@ -202,7 +201,7 @@ void UMCPTransportSubsystem::Deinitialize()
         mg_stop(ServerContext);
         ServerContext = nullptr;
     }
-    MCPLog(this, TEXT("Init"), ECoreLogSeverity::Normal, TEXT("UMCPTransportSubsystem Deinitialize"));
+    MCPLog(this, TEXT("Init"), ECoreLogSeverity::Info, TEXT("UMCPTransportSubsystem Deinitialize"));
     Super::Deinitialize();
 }
 
@@ -217,7 +216,7 @@ bool UMCPTransportSubsystem::ShouldCreateSubsystem(UObject* Outer) const
             if (UCoreLogSubsystem* LogSys = GI->GetSubsystem<UCoreLogSubsystem>())
             {
                 const TMap<FString,FString> Data; // empty
-                LogSys->Log(TEXT("MCP"), TEXT("Init"), ECoreLogSeverity::Normal, FString::Printf(TEXT("ShouldCreateSubsystem=%s"), bCreate ? TEXT("true") : TEXT("false")), Data);
+                LogSys->Log(TEXT("MCP"), TEXT("Init"), ECoreLogSeverity::Info, FString::Printf(TEXT("ShouldCreateSubsystem=%s"), bCreate ? TEXT("true") : TEXT("false")), Data);
             }
         }
     }
@@ -327,18 +326,80 @@ void UMCPTransportSubsystem::RegisterToolProperties(FMCPTool tool, FMCPRouteDele
         Storage.MCPToolVariants.Num(),
         *GetNameSafe(GetOwnerClassFromTool(Storage.MCPTool)),
         *GetNameSafe(GetOwnerClassFromTool(tool)));
+	{
+    TMap<FString, FString> DetailLog;
+
+    // 基本信息
+    DetailLog.Add(TEXT("ToolName"), tool.Name);
+    DetailLog.Add(TEXT("Description"), tool.Description);
+    DetailLog.Add(TEXT("TotalRoutes"), FString::FromInt(Storage.RouteDelegates.Num()));
+    DetailLog.Add(TEXT("Registrations"), FString::FromInt(Storage.ToolNum));
+    DetailLog.Add(TEXT("Variants"), FString::FromInt(Storage.MCPToolVariants.Num()));
+    DetailLog.Add(TEXT("PropertiesCount"), FString::FromInt(tool.Properties.Num()));
+
+    // Canon / Incoming owner
+    DetailLog.Add(TEXT("CanonOwner"), GetNameSafe(GetOwnerClassFromTool(Storage.MCPTool)));
+    DetailLog.Add(TEXT("IncomingOwner"), GetNameSafe(GetOwnerClassFromTool(tool)));
+
+    // 属性清单与类型汇总（逗号分隔，简单字符串，最长 1024 字符）
+    FString PropSummary;
+    for (UMCPToolProperty* P : tool.Properties)
     {
-        TMap<FString,FString> LogData;
-        LogData.Add(TEXT("ToolName"), tool.Name);
-        LogData.Add(TEXT("Routes"), FString::FromInt(Storage.RouteDelegates.Num()));
-        LogData.Add(TEXT("Registrations"), FString::FromInt(Storage.ToolNum));
-        MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Normal, TEXT("Registered tool route"), LogData);
+        if (!P) continue;
+        const FString TypeName = StaticEnum<EMCPJsonType>()->GetNameStringByValue(static_cast<int64>(P->Type));
+        PropSummary += FString::Printf(TEXT("%s:%s,"), *P->Name, *TypeName);
     }
+    if (PropSummary.Len() > 0)
+    {
+        // 去掉末尾逗号
+        PropSummary.RemoveAt(PropSummary.Len() - 1);
+    }
+    // 限制长度，避免日志过长
+    if (PropSummary.Len() > 1024) PropSummary = PropSummary.Left(1024) + TEXT("...");
+
+    DetailLog.Add(TEXT("PropertyList"), MoveTemp(PropSummary));
+
+    // 针对特殊类型（Actor / Component），记录可用目标数量及前几个示例
+    for (UMCPToolProperty* P : tool.Properties)
+    {
+        if (!P) continue;
+        if (UMCPToolPropertyActorPtr* AP = Cast<UMCPToolPropertyActorPtr>(P))
+        {
+            TArray<FString> Targets = AP->GetAvailableTargets();
+            DetailLog.Add(FString::Printf(TEXT("TargetsCount_%s"), *P->Name), FString::FromInt(Targets.Num()));
+            // 列出前 5 个示例
+            FString FirstTargets;
+            for (int32 i = 0; i < Targets.Num() && i < 5; ++i)
+            {
+                FirstTargets += Targets[i] + TEXT(", ");
+            }
+            if (FirstTargets.Len() > 2) FirstTargets.RemoveAt(FirstTargets.Len() - 2);
+            if (FirstTargets.Len() > 256) FirstTargets = FirstTargets.Left(256) + TEXT("...");
+            DetailLog.Add(FString::Printf(TEXT("TargetsSample_%s"), *P->Name), MoveTemp(FirstTargets));
+        }
+        else if (UMCPToolPropertyComponentPtr* CP = Cast<UMCPToolPropertyComponentPtr>(P))
+        {
+            TArray<FString> CTargets = CP->GetAvailableTargets();
+            DetailLog.Add(FString::Printf(TEXT("CompTargetsCount_%s"), *P->Name), FString::FromInt(CTargets.Num()));
+            FString FirstCTargets;
+            for (int32 i = 0; i < CTargets.Num() && i < 5; ++i)
+            {
+                FirstCTargets += CTargets[i] + TEXT(", ");
+            }
+            if (FirstCTargets.Len() > 2) FirstCTargets.RemoveAt(FirstCTargets.Len() - 2);
+            if (FirstCTargets.Len() > 256) FirstCTargets = FirstCTargets.Left(256) + TEXT("...");
+            DetailLog.Add(FString::Printf(TEXT("CompTargetsSample_%s"), *P->Name), MoveTemp(FirstCTargets));
+        }
+    }
+
+    // 最终记录更详细的日志
+    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Info, TEXT("Registered tool route (detailed)"), DetailLog);
+	}
 }
 
 TSharedPtr<FJsonObject> UMCPTransportSubsystem::GetToolbyTarget(FString ActorName)
 {
-    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Normal, FString::Printf(TEXT("Query tools by target: %s"), *ActorName));
+    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Info, FString::Printf(TEXT("Query tools by target: %s"), *ActorName));
     // 用json来存储结果
     TSharedPtr<FJsonObject> result = MakeShareable(new FJsonObject);
     TArray<TSharedPtr<FJsonValue>> ToolsArray;
@@ -362,13 +423,13 @@ TSharedPtr<FJsonObject> UMCPTransportSubsystem::GetToolbyTarget(FString ActorNam
 	// 将json数组添加到根对象
 	result->SetArrayField("tools", ToolsArray);
 	
-    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Normal, FString::Printf(TEXT("Query tools by target done: %d items"), ToolsArray.Num()));
+    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Info, FString::Printf(TEXT("Query tools by target done: %d items"), ToolsArray.Num()));
     return result;
 }
 
 TSharedPtr<FJsonObject> UMCPTransportSubsystem::GetToolTargets(FString ToolName)
 {
-    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Normal, FString::Printf(TEXT("Query targets by tool: %s"), *ToolName));
+    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Info, FString::Printf(TEXT("Query targets by tool: %s"), *ToolName));
     // 通过json来存储结果
     // 构建一个JSON对象
     TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
@@ -417,7 +478,7 @@ TSharedPtr<FJsonObject> UMCPTransportSubsystem::GetToolTargets(FString ToolName)
 
     // 设置根对象
     RootObject->SetArrayField("targets", TargetsArray);
-    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Normal, FString::Printf(TEXT("Query targets by tool done: %d items"), TargetsArray.Num()));
+    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Info, FString::Printf(TEXT("Query targets by tool done: %d items"), TargetsArray.Num()));
     return RootObject;
 }
 
@@ -494,13 +555,13 @@ void UMCPTransportSubsystem::SendSSE(const FString& SessionId, const FString& Ev
         TMap<FString,FString> LogData;
         LogData.Add(TEXT("SessionId"), SessionId);
         LogData.Add(TEXT("Event"), Event);
-        MCPLog(this, TEXT("SSE"), ECoreLogSeverity::Normal, TEXT("Queued SSE message"), LogData);
+        MCPLog(this, TEXT("SSE"), ECoreLogSeverity::Info, TEXT("Queued SSE message"), LogData);
     }
     else
     {
         TMap<FString,FString> LogData;
         LogData.Add(TEXT("SessionId"), SessionId);
-        MCPLog(this, TEXT("SSE"), ECoreLogSeverity::Warning, TEXT("Unknown session for SSE"), LogData);
+        MCPLog(this, TEXT("SSE"), ECoreLogSeverity::Warn, TEXT("Unknown session for SSE"), LogData);
     }
 }
 
@@ -511,7 +572,7 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
     {
         TMap<FString,FString> LogData;
         LogData.Add(TEXT("SessionId"), SessionId);
-        MCPLog(this, TEXT("Message"), ECoreLogSeverity::Normal, TEXT("HandlePostRequest received"), LogData);
+        MCPLog(this, TEXT("Message"), ECoreLogSeverity::Info, TEXT("HandlePostRequest received"), LogData);
     }
 
 
@@ -526,12 +587,18 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
         TMap<FString,FString> LogData;
         LogData.Add(TEXT("SessionId"), SessionId);
         LogData.Add(TEXT("Method"), Method);
-        MCPLog(this, TEXT("Message"), ECoreLogSeverity::Normal, TEXT("Parsed JSON-RPC"), LogData);
+        // 如果是 tools/call，尝试附加工具名以便快速排查
+        if (Method == TEXT("tools/call") && Params.IsValid() && Params->HasField(TEXT("name")))
+        {
+            FString ToolNameLocal = Params->GetStringField(TEXT("name"));
+            LogData.Add(TEXT("ToolName"), ToolNameLocal);
+        }
+        MCPLog(this, TEXT("Message"), ECoreLogSeverity::Info, TEXT("Parsed JSON-RPC"), LogData);
     }
 
 
     if (Method == "initialize") {
-		// 处理初始化逻辑
+        // 处理初始化逻辑
         /*{
             "jsonrpc": "2.0",
                 "id" : 1,
@@ -612,42 +679,42 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
 
 
             // 先剔除所有的换行符
-			InitMessage.ReplaceInline(TEXT("\n"), TEXT(""));
-			InitMessage.ReplaceInline(TEXT("\r"), TEXT(""));
-			InitMessage.ReplaceInline(TEXT("\t"), TEXT(""));
+            InitMessage.ReplaceInline(TEXT("\n"), TEXT(""));
+            InitMessage.ReplaceInline(TEXT("\r"), TEXT(""));
+            InitMessage.ReplaceInline(TEXT("\t"), TEXT(""));
 
 
             //InitMessage += "\n\n";
 
         SendSSE(SessionId, TEXT("message"), InitMessage);
-	}
+    }
     else if (Method == "tools/list") {
         // 展示工具
 
         // 用json的形式构建返回
-		FString ToolListMessage;
+        FString ToolListMessage;
 
-		TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
-		// 设置基本字段
-		RootObject->SetStringField("jsonrpc", "2.0");
-		RootObject->SetNumberField("id", id); 
+        TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
+        // 设置基本字段
+        RootObject->SetStringField("jsonrpc", "2.0");
+        RootObject->SetNumberField("id", id); 
 
-		// 构建 result 对象
-		TSharedPtr<FJsonObject> ResultObject = MakeShareable(new FJsonObject);
+        // 构建 result 对象
+        TSharedPtr<FJsonObject> ResultObject = MakeShareable(new FJsonObject);
 
         // 构建 tools 数组
         TArray<TSharedPtr<FJsonValue>> ToolsArray;
 
-		// 构建 tools 数组
-		for (auto k : MCPTools)
-		{
+        // 构建 tools 数组
+        for (auto k : MCPTools)
+        {
             FMCPTool i = k.Value.MCPTool;
             // 构建工具对象
             TSharedPtr<FJsonObject> ToolObject = MakeShareable(new FJsonObject);
 
             // 工具名称和描述
             FString ToolName = i.Name;
-			FString ToolDescription = i.Description;
+            FString ToolDescription = i.Description;
 
             ToolObject->SetStringField("name", ToolName);
             ToolObject->SetStringField("description", ToolDescription);
@@ -659,7 +726,7 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
             TSharedPtr<FJsonObject> PropertiesObject = MakeShareable(new FJsonObject);
             // 构建 required 数组
             TArray<FString> RequiredArray;
-			// 遍历工具的属性
+            // 遍历工具的属性
             for (UMCPToolProperty* j : i.Properties)
             {
                 PropertiesObject->SetObjectField(j->Name, j->GetJsonObject());
@@ -667,7 +734,7 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
             }
             // 将 properties 添加到 inputSchema
             InputSchemaObject->SetObjectField("properties", PropertiesObject);
-			// 将 required 数组添加到 inputSchema
+            // 将 required 数组添加到 inputSchema
             // Replace the problematic line with the following code to fix the error:
             TArray<TSharedPtr<FJsonValue>> JsonArray;
             for (const FString& RequiredItem : RequiredArray)
@@ -681,108 +748,114 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
             // 将工具对象添加到 tools 数组
             ToolsArray.Add(MakeShareable(new FJsonValueObject(ToolObject)));
         }
-		// 将 tools 数组添加到 result 对象
-		ResultObject->SetArrayField("tools", ToolsArray);
+        // 将 tools 数组添加到 result 对象
+        ResultObject->SetArrayField("tools", ToolsArray);
 
-		// 设置 nextCursor
-		ResultObject->SetStringField("nextCursor", "next-page-cursor");
-		// 将 result 添加到根对象
-		RootObject->SetObjectField("result", ResultObject);
-		// 序列化为字符串
-		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ToolListMessage);
-		FJsonSerializer::Serialize(RootObject.ToSharedRef(), Writer);
-		// 先剔除所有的换行符
-		ToolListMessage.ReplaceInline(TEXT("\n"), TEXT(""));
-		ToolListMessage.ReplaceInline(TEXT("\r"), TEXT(""));
-		ToolListMessage.ReplaceInline(TEXT("\t"), TEXT(""));
+        // 设置 nextCursor
+        ResultObject->SetStringField("nextCursor", "next-page-cursor");
+        // 将 result 添加到根对象
+        RootObject->SetObjectField("result", ResultObject);
+        // 序列化为字符串
+        TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ToolListMessage);
+        FJsonSerializer::Serialize(RootObject.ToSharedRef(), Writer);
+        // 先剔除所有的换行符
+        ToolListMessage.ReplaceInline(TEXT("\n"), TEXT(""));
+        ToolListMessage.ReplaceInline(TEXT("\r"), TEXT(""));
+        ToolListMessage.ReplaceInline(TEXT("\t"), TEXT(""));
 
-		//ToolListMessage += "\n\n";
-		SendSSE(SessionId, TEXT("message"), ToolListMessage);
-	}
-	else if (Method == "resources/list") {
-		// 按 MCP 规范返回空资源列表
-		FString Msg;
-		TSharedPtr<FJsonObject> Root = MakeShareable(new FJsonObject);
-		Root->SetStringField("jsonrpc", "2.0");
-		Root->SetNumberField("id", id);
-		TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject);
-		TArray<TSharedPtr<FJsonValue>> Resources;
-		Result->SetArrayField("resources", Resources);
-		Result->SetStringField("nextCursor", ""); // 暂无分页
-		Root->SetObjectField("result", Result);
-		TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Msg);
-		FJsonSerializer::Serialize(Root.ToSharedRef(), W);
-		Msg.ReplaceInline(TEXT("\n"), TEXT("")); Msg.ReplaceInline(TEXT("\r"), TEXT("")); Msg.ReplaceInline(TEXT("\t"), TEXT(""));
-		SendSSE(SessionId, TEXT("message"), Msg);
-	}
-	else if (Method == "prompts/list") {
-		// 按 MCP 规范返回空提示列表
-		FString Msg;
-		TSharedPtr<FJsonObject> Root = MakeShareable(new FJsonObject);
-		Root->SetStringField("jsonrpc", "2.0");
-		Root->SetNumberField("id", id);
-		TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject);
-		TArray<TSharedPtr<FJsonValue>> Prompts;
-		Result->SetArrayField("prompts", Prompts);
-		Result->SetStringField("nextCursor", "");
-		Root->SetObjectField("result", Result);
-		TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Msg);
-		FJsonSerializer::Serialize(Root.ToSharedRef(), W);
-		Msg.ReplaceInline(TEXT("\n"), TEXT("")); Msg.ReplaceInline(TEXT("\r"), TEXT("")); Msg.ReplaceInline(TEXT("\t"), TEXT(""));
-		SendSSE(SessionId, TEXT("message"), Msg);
-	}
-	else if (Method == "logging/list") {
-		// 暂不支持：按 JSON-RPC 返回标准错误（-32601 方法不存在/不支持）
-		FString Msg;
-		TSharedPtr<FJsonObject> Root = MakeShareable(new FJsonObject);
-		Root->SetStringField("jsonrpc", "2.0");
-		Root->SetNumberField("id", id);
-		TSharedPtr<FJsonObject> Err = MakeShareable(new FJsonObject);
-		Err->SetNumberField("code", -32601);
-		Err->SetStringField("message", TEXT("logging/list not supported"));
-		Root->SetObjectField("error", Err);
-		TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Msg);
-		FJsonSerializer::Serialize(Root.ToSharedRef(), W);
-		Msg.ReplaceInline(TEXT("\n"), TEXT("")); Msg.ReplaceInline(TEXT("\r"), TEXT("")); Msg.ReplaceInline(TEXT("\t"), TEXT(""));
-		SendSSE(SessionId, TEXT("message"), Msg);
+        //ToolListMessage += "\n\n";
+        SendSSE(SessionId, TEXT("message"), ToolListMessage);
+    }
+    else if (Method == "resources/list") {
+        // 按 MCP 规范返回空资源列表
+        FString Msg;
+        TSharedPtr<FJsonObject> Root = MakeShareable(new FJsonObject);
+        Root->SetStringField("jsonrpc", "2.0");
+        Root->SetNumberField("id", id);
+        TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject);
+        TArray<TSharedPtr<FJsonValue>> Resources;
+        Result->SetArrayField("resources", Resources);
+        Result->SetStringField("nextCursor", ""); // 暂无分页
+        Root->SetObjectField("result", Result);
+        TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Msg);
+        FJsonSerializer::Serialize(Root.ToSharedRef(), W);
+        Msg.ReplaceInline(TEXT("\n"), TEXT("")); Msg.ReplaceInline(TEXT("\r"), TEXT("")); Msg.ReplaceInline(TEXT("\t"), TEXT(""));
+        SendSSE(SessionId, TEXT("message"), Msg);
+    }
+    else if (Method == "prompts/list") {
+        // 按 MCP 规范返回空提示列表
+        FString Msg;
+        TSharedPtr<FJsonObject> Root = MakeShareable(new FJsonObject);
+        Root->SetStringField("jsonrpc", "2.0");
+        Root->SetNumberField("id", id);
+        TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject);
+        TArray<TSharedPtr<FJsonValue>> Prompts;
+        Result->SetArrayField("prompts", Prompts);
+        Result->SetStringField("nextCursor", "");
+        Root->SetObjectField("result", Result);
+        TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Msg);
+        FJsonSerializer::Serialize(Root.ToSharedRef(), W);
+        Msg.ReplaceInline(TEXT("\n"), TEXT("")); Msg.ReplaceInline(TEXT("\r"), TEXT("")); Msg.ReplaceInline(TEXT("\t"), TEXT(""));
+        SendSSE(SessionId, TEXT("message"), Msg);
+    }
+    else if (Method == "logging/list") {
+        // 暂不支持：按 JSON-RPC 返回标准错误（-32601 方法不存在/不支持）
+        FString Msg;
+        TSharedPtr<FJsonObject> Root = MakeShareable(new FJsonObject);
+        Root->SetStringField("jsonrpc", "2.0");
+        Root->SetNumberField("id", id);
+        TSharedPtr<FJsonObject> Err = MakeShareable(new FJsonObject);
+        Err->SetNumberField("code", -32601);
+        Err->SetStringField("message", TEXT("logging/list not supported"));
+        Root->SetObjectField("error", Err);
+        TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Msg);
+        FJsonSerializer::Serialize(Root.ToSharedRef(), W);
+        Msg.ReplaceInline(TEXT("\n"), TEXT("")); Msg.ReplaceInline(TEXT("\r"), TEXT("")); Msg.ReplaceInline(TEXT("\t"), TEXT(""));
+        SendSSE(SessionId, TEXT("message"), Msg);
 
     }
-	else if (Method == "tools/call") {
+    else if (Method == "tools/call") {
 
         // 从params里面获取name
-		FString ToolName = Params->GetStringField(TEXT("name"));
+        FString ToolName = Params->GetStringField(TEXT("name"));
 
+        {
+            TMap<FString,FString> LogData;
+            LogData.Add(TEXT("SessionId"), SessionId);
+            LogData.Add(TEXT("ToolName"), ToolName);
+            MCPLog(this, TEXT("Message"), ECoreLogSeverity::Info, FString::Printf(TEXT("tools/call received for %s"), *ToolName), LogData);
+        }
 
-    	
-		// print 一下时间
-    	UE_LOG(LogTemp, Log, TEXT("SSE: tools/call: time: %s"), *FDateTime::Now().ToString());
-      		// 直接print一下
-		UE_LOG(LogTemp, Log, TEXT("SSE: tools/call: %s"), *ToolName);
+        
+        // print 一下时间
+        UE_LOG(LogTemp, Log, TEXT("SSE: tools/call: time: %s"), *FDateTime::Now().ToString());
+            // 直接print一下
+        UE_LOG(LogTemp, Log, TEXT("SSE: tools/call: %s"), *ToolName);
 
-		// 提取 _meta.progressToken（字符串或数字），用于进度回报
-		FString ProgressToken;
-		if (Params.IsValid() && Params->HasField(TEXT("_meta")))
-		{
-			TSharedPtr<FJsonObject> MetaObj = Params->GetObjectField(TEXT("_meta"));
-			if (MetaObj.IsValid())
-			{
-				if (MetaObj->HasTypedField<EJson::String>(TEXT("progressToken")))
-				{
-					ProgressToken = MetaObj->GetStringField(TEXT("progressToken"));
-				}
-				else if (MetaObj->HasField(TEXT("progressToken")))
-				{
-					// 兼容数字类型的 token
-					const double NumToken = MetaObj->GetNumberField(TEXT("progressToken"));
-					ProgressToken = FString::SanitizeFloat(NumToken);
-				}
-			}
-		}
+        // 提取 _meta.progressToken（字符串或数字），用于进度回报
+        FString ProgressToken;
+        if (Params.IsValid() && Params->HasField(TEXT("_meta")))
+        {
+            TSharedPtr<FJsonObject> MetaObj = Params->GetObjectField(TEXT("_meta"));
+            if (MetaObj.IsValid())
+            {
+                if (MetaObj->HasTypedField<EJson::String>(TEXT("progressToken")))
+                {
+                    ProgressToken = MetaObj->GetStringField(TEXT("progressToken"));
+                }
+                else if (MetaObj->HasField(TEXT("progressToken")))
+                {
+                    // 兼容数字类型的 token
+                    const double NumToken = MetaObj->GetNumberField(TEXT("progressToken"));
+                    ProgressToken = FString::SanitizeFloat(NumToken);
+                }
+            }
+        }
 
-		// 调用绑定的函数
+        // 调用绑定的函数
         if (MCPTools.Contains(ToolName)){
-        	// 计数器
-        	int Num = 0 ;
+            // 计数器
+            int Num = 0 ;
             FMCPToolStorage& Storage = MCPTools[ToolName];
 
             // 参数校验：验证变体中的 Actor 指针参数是否有效
@@ -885,12 +958,34 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
                             {
                                 MCPToolHandle->ToolCallbackRaw(true, Msg, true, -1, -1);
                             }
+
+                            // 记录失败日志，包含工具名与无效参数
+                            {
+                                TMap<FString,FString> LogData;
+                                LogData.Add(TEXT("ToolName"), ToolName);
+                                LogData.Add(TEXT("BadParams"), FString::Join(BadParams, TEXT(",")));
+                                LogData.Add(TEXT("Success"), TEXT("false"));
+                                LogData.Add(TEXT("VariantIndex"), FString::FromInt(BestIdx));
+                                LogData.Add(TEXT("Owner"), GetNameSafe(ProvidedOwner));
+                                MCPLog(this, TEXT("Message"), ECoreLogSeverity::Warn, FString::Printf(TEXT("tools/call validation failed: %s"), *Msg), LogData);
+                            }
+
                             Num = 1; // 已处理（错误回调），不再进入后续委托
                         }
                         else
                         {
                             Delegate.ExecuteIfBound(Request.Json, MCPToolHandle, ToolVariant);
                             Num = 1;
+
+                            // 记录成功触发委托的日志
+                            {
+                                TMap<FString,FString> LogData;
+                                LogData.Add(TEXT("ToolName"), ToolName);
+                                LogData.Add(TEXT("Success"), TEXT("true"));
+                                LogData.Add(TEXT("VariantIndex"), FString::FromInt(BestIdx));
+                                LogData.Add(TEXT("Owner"), GetNameSafe(ProvidedOwner));
+                                MCPLog(this, TEXT("Message"), ECoreLogSeverity::Info, FString::Printf(TEXT("tools/call executed: %s"), *ToolName), LogData);
+                            }
                         }
                     }
                 }
@@ -918,12 +1013,32 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
                             {
                                 MCPToolHandle->ToolCallbackRaw(true, Msg, true, -1, -1);
                             }
+
+                            // 记录失败日志
+                            {
+                                TMap<FString,FString> LogData;
+                                LogData.Add(TEXT("ToolName"), ToolName);
+                                LogData.Add(TEXT("BadParams"), FString::Join(BadParams, TEXT(",")));
+                                LogData.Add(TEXT("Success"), TEXT("false"));
+                                LogData.Add(TEXT("VariantIndex"), FString::FromInt(idx));
+                                MCPLog(this, TEXT("Message"), ECoreLogSeverity::Warn, FString::Printf(TEXT("tools/call validation failed (fallback): %s"), *Msg), LogData);
+                            }
+
                             Num = 1; // 已处理错误
                         }
                         else
                         {
                             Delegate.ExecuteIfBound(Request.Json, MCPToolHandle, ToolVariant);
                             Num = 1;
+
+                            // 记录成功触发委托的日志
+                            {
+                                TMap<FString,FString> LogData;
+                                LogData.Add(TEXT("ToolName"), ToolName);
+                                LogData.Add(TEXT("Success"), TEXT("true"));
+                                LogData.Add(TEXT("VariantIndex"), FString::FromInt(idx));
+                                MCPLog(this, TEXT("Message"), ECoreLogSeverity::Info, FString::Printf(TEXT("tools/call executed (fallback): %s"), *ToolName), LogData);
+                            }
                         }
                     }
                 }
@@ -955,6 +1070,12 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
 			ErrorMessage.ReplaceInline(TEXT("\t"), TEXT(""));
 
 			SendSSE(SessionId, TEXT("message"), ErrorMessage);
+
+            // 记录未知工具的日志
+            TMap<FString,FString> LogData;
+            LogData.Add(TEXT("ToolName"), ToolName);
+            LogData.Add(TEXT("Success"), TEXT("false"));
+            MCPLog(this, TEXT("Message"), ECoreLogSeverity::Warn, TEXT("tools/call: unknown tool"), LogData);
         }
     }
     else if (Method == "ping" || Method == "Ping") {
@@ -964,30 +1085,30 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
                 "id" : "123",
                 "result" : {}
         }*/
-		FString PingMessage;
-		TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
-		// 设置基本字段
-		RootObject->SetStringField("jsonrpc", "2.0");
-		RootObject->SetNumberField("id", id);
-		// 构建 result 对象
-		TSharedPtr<FJsonObject> ResultObject = MakeShareable(new FJsonObject);
-		// 将 result 添加到根对象
-		RootObject->SetObjectField("result", ResultObject);
-		// 序��化为字符串
-		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&PingMessage);
-		FJsonSerializer::Serialize(RootObject.ToSharedRef(), Writer);
-		// 先剔除所有的换行符
-		PingMessage.ReplaceInline(TEXT("\n"), TEXT(""));
-		PingMessage.ReplaceInline(TEXT("\r"), TEXT(""));
-		PingMessage.ReplaceInline(TEXT("\t"), TEXT(""));
+        FString PingMessage;
+        TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
+        // 设置基本字段
+        RootObject->SetStringField("jsonrpc", "2.0");
+        RootObject->SetNumberField("id", id);
+        // 构建 result 对象
+        TSharedPtr<FJsonObject> ResultObject = MakeShareable(new FJsonObject);
+        // 将 result 添加到根对象
+        RootObject->SetObjectField("result", ResultObject);
+        // 序列��化为字符串
+        TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&PingMessage);
+        FJsonSerializer::Serialize(RootObject.ToSharedRef(), Writer);
+        // 先剔除所有的换行符
+        PingMessage.ReplaceInline(TEXT("\n"), TEXT(""));
+        PingMessage.ReplaceInline(TEXT("\r"), TEXT(""));
+        PingMessage.ReplaceInline(TEXT("\t"), TEXT(""));
 
-		SendSSE(SessionId, TEXT("message"), PingMessage);
+        SendSSE(SessionId, TEXT("message"), PingMessage);
     }
     else {
         TMap<FString,FString> LogData;
         LogData.Add(TEXT("Method"), Method);
         LogData.Add(TEXT("SessionId"), SessionId);
-        MCPLog(this, TEXT("Message"), ECoreLogSeverity::Warning, TEXT("Unknown JSON-RPC method"), LogData);
+        MCPLog(this, TEXT("Message"), ECoreLogSeverity::Warn, TEXT("Unknown JSON-RPC method"), LogData);
     }
 }
 
@@ -1019,7 +1140,7 @@ void UMCPTransportSubsystem::StartMCPServer()
     else
     {
         TMap<FString,FString> LogData; LogData.Add(TEXT("Port"), Port);
-        MCPLog(this, TEXT("Server"), ECoreLogSeverity::Normal, TEXT("MCP server started"), LogData);
+        MCPLog(this, TEXT("Server"), ECoreLogSeverity::Info, TEXT("MCP server started"), LogData);
     }
 
     //AI写的 不知道干嘛用的
@@ -1039,7 +1160,7 @@ void UMCPTransportSubsystem::StartMCPServer()
     mg_set_request_handler(ServerContext, "/favicon.ico", OnGetFavicon, this);
 
     // log handlers registered
-    MCPLog(this, TEXT("Server"), ECoreLogSeverity::Normal, TEXT("Handlers registered: /message, /sse, /tools, /tools/version, /ui/tools"));
+    MCPLog(this, TEXT("Server"), ECoreLogSeverity::Info, TEXT("Handlers registered: /message, /sse, /tools, /tools/version, /ui/tools"));
 
 
 
@@ -1088,8 +1209,23 @@ int UMCPTransportSubsystem::OnPostMessage(struct mg_connection* Connection, void
 
     // 获取 body 内容
     char bodyBuf[4096] = {};
-    int bytesRead = mg_read(Connection, bodyBuf, sizeof(bodyBuf) - 1);
-    bodyBuf[bytesRead] = '\0'; // 确保 null 结尾
+    // mg_read 返回读取的字节数（可能为负数表示错误）
+    int bytesRead = mg_read(Connection, bodyBuf, static_cast<int>(sizeof(bodyBuf) - 1));
+    if (bytesRead <= 0)
+    {
+        // 读取失败或为空，确保字符串为空
+        bodyBuf[0] = '\0';
+    }
+    else
+    {
+        // 防止越界（mg_read 在极端情况下可能返回超过请求长度）
+        int len = bytesRead;
+        if (len >= static_cast<int>(sizeof(bodyBuf)))
+        {
+            len = static_cast<int>(sizeof(bodyBuf)) - 1;
+        }
+        bodyBuf[len] = '\0';
+    }
 
     // 正确解码 UTF-8 到 FString
     FString JsonBody = FString(FUTF8ToTCHAR(bodyBuf));
@@ -1542,19 +1678,7 @@ AActor* UMCPToolPropertyActorPtr::GetValue(FString InJson)
 				// 在ActorMap中查找
 				return GetActor(ActorName);
 			}
-			else
-			{
-				UE_LOG(LogTemp, Warning, TEXT("GetValue: No arguments field found in params"));
-			}
 		}
-		else
-		{
-			UE_LOG(LogTemp, Warning, TEXT("GetValue: No params field found in JSON"));
-		}
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("GetValue: Failed to parse JSON: %s"), *InJson);
 	}
 	return nullptr;
 	
@@ -1711,7 +1835,6 @@ UMCPToolHandle* UMCPToolHandle::initToolHandle(int _id, const FString& _SessionI
 // 		JsonMessage.ReplaceInline(TEXT("\n"), TEXT(""));
 // 		JsonMessage.ReplaceInline(TEXT("\r"), TEXT(""));
 // 		JsonMessage.ReplaceInline(TEXT("\t"), TEXT(""));
-// 		//JsonMessage += "\n\n";
 //
 //         // 通��子系统发送消息
 // 		MCPTransportSubsystem->SendSSE(SessionId, TEXT("message"), JsonMessage);
@@ -1803,7 +1926,6 @@ void UMCPToolHandle::ToolCallback(bool isError, TSharedPtr<FJsonObject> json)
 		JsonMessage.ReplaceInline(TEXT("\n"), TEXT(""));
 		JsonMessage.ReplaceInline(TEXT("\r"), TEXT(""));
 		JsonMessage.ReplaceInline(TEXT("\t"), TEXT(""));
-		//JsonMessage += "\n\n";
 
 		// 通过子系统发送消息
 		MCPTransportSubsystem->SendSSE(SessionId, TEXT("message"), JsonMessage);

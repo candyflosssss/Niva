@@ -393,14 +393,14 @@ void UAudioStreamHttpWsSubsystem::InitMediaUdp()
         UE_LOG(LogTemp, Log, TEXT("[AudioStream] UDP listen on %d"), MediaUdpPort);
     }
 
-    // 兼容监听：服务器端额外在18500端口只接收HELLO，避免客户端仍向固定端口发HELLO而丢包
-    if (IsServer() && MediaUdpPort != 18500 && !HelloCompatUdpHandler)
-    {
-        HelloCompatUdpHandler = NewObject<UUDPHandler>(this);
-        HelloCompatUdpHandler->OnBinaryReceived.AddUObject(this, &UAudioStreamHttpWsSubsystem::HandleHelloUdp);
-        HelloCompatUdpHandler->StartUDPReceiver(18500);
-        UE_LOG(LogTemp, Log, TEXT("[AudioStream] HelloCompat listen on 18500 (main=%d)"), MediaUdpPort);
-    }
+    // // 兼容监听：服务器端额外在18500端口只接收HELLO，避免客户端仍向固定端口发HELLO而丢包
+    // if (IsServer() && MediaUdpPort != 18500 && !HelloCompatUdpHandler)
+    // {
+    //     HelloCompatUdpHandler = NewObject<UUDPHandler>(this);
+    //     HelloCompatUdpHandler->OnBinaryReceived.AddUObject(this, &UAudioStreamHttpWsSubsystem::HandleHelloUdp);
+    //     HelloCompatUdpHandler->StartUDPReceiver(18500);
+    //     UE_LOG(LogTemp, Log, TEXT("[AudioStream] HelloCompat listen on 18500 (main=%d)"), MediaUdpPort);
+    // }
 
     // 创建发送socket
     if (!MediaSendSocket)
@@ -484,13 +484,13 @@ void UAudioStreamHttpWsSubsystem::ShutdownMediaUdp()
     }
     MediaClients.Reset();
 
-    if (HelloCompatUdpHandler)
-    {
-        HelloCompatUdpHandler->OnBinaryReceived.Clear();
-        HelloCompatUdpHandler->StopUDPReceiver();
-        HelloCompatUdpHandler = nullptr;
-        UE_LOG(LogTemp, Log, TEXT("[AudioStream] HelloCompat UDP listener shutdown"));
-    }
+    // if (HelloCompatUdpHandler)
+    // {
+    //     HelloCompatUdpHandler->OnBinaryReceived.Clear();
+    //     HelloCompatUdpHandler->StopUDPReceiver();
+    //     HelloCompatUdpHandler = nullptr;
+    //     UE_LOG(LogTemp, Log, TEXT("[AudioStream] HelloCompat UDP listener shutdown"));
+    // }
 }
 
 static void SendPacketToAll(FSocket* Sock, const TSet<FIPv4Endpoint>& Clients, const TArray<uint8>& Packet)
@@ -955,14 +955,14 @@ bool UAudioStreamHttpWsSubsystem::TickSync(float DeltaTime)
 {
     const double NowSec = FPlatformTime::Seconds();
 
-    // 服务器兜底：若初始化时未识别为服务器，确保此时已在 18500 开启兼容 HELLO 监听
-    if (IsServer() && MediaUdpPort != 18500 && HelloCompatUdpHandler == nullptr)
-    {
-        HelloCompatUdpHandler = NewObject<UUDPHandler>(this);
-        HelloCompatUdpHandler->OnBinaryReceived.AddUObject(this, &UAudioStreamHttpWsSubsystem::HandleHelloUdp);
-        HelloCompatUdpHandler->StartUDPReceiver(18500);
-        UE_LOG(LogTemp, Log, TEXT("[AudioStream] HelloCompat listen(on-tick) on 18500 (main=%d)"), MediaUdpPort);
-    }
+    // // 服务器兜底：若初始化时未识别为服务器，确保此时已在 18500 开启兼容 HELLO 监听
+    // if (IsServer() && MediaUdpPort != 18500 && HelloCompatUdpHandler == nullptr)
+    // {
+    //     HelloCompatUdpHandler = NewObject<UUDPHandler>(this);
+    //     HelloCompatUdpHandler->OnBinaryReceived.AddUObject(this, &UAudioStreamHttpWsSubsystem::HandleHelloUdp);
+    //     HelloCompatUdpHandler->StartUDPReceiver(18500);
+    //     UE_LOG(LogTemp, Log, TEXT("[AudioStream] HelloCompat listen(on-tick) on 18500 (main=%d)"), MediaUdpPort);
+    // }
 
     // 新增：成为服务器后自动绑定HTTP端点（初始化过早处于大厅/Standalone会跳过，此处补绑定）
     if (IsServer() && !bHttpStarted)
@@ -1083,13 +1083,13 @@ void UAudioStreamHttpWsSubsystem::ClientRegisterToServer(const FString& ServerIp
         MediaSendSocket->SendTo(P.GetData(), P.Num(), Sent, *A);
     }
 
-    // 兼容：若服务器主端口非18500，再向18500也发送一份HELLO
-    if ((int32)MainPort != 18500)
-    {
-        FIPv4Endpoint Ep18500(Addr, 18500);
-        TSharedRef<FInternetAddr> B = Ep18500.ToInternetAddr();
-        MediaSendSocket->SendTo(P.GetData(), P.Num(), Sent, *B);
-    }
+    // // 兼容：若服务器主端口非18500，再向18500也发送一份HELLO
+    // if ((int32)MainPort != 18500)
+    // {
+    //     FIPv4Endpoint Ep18500(Addr, 18500);
+    //     TSharedRef<FInternetAddr> B = Ep18500.ToInternetAddr();
+    //     MediaSendSocket->SendTo(P.GetData(), P.Num(), Sent, *B);
+    // }
 }
 
 // ======= WebSocket =======
@@ -2083,6 +2083,9 @@ void UAudioStreamHttpWsSubsystem::StartRunAndConnect(const FString& ServerHostWi
 // 第3步：向 /stream/{task_id} 发送文本块
 void UAudioStreamHttpWsSubsystem::PostStreamText(const FString& Text)
 {
+    UE_LOG(LogTemp, Warning, TEXT("[AudioStream][Subsystem] PostStreamText ignored: logic moved to component."));
+    CoreLog(this, ECoreLogSeverity::Warn, TEXT("Subsystem PostStreamText ignored: moved to component"));
+    return;
     FString TaskId = ActiveTaskId;
     if (TaskId.IsEmpty())
     {

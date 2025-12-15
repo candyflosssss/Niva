@@ -154,7 +154,7 @@ private:
     UPROPERTY() UUDPHandler* MediaUdpHandler = nullptr; // 避免GC
     FSocket* MediaSendSocket = nullptr;
     // 兼容接收器：始终监听18500，仅处理hello（用于客户端仍向18500发HELLO的情况）
-    UPROPERTY() UUDPHandler* HelloCompatUdpHandler = nullptr;
+    // UPROPERTY() UUDPHandler* HelloCompatUdpHandler = nullptr;
     uint32 MediaSeq = 0;
 
     // 服务器-客户端映射

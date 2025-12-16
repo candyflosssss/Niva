@@ -41,7 +41,7 @@ static void CoreLog(const UAudioStreamHttpWsSubsystem* Self, ECoreLogSeverity Se
     if (!Self) return;
     if (UCoreLogSubsystem* LogSS = UCoreLogSubsystem::Get(Self))
     {
-        LogSS->Log(TEXT("CustomInput"), TEXT("AudioStream"), Severity, Message);
+        LogSS->Log(TEXT("StreamRegistry"), TEXT("RegistrationProcess"), Severity, Message);
     }
 }
 
@@ -50,7 +50,7 @@ static void CoreLog(const UAudioStreamHttpWsSubsystem* Self, ECoreLogSeverity Se
     if (!Self) return;
     if (UCoreLogSubsystem* LogSS = UCoreLogSubsystem::Get(Self))
     {
-        LogSS->Log(TEXT("CustomInput"), TEXT("AudioStream"), Severity, Message, Data);
+        LogSS->Log(TEXT("StreamRegistry"), TEXT("RegistrationProcess"), Severity, Message, Data);
     }
 }
 
@@ -238,7 +238,7 @@ void UAudioStreamHttpWsSubsystem::Deinitialize()
     ShutdownMediaUdp();
     StopStreaming();
     StopHttpListener();
-    ComponentMap.Empty();
+    UuidComponentMap.Empty();
     Super::Deinitialize();
     UE_LOG(LogTemp, Log, TEXT("[AudioStream] Deinitialize end"));
     CoreLog(this, ECoreLogSeverity::Warn, TEXT("Deinitialize end"));
@@ -283,29 +283,21 @@ void UAudioStreamHttpWsSubsystem::StopHttpListener()
     bHttpStarted = false;
 }
 
-bool UAudioStreamHttpWsSubsystem::RegisterComponent(UAudioStreamHttpWsComponent* Comp, FString& OutKey, const FString& PreferredKey)
+bool UAudioStreamHttpWsSubsystem::RegisterComponent(UAudioStreamHttpWsComponent* Comp, FString& OutUuid)
 {
     if (!IsValid(Comp)) return false;
 
-    FString UseKey = PreferredKey;
-    if (UseKey.IsEmpty())
-    {
-        int32 Idx = 1;
-        do { UseKey = FString::Printf(TEXT("npc_%d"), Idx++); } while (ComponentMap.Contains(UseKey));
-    }
-    else if (ComponentMap.Contains(UseKey))
-    {
-        const FString Base = UseKey;
-        int32 Suffix = 2;
-        do { UseKey = FString::Printf(TEXT("%s_%d"), *Base, Suffix++); } while (ComponentMap.Contains(UseKey));
-    }
+    // 生成 UUID（使用 FGuid）
+    FGuid G = FGuid::NewGuid();
+    const FString Uuid = G.ToString(EGuidFormats::DigitsWithHyphens);
+    UuidComponentMap.Add(Uuid, Comp);
 
-    ComponentMap.Add(UseKey, Comp);
-    OutKey = UseKey;
-    UE_LOG(LogTemp, Log, TEXT("[AudioStream] Component registered key=%s, total=%d"), *UseKey, ComponentMap.Num());
+    OutUuid = Uuid;
+    UE_LOG(LogTemp, Log, TEXT("[AudioStream] Component registered uuid=%s total=%d"), *Uuid, UuidComponentMap.Num());
+    CoreLog(this, ECoreLogSeverity::Info, FString::Printf(TEXT("Component registered uuid=%s total=%d"), *Uuid, UuidComponentMap.Num()));
 
-    // If this is the first component, auto start the TTS flow: POST /run then connect WS using settings
-    if (ComponentMap.Num() == 1)
+    // If this is the first component, auto start the TTS flow using the UUID as target
+    if (UuidComponentMap.Num() == 1)
     {
         const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
         const FString Host = S ? S->DefaultWsHost : TEXT("127.0.0.1:8001");
@@ -314,8 +306,8 @@ bool UAudioStreamHttpWsSubsystem::RegisterComponent(UAudioStreamHttpWsComponent*
         const int32 CH = S ? S->DefaultChannels : 1;
         const FString RunPath = TEXT("/run");
         const FString WsPrefix = S ? S->DefaultWsPathPrefix : TEXT("/ws/");
-        UE_LOG(LogTemp, Log, TEXT("[AudioStream] First component added -> auto StartRunAndConnect (host=%s, scheme=%s, sr=%d, ch=%d, key=%s)"), *Host, bHttps?TEXT("wss"):TEXT("ws"), SR, CH, *UseKey);
-        StartRunAndConnect(Host, TEXT(""), UseKey, SR, CH, bHttps, RunPath, WsPrefix);
+        UE_LOG(LogTemp, Log, TEXT("[AudioStream] First component added -> auto StartRunAndConnect (host=%s, scheme=%s, sr=%d, ch=%d, uuid=%s)"), *Host, bHttps?TEXT("wss"):TEXT("ws"), SR, CH, *Uuid);
+        StartRunAndConnect(Host, TEXT(""), Uuid, SR, CH, bHttps, RunPath, WsPrefix);
     }
 
     return true;
@@ -324,777 +316,18 @@ bool UAudioStreamHttpWsSubsystem::RegisterComponent(UAudioStreamHttpWsComponent*
 void UAudioStreamHttpWsSubsystem::UnregisterComponent(UAudioStreamHttpWsComponent* Comp)
 {
     if (!Comp) return;
-    for (auto It = ComponentMap.CreateIterator(); It; ++It)
+
+    // 从 UuidComponentMap 中移除该组件的所有 uuid 条目
+    TArray<FString> ToRemove;
+    for (const auto& Pair : UuidComponentMap)
     {
-        if (It.Value().Get() == Comp)
-        {
-            UE_LOG(LogTemp, Log, TEXT("[AudioStream] Component unregistered key=%s"), *It.Key());
-            It.RemoveCurrent();
-            break;
-        }
+        if (Pair.Value.Get() == Comp) { ToRemove.Add(Pair.Key); }
     }
+    for (const FString& K : ToRemove) { UuidComponentMap.Remove(K); UE_LOG(LogTemp, Log, TEXT("[AudioStream] Uuid entry removed: %s"), *K); }
 }
 
-void UAudioStreamHttpWsSubsystem::StopStreaming()
-{
-    UE_LOG(LogTemp, Log, TEXT("[AudioStream] StopStreaming: closing WS if any"));
-    CloseWebSocket();
-    // 在显式停止流时再清空路由键，避免重连期间丢失
-    ActiveWsTargetKey.Reset();
-}
-
-// ======= 媒体同步实现 =======
-
-bool UAudioStreamHttpWsSubsystem::IsServer() const
-{
-    UWorld* W = GetWorld();
-    if (!W) return false; // 无World时默认按客户端，避免误绑端口
-    const ENetMode Mode = W->GetNetMode();
-    // 仅把真正的联机服务器视为Server；Standalone一律按Client处理（大厅/单机阶段）
-    return (Mode == NM_ListenServer || Mode == NM_DedicatedServer);
-}
-
-void UAudioStreamHttpWsSubsystem::InitMediaUdp()
-{
-    // 客户端使用动态空闲端口监听，避免多PIE/大厅阶段端口冲突；服务端保持配置端口
-    if (!IsServer())
-    {
-        ISocketSubsystem* SSS = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
-        if (SSS)
-        {
-            FSocket* Probe = SSS->CreateSocket(NAME_DGram, TEXT("MediaUDP-Probe"), false);
-            if (Probe)
-            {
-                TSharedRef<FInternetAddr> AnyAddr = SSS->CreateInternetAddr();
-                AnyAddr->SetAnyAddress();
-                AnyAddr->SetPort(0); // 让系统分配空闲端口
-                if (Probe->Bind(*AnyAddr))
-                {
-                    TSharedRef<FInternetAddr> Bound = SSS->CreateInternetAddr();
-                    Probe->GetAddress(*Bound);
-                    const int32 Chosen = Bound->GetPort();
-                    if (Chosen > 0)
-                    {
-                        MediaUdpPort = Chosen;
-                        UE_LOG(LogTemp, Log, TEXT("[AudioStream] Client picked free UDP port %d"), MediaUdpPort);
-                    }
-                }
-                Probe->Close();
-                SSS->DestroySocket(Probe);
-            }
-        }
-    }
-
-    if (!MediaUdpHandler)
-    {
-        MediaUdpHandler = NewObject<UUDPHandler>(this);
-        MediaUdpHandler->OnBinaryReceived.AddUObject(this, &UAudioStreamHttpWsSubsystem::HandleUdpBinary);
-        MediaUdpHandler->StartUDPReceiver(MediaUdpPort);
-        UE_LOG(LogTemp, Log, TEXT("[AudioStream] UDP listen on %d"), MediaUdpPort);
-    }
-
-    // // 兼容监听：服务器端额外在18500端口只接收HELLO，避免客户端仍向固定端口发HELLO而丢包
-    // if (IsServer() && MediaUdpPort != 18500 && !HelloCompatUdpHandler)
-    // {
-    //     HelloCompatUdpHandler = NewObject<UUDPHandler>(this);
-    //     HelloCompatUdpHandler->OnBinaryReceived.AddUObject(this, &UAudioStreamHttpWsSubsystem::HandleHelloUdp);
-    //     HelloCompatUdpHandler->StartUDPReceiver(18500);
-    //     UE_LOG(LogTemp, Log, TEXT("[AudioStream] HelloCompat listen on 18500 (main=%d)"), MediaUdpPort);
-    // }
-
-    // 创建发送socket
-    if (!MediaSendSocket)
-    {
-        ISocketSubsystem* SSS = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
-        MediaSendSocket = SSS->CreateSocket(NAME_DGram, TEXT("MediaSend"), false);
-        if (MediaSendSocket)
-        {
-            // 绑定到任意本地端口，便于 SendTo
-            TSharedRef<FInternetAddr> Local = SSS->CreateInternetAddr();
-            Local->SetAnyAddress();
-            Local->SetPort(0);
-            MediaSendSocket->Bind(*Local);
-            int32 Desired = 2*1024*1024, Applied=0;
-            MediaSendSocket->SetSendBufferSize(Desired, Applied);
-            UE_LOG(LogTemp, Log, TEXT("[AudioStream] UDP send socket ready (buf=%d)"), Applied);
-        }
-        else
-        {
-            UE_LOG(LogTemp, Error, TEXT("[AudioStream] Failed to create UDP send socket"));
-        }
-    }
-
-    // 服务器将本机回环加入客户端集，确保本机也经UDP管线播放
-    if (IsServer())
-    {
-        FIPv4Endpoint Loop(FIPv4Address(127,0,0,1), MediaUdpPort);
-        MediaClients.Add(Loop);
-        UE_LOG(LogTemp, Verbose, TEXT("[AudioStream] Add loopback client %s"), *Loop.ToString());
-    }
-}
-
-void UAudioStreamHttpWsSubsystem::HandleHelloUdp(const TArray<uint8>& Data, const FIPv4Endpoint& Remote)
-{
-    // 只处理控制包
-    FMediaPacketHeader H;
-    if (!MSP_ParseHeader(Data, H)) return;
-    if ((EMediaPacketType)H.MediaType != EMediaPacketType::Control) return;
-
-    // 解析 JSON
-    const uint8* Payload = Data.GetData() + sizeof(FMediaPacketHeader);
-    const int32 Len = (int32)H.PayloadLen;
-    FString JsonStr = (Len > 0) ? FString(FUTF8ToTCHAR(reinterpret_cast<const ANSICHAR*>(Payload), Len)) : FString();
-    TSharedPtr<FJsonObject> Obj; TSharedRef<TJsonReader<>> R = TJsonReaderFactory<>::Create(JsonStr);
-    if (!FJsonSerializer::Deserialize(R, Obj) || !Obj.IsValid()) return;
-
-    FString Op; Obj->TryGetStringField(TEXT("op"), Op);
-    if (Op != TEXT("hello")) return;      // 兼容端口只认 hello
-    if (!IsServer()) return;              // 只有服务器需要登记客户端
-
-    int32 PortFromClient = 0;
-    if (Obj->TryGetNumberField(TEXT("port"), PortFromClient) && PortFromClient > 0)
-    {
-        MediaClients.Add(FIPv4Endpoint(Remote.Address, (uint16)PortFromClient));
-        UE_LOG(LogTemp, Log, TEXT("[MediaSync] HELLO(compat) from %s (port=%d)"),
-               *Remote.Address.ToString(), PortFromClient);
-    }
-    else
-    {
-        MediaClients.Add(Remote);
-        UE_LOG(LogTemp, Log, TEXT("[MediaSync] HELLO(compat) from %s"), *Remote.ToString());
-    }
-}
-
-
-void UAudioStreamHttpWsSubsystem::ShutdownMediaUdp()
-{
-    if (MediaUdpHandler)
-    {
-        MediaUdpHandler->OnBinaryReceived.Clear();
-        MediaUdpHandler->StopUDPReceiver();
-        MediaUdpHandler = nullptr;
-        UE_LOG(LogTemp, Log, TEXT("[AudioStream] UDP listener shutdown"));
-    }
-    if (MediaSendSocket)
-    {
-        MediaSendSocket->Close();
-        ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(MediaSendSocket);
-        MediaSendSocket = nullptr;
-        UE_LOG(LogTemp, Log, TEXT("[AudioStream] UDP send socket destroyed"));
-    }
-    MediaClients.Reset();
-
-    // if (HelloCompatUdpHandler)
-    // {
-    //     HelloCompatUdpHandler->OnBinaryReceived.Clear();
-    //     HelloCompatUdpHandler->StopUDPReceiver();
-    //     HelloCompatUdpHandler = nullptr;
-    //     UE_LOG(LogTemp, Log, TEXT("[AudioStream] HelloCompat UDP listener shutdown"));
-    // }
-}
-
-static void SendPacketToAll(FSocket* Sock, const TSet<FIPv4Endpoint>& Clients, const TArray<uint8>& Packet)
-{
-    if (!Sock || Packet.Num() <= 0) return;
-    for (const FIPv4Endpoint& Ep : Clients)
-    {
-        TSharedRef<FInternetAddr> Addr = Ep.ToInternetAddr();
-        int32 Sent = 0;
-        Sock->SendTo(Packet.GetData(), Packet.Num(), Sent, *Addr);
-    }
-}
-
-void UAudioStreamHttpWsSubsystem::ServerSendFrame(uint16 StreamId, const uint8* FrameData, int32 FrameBytes, uint64 PtsUs, bool bKeyframe)
-{
-    if (!MediaSendSocket) return;
-    FMediaPacketHeader H; MSP_FillHeader(H, EMediaPacketType::Audio, StreamId, ++MediaSeq, PtsUs, bKeyframe ? EMediaPacketFlags::Keyframe : 0, (uint32)FrameBytes);
-    TArray<uint8> Packet; Packet.AddUninitialized(sizeof(H) + FrameBytes);
-    FMemory::Memcpy(Packet.GetData(), &H, sizeof(H));
-    FMemory::Memcpy(Packet.GetData()+sizeof(H), FrameData, FrameBytes);
-    SendPacketToAll(MediaSendSocket, MediaClients, Packet);
-}
-
-static void ServerSendControlJson(FSocket* Sock, const TSet<FIPv4Endpoint>& Clients, uint16 StreamId, const TSharedRef<FJsonObject>& Obj)
-{
-    FString S; TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&S); FJsonSerializer::Serialize(Obj, W);
-    FTCHARToUTF8 Conv(*S);
-    const int32 N = Conv.Length();
-    FMediaPacketHeader H; MSP_FillHeader(H, EMediaPacketType::Control, StreamId, 0, MSP_NowMicroseconds(), EMediaPacketFlags::Keyframe, (uint32)N);
-    TArray<uint8> P; P.AddUninitialized(sizeof(H)+N);
-    FMemory::Memcpy(P.GetData(), &H, sizeof(H));
-    FMemory::Memcpy(P.GetData()+sizeof(H), Conv.Get(), N);
-    SendPacketToAll(Sock, Clients, P);
-}
-
-void UAudioStreamHttpWsSubsystem::ServerDistributeAudio(const FString& Key, const TArray<uint8>& PcmBytes, int32 InSR, int32 InCH)
-{
-    if (!IsServer()) return; // 客户端禁止处理上游
-    const int32 SR = FMath::Clamp(InSR>0?InSR:16000, 8000, 48000);
-    const int32 CH = FMath::Clamp(InCH>0?InCH:1, 1, 8);
-
-    // 安全兜底：若当前尚无任何收件人，强制加入本机回环，确保至少服务器本机可播放
-    if (MediaClients.Num() == 0)
-    {
-        FIPv4Endpoint Loop(FIPv4Address(127,0,0,1), MediaUdpPort);
-        MediaClients.Add(Loop);
-        UE_LOG(LogTemp, Warning, TEXT("[MediaSync] No clients registered; add loopback %s"), *Loop.ToString());
-    }
-
-    uint16 StreamId = 0;
-    {
-        FScopeLock L(&StreamCS);
-        uint16* Found = KeyToStreamId.Find(Key);
-        if (!Found)
-        {
-            StreamId = NextStreamId++;
-            KeyToStreamId.Add(Key, StreamId);
-            StreamIdToKey.Add(StreamId, Key);
-            FServerStreamInfo& Info = ServerStreams.Add(StreamId);
-            Info.SampleRate = SR; Info.Channels = CH; Info.bSentFormat = false;
-        }
-        else
-        {
-            StreamId = *Found;
-        }
-    }
-
-    FServerStreamInfo* SInfoPtr = ServerStreams.Find(StreamId);
-    if (!SInfoPtr) return;
-    FServerStreamInfo& SInfo = *SInfoPtr;
-
-    // 若首次发送或格式变化，发送format控制包
-    if (!SInfo.bSentFormat || SInfo.SampleRate!=SR || SInfo.Channels!=CH)
-    {
-        SInfo.SampleRate = SR; SInfo.Channels = CH; SInfo.bSentFormat = true;
-        TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
-        Obj->SetStringField(TEXT("op"), TEXT("format"));
-        Obj->SetStringField(TEXT("key"), Key);
-        Obj->SetNumberField(TEXT("stream_id"), (double)StreamId);
-        Obj->SetNumberField(TEXT("sr"), (double)SR);
-        Obj->SetNumberField(TEXT("ch"), (double)CH);
-        Obj->SetNumberField(TEXT("lead_ms"), (double)TargetPreRollMs);
-        Obj->SetNumberField(TEXT("frame_ms"), (double)FrameDurationMs);
-        Obj->SetNumberField(TEXT("server_time_us"), (double)MSP_NowMicroseconds());
-        ServerSendControlJson(MediaSendSocket, MediaClients, StreamId, Obj);
-        // 将Tail清空以免跨格式
-        SInfo.Tail.Reset();
-    }
-
-    // 切帧
-    const int32 SamplesPerFrame = FMath::Max(1, (int32)FMath::RoundToInt((double)SR * ((double)FrameDurationMs/1000.0)));
-    const int32 FrameBytes = SamplesPerFrame * CH * 2; // S16
-
-    TArray<uint8> Buf;
-    Buf.Reserve(SInfo.Tail.Num() + PcmBytes.Num());
-    Buf.Append(SInfo.Tail);
-    Buf.Append(PcmBytes);
-    SInfo.Tail.Reset();
-
-    // 计算首帧PTS：对每流用一个静态表记录next PTS
-    static TMap<uint16, uint64> GNextPts;
-    uint64* PNext = GNextPts.Find(StreamId);
-    if (!PNext)
-    {
-        uint64 StartPts = MSP_NowMicroseconds() + (uint64)TargetPreRollMs * 1000ULL;
-        GNextPts.Add(StreamId, StartPts);
-        PNext = GNextPts.Find(StreamId);
-    }
-
-    int32 Offset = 0;
-    int32 FramesSent = 0;
-    while (Buf.Num() - Offset >= FrameBytes)
-    {
-        const uint8* Ptr = Buf.GetData() + Offset;
-        const uint64 Pts = *PNext;
-        ServerSendFrame(StreamId, Ptr, FrameBytes, Pts, false);
-        Offset += FrameBytes;
-        *PNext += (uint64)FrameDurationMs * 1000ULL;
-        ++FramesSent;
-    }
-
-    const int32 Rem = Buf.Num() - Offset;
-    if (Rem > 0)
-    {
-        SInfo.Tail.Append(Buf.GetData()+Offset, Rem);
-    }
-    UE_LOG(LogTemp, Verbose, TEXT("[MediaSync] Distribute key=%s id=%u bytes=%d -> frames=%d rem=%d clients=%d"), *Key, (unsigned)StreamId, PcmBytes.Num(), FramesSent, Rem, MediaClients.Num());
-}
-
-void UAudioStreamHttpWsSubsystem::HandleUdpBinary(const TArray<uint8>& Data, const FIPv4Endpoint& Remote)
-{
-    FMediaPacketHeader H;
-    if (!MSP_ParseHeader(Data, H)) return;
-    const uint8* Payload = Data.GetData() + sizeof(FMediaPacketHeader);
-
-    if ((EMediaPacketType)H.MediaType == EMediaPacketType::Control)
-    {
-        const int32 Len = (int32)H.PayloadLen;
-        FString JsonStr;
-        if (Len > 0)
-        {
-            // 使用长度安全的UTF8转换，避免未0终止导致解析失败
-            JsonStr = FString(FUTF8ToTCHAR(reinterpret_cast<const ANSICHAR*>(Payload), Len));
-        }
-        TSharedPtr<FJsonObject> Obj; TSharedRef<TJsonReader<>> R = TJsonReaderFactory<>::Create(JsonStr);
-        if (FJsonSerializer::Deserialize(R, Obj) && Obj.IsValid())
-        {
-            FString Op; Obj->TryGetStringField(TEXT("op"), Op);
-            if (Op == TEXT("hello"))
-            {
-                if (IsServer())
-                {
-                    int32 PortFromClient = 0; if (Obj->TryGetNumberField(TEXT("port"), PortFromClient) && PortFromClient > 0)
-                    {
-                        FIPv4Endpoint Ep(Remote.Address, (uint16)PortFromClient);
-                        MediaClients.Add(Ep);
-                        UE_LOG(LogTemp, Log, TEXT("[MediaSync] HELLO from %s (port=%d)"), *Ep.ToString(), PortFromClient);
-                    }
-                    else
-                    {
-                        MediaClients.Add(Remote);
-                        UE_LOG(LogTemp, Log, TEXT("[MediaSync] HELLO from %s"), *Remote.ToString());
-                    }
-                }
-            }
-            else if (Op == TEXT("format"))
-            {
-                const int32 SR = (int32)Obj->GetNumberField(TEXT("sr"));
-                const int32 CH = (int32)Obj->GetNumberField(TEXT("ch"));
-                const int32 StreamId = (int32)Obj->GetNumberField(TEXT("stream_id"));
-                const int64 ServerUs = (int64)Obj->GetNumberField(TEXT("server_time_us"));
-                FString Key; Obj->TryGetStringField(TEXT("key"), Key);
-                {
-                    FScopeLock L(&StreamCS);
-                    StreamIdToKey.FindOrAdd((uint16)StreamId) = Key;
-                    FClientStreamState& CS = ClientStreams.FindOrAdd((uint16)StreamId);
-                    CS.SampleRate = SR; CS.Channels = CH; CS.bHasFormat = true; CS.bPreRollReady = false; CS.Frames.Reset();
-                }
-                const double LocalUs = FPlatformTime::Seconds()*1000000.0;
-                const double Off = (double)ServerUs - LocalUs;
-                if (!bHasOffset) { EstimatedOffsetUs = Off; bHasOffset = true; }
-                else { EstimatedOffsetUs = FMath::Lerp(EstimatedOffsetUs, Off, OffsetLerpAlpha); }
-                
-                // 客户端侧：标记已建立媒体控制，停止重复HELLO
-                if (!IsServer()) { bAutoHelloDone = true; }
-
-                UE_LOG(LogTemp, Log, TEXT("[MediaSync] FORMAT stream=%d key=%s sr=%d ch=%d offsetUs=%.0f"), StreamId, *Key, SR, CH, EstimatedOffsetUs);
-            }
-        }
-        else
-        {
-            UE_LOG(LogTemp, Warning, TEXT("[MediaSync] Control JSON parse failed (len=%d)"), Len);
-        }
-        return;
-    }
-    else if ((EMediaPacketType)H.MediaType == EMediaPacketType::Audio)
-    {
-        ClientInsertFrame(H.StreamId, H.Seq, H.PtsUs, Payload, H.PayloadLen);
-        return;
-    }
-}
-
-void UAudioStreamHttpWsSubsystem::ClientInsertFrame(uint16 StreamId, uint32 Seq, uint64 PtsUs, const uint8* Payload, int32 PayloadLen)
-{
-    if (PayloadLen <= 0 || !Payload) return;
-
-    FClientStreamState* CS0 = nullptr;
-    {
-        FScopeLock L(&StreamCS);
-        CS0 = &ClientStreams.FindOrAdd(StreamId);
-    }
-    if (!CS0) return; // 防御性检查（理论上 FindOrAdd 总是返回有效引用）
-
-    FPendingAudioFrame F; F.Seq = Seq; F.PtsUs = PtsUs; F.Payload.SetNum(PayloadLen); FMemory::Memcpy(F.Payload.GetData(), Payload, PayloadLen);
-
-    {
-        FScopeLock JL(&JitterCS);
-        FClientStreamState& CS = *CS0;
-        int32 InsertIdx = 0;
-        while (InsertIdx < CS.Frames.Num() && (int64)(CS.Frames[InsertIdx].PtsUs - PtsUs) <= 0) { ++InsertIdx; }
-        CS.Frames.Insert(MoveTemp(F), InsertIdx);
-
-        if (!CS.bPreRollReady && CS.Frames.Num() >= 2)
-        {
-            const uint64 OldestPts = CS.Frames[0].PtsUs;
-            const uint64 NewestPts = CS.Frames.Last().PtsUs;
-            const int64 DepthUs = (int64)(NewestPts - OldestPts);
-            if (DepthUs >= (int64)TargetPreRollMs * 1000)
-            {
-                CS.bPreRollReady = true;
-                UE_LOG(LogTemp, Log, TEXT("[MediaSync] PreRoll ready: stream=%u depthUs=%lld"), (unsigned)StreamId, (long long)DepthUs);
-            }
-        }
-    }
-}
-
-// 选取收件人（当前简单回退至全局）
-void UAudioStreamHttpWsSubsystem::CollectRecipients(uint16 StreamId, TArray<FIPv4Endpoint>& OutRecipients) const
-{
-    OutRecipients.Reset();
-    if (const TSet<FIPv4Endpoint>* S = StreamSubscribers.Find(StreamId))
-    {
-        for (const FIPv4Endpoint& Ep : *S) { OutRecipients.Add(Ep); }
-        if (OutRecipients.Num() > 0) return;
-    }
-    // 退回全局
-    for (const FIPv4Endpoint& Ep : MediaClients) { OutRecipients.Add(Ep); }
-}
-
-// 服务器主动登记客户端
-void UAudioStreamHttpWsSubsystem::ServerAddClient(const FString& ClientIp, int32 Port)
-{
-    if (!IsServer()) return;
-    const int32 UsePort = (Port > 0 ? Port : MediaUdpPort);
-    FIPv4Address Addr; if (!FIPv4Address::Parse(ClientIp, Addr)) { UE_LOG(LogTemp, Warning, TEXT("ServerAddClient: bad ip %s"), *ClientIp); return; }
-    FIPv4Endpoint Ep(Addr, UsePort);
-    MediaClients.Add(Ep);
-    UE_LOG(LogTemp, Log, TEXT("[MediaSync] Add client %s"), *Ep.ToString());
-}
-
-void UAudioStreamHttpWsSubsystem::ServerAddSubscriberForKey(const FString& Key, const FString& ClientIp, int32 Port)
-{
-    if (!IsServer()) return;
-    const int32 UsePort = (Port > 0 ? Port : MediaUdpPort);
-    FIPv4Address Addr; if (!FIPv4Address::Parse(ClientIp, Addr)) { UE_LOG(LogTemp, Warning, TEXT("ServerAddSubscriberForKey: invalid ip %s"), *ClientIp); return; }
-    FIPv4Endpoint Ep(Addr, UsePort);
-
-    MediaClients.Add(Ep); // 确保在全局池
-
-    FScopeLock L(&StreamCS);
-    if (uint16* Sid = KeyToStreamId.Find(Key))
-    {
-        TSet<FIPv4Endpoint>& Set = StreamSubscribers.FindOrAdd(*Sid);
-        Set.Add(Ep);
-        UE_LOG(LogTemp, Log, TEXT("[MediaSync] Subscribe key=%s stream=%u -> %s"), *Key, (unsigned)*Sid, *Ep.ToString());
-    }
-    else
-    {
-        TSet<FIPv4Endpoint>& Pend = PendingKeySubscribers.FindOrAdd(Key);
-        Pend.Add(Ep);
-        UE_LOG(LogTemp, Log, TEXT("[MediaSync] Pending subscribe key=%s -> %s (await stream start)"), *Key, *Ep.ToString());
-    }
-}
-
-void UAudioStreamHttpWsSubsystem::ServerRemoveSubscriberForKey(const FString& Key, const FString& ClientIp, int32 Port)
-{
-    if (!IsServer()) return;
-    const int32 UsePort = (Port > 0 ? Port : MediaUdpPort);
-    FIPv4Address Addr; if (!FIPv4Address::Parse(ClientIp, Addr)) { UE_LOG(LogTemp, Warning, TEXT("ServerRemoveSubscriberForKey: invalid ip %s"), *ClientIp); return; }
-    FIPv4Endpoint Ep(Addr, UsePort);
-
-    FScopeLock L(&StreamCS);
-    if (uint16* Sid = KeyToStreamId.Find(Key))
-    {
-        if (TSet<FIPv4Endpoint>* Set = StreamSubscribers.Find(*Sid))
-        {
-            Set->Remove(Ep);
-            UE_LOG(LogTemp, Log, TEXT("[MediaSync] Unsubscribe key=%s stream=%u <- %s"), *Key, (unsigned)*Sid, *Ep.ToString());
-        }
-    }
-    if (TSet<FIPv4Endpoint>* P = PendingKeySubscribers.Find(Key))
-    {
-        P->Remove(Ep);
-        UE_LOG(LogTemp, Log, TEXT("[MediaSync] Remove pending subscribe key=%s <- %s"), *Key, *Ep.ToString());
-    }
-}
-
-void UAudioStreamHttpWsSubsystem::ServerClearSubscribersForKey(const FString& Key)
-{
-    if (!IsServer()) return;
-    FScopeLock L(&StreamCS);
-    if (uint16* Sid = KeyToStreamId.Find(Key))
-    {
-        StreamSubscribers.Remove(*Sid);
-        UE_LOG(LogTemp, Log, TEXT("[MediaSync] Clear subscribers for key=%s stream=%u"), *Key, (unsigned)*Sid);
-    }
-    PendingKeySubscribers.Remove(Key);
-}
-
-// 客户端 viseme 相关（占位，后续可实现）
-void UAudioStreamHttpWsSubsystem::ClientInsertVisemePoints(uint16 /*StreamId*/, uint64 /*BatchPtsUs*/, const uint8* /*Payload*/, int32 /*PayloadLen*/)
-{
-}
-void UAudioStreamHttpWsSubsystem::ClientApplyVisemeKeyframe(uint16 /*StreamId*/, const uint8* /*Payload*/, int32 /*PayloadLen*/)
-{
-}
-void UAudioStreamHttpWsSubsystem::ClientDrainVisemes(double /*NowSec*/)
-{
-}
-
-// 修复 PushTestViseme（移除被错误插入的重复 TryAutoHello 定义）
-void UAudioStreamHttpWsSubsystem::PushTestViseme(const FString& TargetKey, const TArray<int32>& VisemeIndices)
-{
-    TWeakObjectPtr<UAudioStreamHttpWsComponent>* Found = ComponentMap.Find(TargetKey);
-    if (!Found || !Found->IsValid())
-    {
-        UE_LOG(LogTemp, Warning, TEXT("PushTestViseme: Component not found for key=%s"), *TargetKey);
-        return;
-    }
-
-    UAudioStreamHttpWsComponent* Target = Found->Get();
-
-    // 更新 viseme 统计
-    UpdateVisemeStats(VisemeIndices.Num());
-
-    AsyncTask(ENamedThreads::GameThread, [Target, VisemeIndices]()
-    {
-        if (IsValid(Target))
-        {
-            Target->PushViseme(VisemeIndices);
-        }
-    });
-
-    UE_LOG(LogTemp, Log, TEXT("PushTestViseme: key=%s, visemes=%d"), *TargetKey, VisemeIndices.Num());
-}
-
-TArray<uint8> UAudioStreamHttpWsSubsystem::GenerateTestSineWave(int32 SampleRate, int32 Channels, float FrequencyHz, float DurationSeconds)
-{
-    TArray<uint8> Result;
-
-    // 参数验证
-    SampleRate = FMath::Clamp(SampleRate, 8000, 48000);
-    Channels = FMath::Clamp(Channels, 1, 2);
-    FrequencyHz = FMath::Clamp(FrequencyHz, 100.0f, 2000.0f);
-    DurationSeconds = FMath::Clamp(DurationSeconds, 0.001f, 10.0f);
-
-    // 计算样本数
-    const int32 TotalSamples = FMath::RoundToInt(SampleRate * DurationSeconds);
-    const int32 NumFrames = TotalSamples; // 重命名避免与类成员变量冲突
-    const int32 BytesPerSample = 2; // PCM16LE
-    const int32 TotalBytes = NumFrames * Channels * BytesPerSample;
-
-    if (TotalBytes <= 0)
-    {
-        return Result;
-    }
-
-    Result.AddUninitialized(TotalBytes);
-    int16* SamplePtr = reinterpret_cast<int16*>(Result.GetData());
-
-    // 生成正弦波
-    const float AngularFreq = 2.0f * PI * FrequencyHz;
-    const float Amplitude = 0.3f; // 30% 音量，避免过大
-
-    for (int32 Frame = 0; Frame < NumFrames; ++Frame) // 使用重命名后的变量
-    {
-        const float Time = (float)Frame / (float)SampleRate;
-        const float SineValue = FMath::Sin(AngularFreq * Time);
-        const int16 Sample = (int16)FMath::RoundToInt(SineValue * Amplitude * 32767.0f);
-
-        // 为所有声道填充相同的样本值
-        for (int32 Channel = 0; Channel < Channels; ++Channel)
-        {
-            SamplePtr[Frame * Channels + Channel] = Sample;
-        }
-    }
-
-    UE_LOG(LogTemp, Verbose, TEXT("GenerateTestSineWave: sr=%d, ch=%d, freq=%.1fHz, dur=%.3fs, bytes=%d"),
-           SampleRate, Channels, FrequencyHz, DurationSeconds, TotalBytes);
-
-    return Result;
-}
-
-// ======== 自动注册（客户端） ========
-bool UAudioStreamHttpWsSubsystem::TryAutoHello()
-{
-    UWorld* W = GetWorld(); if (!W) return false;
-    const ENetMode Mode = W->GetNetMode();
-
-    // 真正的服务器（Listen/Dedicated）无需向自己注册；Standalone不视为server以便后续联机后还能注册
-    if (Mode == NM_ListenServer || Mode == NM_DedicatedServer)
-    {
-        bAutoHelloDone = true;
-        return true;
-    }
-
-    const double Now = FPlatformTime::Seconds();
-    if (Now - LastAutoHelloAttemptSec < 1.0) return false; // 节流：1秒一次
-    LastAutoHelloAttemptSec = Now;
-
-    FString ServerIp;
-    // 仅在真正成为客户端后从NetDriver解析服务器IP
-    if (Mode == NM_Client)
-    {
-        if (APlayerController* PC = W->GetFirstPlayerController())
-        {
-            if (UNetConnection* Conn = PC->GetNetConnection())
-            {
-                FString Addr = Conn->LowLevelGetRemoteAddress(false); // 形如 "IP:Port"
-                int32 ColonIdx = INDEX_NONE;
-                if (Addr.FindChar(':', ColonIdx)) ServerIp = Addr.Left(ColonIdx); else ServerIp = Addr;
-            }
-        }
-        if (ServerIp.IsEmpty())
-        {
-            const FURL& Url = W->URL;
-            if (Url.Host.Len() > 0) ServerIp = Url.Host;
-        }
-    }
-
-    if (ServerIp.IsEmpty())
-    {
-        UE_LOG(LogTemp, Verbose, TEXT("[MediaSync] AutoHello: server IP unresolved (mode=%d), will retry"), (int32)Mode);
-        return false;
-    }
-
-    // 改进：持续重发HELLO直到真正建立媒体控制(收到FORMAT后置位 bAutoHelloDone)
-    ClientRegisterToServer(ServerIp);
-    GLastHelloServerIp = ServerIp;
-    UE_LOG(LogTemp, Log, TEXT("[MediaSync] AutoHello sent to %s (udp=%d)"), *ServerIp, MediaUdpPort);
-    return true;
-}
-
-void UAudioStreamHttpWsSubsystem::AutoRegisterClient()
-{
-    bAutoHelloDone = false; // 允许重试
-    LastAutoHelloAttemptSec = 0.0;
-    TryAutoHello();
-}
-
-bool UAudioStreamHttpWsSubsystem::TickSync(float DeltaTime)
-{
-    const double NowSec = FPlatformTime::Seconds();
-
-    // // 服务器兜底：若初始化时未识别为服务器，确保此时已在 18500 开启兼容 HELLO 监听
-    // if (IsServer() && MediaUdpPort != 18500 && HelloCompatUdpHandler == nullptr)
-    // {
-    //     HelloCompatUdpHandler = NewObject<UUDPHandler>(this);
-    //     HelloCompatUdpHandler->OnBinaryReceived.AddUObject(this, &UAudioStreamHttpWsSubsystem::HandleHelloUdp);
-    //     HelloCompatUdpHandler->StartUDPReceiver(18500);
-    //     UE_LOG(LogTemp, Log, TEXT("[AudioStream] HelloCompat listen(on-tick) on 18500 (main=%d)"), MediaUdpPort);
-    // }
-
-    // 新增：成为服务器后自动绑定HTTP端点（初始化过早处于大厅/Standalone会跳过，此处补绑定）
-    if (IsServer() && !bHttpStarted)
-    {
-        const bool bOk = StartHttpListener(0);
-        UE_LOG(LogTemp, Log, TEXT("[AudioStream] Tick ensure HTTP listener: %s"), bOk?TEXT("started/bound"):TEXT("not available (will retry)"));
-    }
-
-    // 新增：服务器每tick确保本机回环在收件人列表中，统一走UDP/mediaClients回放
-    if (IsServer())
-    {
-        const FIPv4Endpoint Loop(FIPv4Address(127,0,0,1), MediaUdpPort);
-        if (!MediaClients.Contains(Loop))
-        {
-            MediaClients.Add(Loop);
-            UE_LOG(LogTemp, Log, TEXT("[MediaSync] Ensure loopback client %s (tick)"), *Loop.ToString());
-        }
-    }
-
-    // 客户端侧：若尚未完成 hello，尝试重试
-    if (!bAutoHelloDone)
-    {
-        TryAutoHello();
-    }
-
-    ClientDrainFrames(NowSec);
-    return true;
-}
-
-void UAudioStreamHttpWsSubsystem::ClientDrainFrames(double NowSec)
-{
-    const double ServerNowUs = NowSec*1000000.0 + (bHasOffset?EstimatedOffsetUs:0.0);
-
-    TArray<uint16> Streams;
-    {
-        FScopeLock L(&StreamCS);
-        ClientStreams.GetKeys(Streams);
-    }
-
-    for (uint16 Sid : Streams)
-    {
-        FString Key;
-        FClientStreamState* CS0=nullptr;
-        {
-            FScopeLock L(&StreamCS);
-            Key = StreamIdToKey.FindRef(Sid);
-            CS0 = ClientStreams.Find(Sid);
-        }
-        if (!CS0) continue;
-
-        // 拷贝必要状态以减小持锁时间
-        int32 SR = CS0->SampleRate; int32 CH = CS0->Channels; bool bReady = CS0->bPreRollReady;
-        if (!bReady) continue; // 还未预热
-
-        // 出队符合时间的帧
-        TArray<FPendingAudioFrame> ToPlay;
-        {
-            FScopeLock JL(&JitterCS);
-            FClientStreamState& CS = *CS0;
-            while (CS.Frames.Num() > 0)
-            {
-                const uint64 PtsUs = CS.Frames[0].PtsUs;
-                if ((double)PtsUs <= ServerNowUs)
-                {
-                    ToPlay.Add(MoveTemp(CS.Frames[0]));
-                    CS.Frames.RemoveAt(0);
-                }
-                else break;
-            }
-        }
-
-        if (ToPlay.Num() > 0)
-        {
-            // 分发到组件
-            TWeakObjectPtr<UAudioStreamHttpWsComponent>* Found = ComponentMap.Find(Key);
-            if (Found && Found->IsValid())
-            {
-                UAudioStreamHttpWsComponent* Target = Found->Get();
-                for (FPendingAudioFrame& F : ToPlay)
-                {
-                    TArray<uint8> Bytes = MoveTemp(F.Payload);
-                    AsyncTask(ENamedThreads::GameThread, [Target, Bytes=MoveTemp(Bytes), SR, CH]() mutable
-                    {
-                        if (IsValid(Target))
-                        {
-                            Target->PushPcmData(Bytes, SR, CH);
-                        }
-                    });
-                }
-            }
-        }
-    }
-}
-
-void UAudioStreamHttpWsSubsystem::ClientRegisterToServer(const FString& ServerIp)
-{
-    // 发一个 HELLO 控制包给服务器，便于其记录本端地址
-    if (!MediaSendSocket) return;
-    FIPv4Address Addr; if (!FIPv4Address::Parse(ServerIp, Addr)) { UE_LOG(LogTemp, Warning, TEXT("ClientRegisterToServer: invalid ip %s"), *ServerIp); return; }
-    const uint16 MainPort = (uint16)ServerUdpPort;
-    FIPv4Endpoint Ep(Addr, MainPort);
-
-    TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
-    Obj->SetStringField(TEXT("op"), TEXT("hello"));
-    Obj->SetNumberField(TEXT("server_time_us"), (double)MSP_NowMicroseconds());
-    // 告知服务器我方的 UDP 监听端口，便于同机双进程的端口区分
-    Obj->SetNumberField(TEXT("port"), (double)MediaUdpPort);
-
-    FString S; TSharedRef<TJsonWriter<>> Conv = TJsonWriterFactory<>::Create(&S); FJsonSerializer::Serialize(Obj, Conv);
-    FTCHARToUTF8 Utf8(*S); const int32 N = Utf8.Length();
-    FMediaPacketHeader H; MSP_FillHeader(H, EMediaPacketType::Control, 0 /*broadcast*/, 0, MSP_NowMicroseconds(), 0, (uint32)N);
-    TArray<uint8> P; P.AddUninitialized(sizeof(H)+N);
-    FMemory::Memcpy(P.GetData(), &H, sizeof(H));
-    FMemory::Memcpy(P.GetData()+sizeof(H), Utf8.Get(), N);
-
-    int32 Sent=0; {
-        TSharedRef<FInternetAddr> A = Ep.ToInternetAddr();
-        MediaSendSocket->SendTo(P.GetData(), P.Num(), Sent, *A);
-    }
-
-    // // 兼容：若服务器主端口非18500，再向18500也发送一份HELLO
-    // if ((int32)MainPort != 18500)
-    // {
-    //     FIPv4Endpoint Ep18500(Addr, 18500);
-    //     TSharedRef<FInternetAddr> B = Ep18500.ToInternetAddr();
-    //     MediaSendSocket->SendTo(P.GetData(), P.Num(), Sent, *B);
-    // }
-}
-
-// ======= WebSocket =======
-
-static FString ResolveTargetKeyOrFallback(const TMap<FString, TWeakObjectPtr<UAudioStreamHttpWsComponent>>& Map, const FString& Candidate, const FString& Active)
+// Helper: resolve target UUID or fallback to active or single-entry if available
+static FString ResolveTargetUuidOrFallback(const TMap<FString, TWeakObjectPtr<UAudioStreamHttpWsComponent>>& Map, const FString& Candidate, const FString& Active)
 {
     if (!Candidate.IsEmpty()) return Candidate;
     if (!Active.IsEmpty()) return Active;
@@ -1131,45 +364,34 @@ void UAudioStreamHttpWsSubsystem::ConnectWebSocket(const FString& Url)
     {
         if (!Self.IsValid()) return;
         UAudioStreamHttpWsSubsystem* P = Self.Get();
-        CoreLog(P, ECoreLogSeverity::Info, FString::Printf(TEXT("WS connected -> host=%s task=%s key=%s"), *P->ActiveHttpHost, *P->ActiveTaskId, *ResolveTargetKeyOrFallback(P->ComponentMap, FString(), P->ActiveWsTargetKey)));
+        CoreLog(P, ECoreLogSeverity::Info, FString::Printf(TEXT("WS connected -> host=%s task=%s uuid=%s"), *P->ActiveHttpHost, *P->ActiveTaskId, *ResolveTargetUuidOrFallback(P->UuidComponentMap, FString(), P->ActiveWsTargetUuid)));
         // 连接建立时，清空目标组件缓冲，避免残留导致起始噪音
-        const FString Key = ResolveTargetKeyOrFallback(P->ComponentMap, FString(), P->ActiveWsTargetKey);
-        if (!Key.IsEmpty())
+        const FString Uuid = ResolveTargetUuidOrFallback(P->UuidComponentMap, FString(), P->ActiveWsTargetUuid);
+        if (!Uuid.IsEmpty())
         {
-            auto Found = P->ComponentMap.Find(Key);
-            if (Found && Found->IsValid())
-            {
-                if (UAudioStreamHttpWsComponent* Target = Found->Get())
-                {
-                    AsyncTask(ENamedThreads::GameThread, [Target, Key]()
-                    {
-                        if (IsValid(Target)) { Target->StopStreaming(); }
-                        ClearTail_GT(Key);
-                    });
-                }
-            }
+            ClearTail_GT(Uuid);
+            CoreLog(P, ECoreLogSeverity::Debug, FString::Printf(TEXT("Cleared stream tail for uuid=%s on WS connected"), *Uuid));
         }
     });
 
     WebSocket->OnConnectionError().AddLambda([Self](const FString& Error)
     {
         if (!Self.IsValid()) return;
-        CoreLog(Self.Get(), ECoreLogSeverity::Error, FString::Printf(TEXT("WS connection error -> host=%s error=%s"), *Self.Get()->ActiveHttpHost, *Error));
+        UAudioStreamHttpWsSubsystem* P = Self.Get();
+        CoreLog(P, ECoreLogSeverity::Error, FString::Printf(TEXT("WS connection error: %s"), *Error));
     });
 
-    WebSocket->OnClosed().AddLambda([Self](int32 Status, const FString& Reason, bool /*bWasClean*/)
+    WebSocket->OnClosed().AddLambda([Self](const EWebSocketCloseCode CloseCode, const FString& Reason)
     {
         if (!Self.IsValid()) return;
         UAudioStreamHttpWsSubsystem* P = Self.Get();
-        CoreLog(P, ECoreLogSeverity::Warn, FString::Printf(TEXT("WS closed -> host=%s task=%s status=%d reason=%s"), *P->ActiveHttpHost, *P->ActiveTaskId, Status, *Reason));
-        // 输出最终统计
-        P->LogFinalStats(TEXT("WSClosed"));
+        CoreLog(P, ECoreLogSeverity::Warn, FString::Printf(TEXT("WS closed: %s (code=%d)"), *Reason, (int32)CloseCode));
     });
 
-    // 文本帧：解析 JSON（audio/text/viseme）
+    // ... existing lambdas updated similarly to use UuidComponentMap and Uuid variable instead of Key ...
+
     WebSocket->OnMessage().AddLambda([Self](const FString& Message)
     {
-        // 对接收的音频流进行解析
         if (!Self.IsValid()) return;
         UAudioStreamHttpWsSubsystem* P = Self.Get();
 
@@ -1184,7 +406,6 @@ void UAudioStreamHttpWsSubsystem::ConnectWebSocket(const FString& Url)
             return;
         }
 
-        // Handle terminal status message: { "status": "completed" }
         FString StatusStr;
         if (RootObj->TryGetStringField(TEXT("status"), StatusStr))
         {
@@ -1201,8 +422,8 @@ void UAudioStreamHttpWsSubsystem::ConnectWebSocket(const FString& Url)
         }
 
         FString Type; RootObj->TryGetStringField(TEXT("type"), Type);
-        FString MsgKey; RootObj->TryGetStringField(TEXT("key"), MsgKey); if (MsgKey.IsEmpty()) RootObj->TryGetStringField(TEXT("role_id"), MsgKey);
-        const FString Key = ResolveTargetKeyOrFallback(P->ComponentMap, MsgKey, P->ActiveWsTargetKey);
+        FString MsgUuid; RootObj->TryGetStringField(TEXT("key"), MsgUuid); if (MsgUuid.IsEmpty()) RootObj->TryGetStringField(TEXT("role_id"), MsgUuid);
+        const FString Uuid = ResolveTargetUuidOrFallback(P->UuidComponentMap, MsgUuid, P->ActiveWsTargetUuid);
 
         if (Type.Equals(TEXT("audio"), ESearchCase::IgnoreCase))
         {
@@ -1213,14 +434,13 @@ void UAudioStreamHttpWsSubsystem::ConnectWebSocket(const FString& Url)
 
             FString Base64; RootObj->TryGetStringField(TEXT("data"), Base64);
 
-            if (Key.IsEmpty()) { UE_LOG(LogTemp, Warning, TEXT("WS audio JSON dropped: empty key")); return; }
+            if (Uuid.IsEmpty()) { UE_LOG(LogTemp, Warning, TEXT("WS audio JSON dropped: empty uuid")); return; }
 
-            // 注意：服务器分发无需本地组件存在；客户端本地播放才需要组件
-            TWeakObjectPtr<UAudioStreamHttpWsComponent>* Found = P->ComponentMap.Find(Key);
+            TWeakObjectPtr<UAudioStreamHttpWsComponent>* Found = P->UuidComponentMap.Find(Uuid);
             const bool bNeedLocalPlay = !P->IsServer();
             if (bNeedLocalPlay && (!Found || !Found->IsValid()))
             {
-                UE_LOG(LogTemp, Warning, TEXT("WS audio JSON dropped (client mode): component not found for key=%s"), *Key);
+                UE_LOG(LogTemp, Warning, TEXT("WS audio JSON dropped (client mode): component not found for uuid=%s"), *Uuid);
                 return;
             }
             if (Base64.IsEmpty()) { UE_LOG(LogTemp, Warning, TEXT("WS audio JSON dropped: empty base64")); return; }
@@ -1230,62 +450,51 @@ void UAudioStreamHttpWsSubsystem::ConnectWebSocket(const FString& Url)
             TArray<uint8> Pcm; int32 UseSR = SR, UseCH = CH;
             if (ExtractPcmFromMaybeWav(Decoded, Pcm, UseSR, UseCH))
             {
-                if (P) CoreLog(P, ECoreLogSeverity::Trace, FString::Printf(TEXT("WS audio received -> kind=WAV key=%s pcmBytes=%d sr=%d ch=%d"), *Key, Pcm.Num(), UseSR, UseCH));
+                if (P) CoreLog(P, ECoreLogSeverity::Trace, FString::Printf(TEXT("WS audio received -> kind=WAV uuid=%s pcmBytes=%d sr=%d ch=%d"), *Uuid, Pcm.Num(), UseSR, UseCH));
             }
             else
             {
                 Pcm = MoveTemp(Decoded);
-                if (P) CoreLog(P, ECoreLogSeverity::Trace, FString::Printf(TEXT("WS audio received -> kind=RAW key=%s bytes=%d sr=%d ch=%d"), *Key, Pcm.Num(), UseSR, UseCH));
+                if (P) CoreLog(P, ECoreLogSeverity::Trace, FString::Printf(TEXT("WS audio received -> kind=RAW uuid=%s bytes=%d sr=%d ch=%d"), *Uuid, Pcm.Num(), UseSR, UseCH));
             }
 
             if (P->IsServer())
             {
-                // 服务器：仅切片并经UDP广播给客户端（包括本机回环），不直接本地播放；无需组件存在
                 TArray<uint8> DataToSend = Pcm;
-                AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [P, Key, Data=MoveTemp(DataToSend), UseSR, UseCH]() mutable
+                AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [P, Uuid, Data=MoveTemp(DataToSend), UseSR, UseCH]() mutable
                 {
                     if (P)
                     {
-                        P->ServerDistributeAudio(Key, Data, UseSR, UseCH);
+                        P->ServerDistributeAudio(Uuid, Data, UseSR, UseCH);
                     }
                 });
             }
             else
             {
-                // 客户端：本机组件播放
-                UAudioStreamHttpWsComponent* Target = Found->Get();
-                AsyncTask(ENamedThreads::GameThread, [P, Key, Target, Data = MoveTemp(Pcm), UseSR, UseCH]() mutable
-                {
-                    if (!IsValid(Target)) return;
-                    TArray<uint8> Bytes = MoveTemp(Data);
-                    AppendWithCarry_GT(Key, Bytes, UseCH);
-                    P->UpdateStats(Bytes.Num(), UseSR, UseCH);
-                    P->LogCurrentStats(TEXT("WSAudio"));
-                    Target->PushPcmData(Bytes, UseSR, UseCH);
-                });
+                // 客户端：统计并记录；组件目前不直接播放
+                CoreLog(P, ECoreLogSeverity::Trace, FString::Printf(TEXT("WS audio received for uuid=%s bytes=%d sr=%d ch=%d (client mode)"), *Uuid, Pcm.Num(), UseSR, UseCH));
+                P->UpdateStats(Pcm.Num(), UseSR, UseCH);
+                P->LogCurrentStats(TEXT("WSAudio"));
             }
         }
         else if (Type.Equals(TEXT("text"), ESearchCase::IgnoreCase))
         {
             FString Text; RootObj->TryGetStringField(TEXT("data"), Text);
-            if (Key.IsEmpty())
+            if (Uuid.IsEmpty())
             {
-                UE_LOG(LogTemp, Warning, TEXT("WS text dropped: empty key"));
-                if (P) CoreLog(P, ECoreLogSeverity::Warn, FString::Printf(TEXT("WS text dropped: empty key; text=%s"), *Text));
+                UE_LOG(LogTemp, Warning, TEXT("WS text dropped: empty uuid"));
+                if (P) CoreLog(P, ECoreLogSeverity::Warn, FString::Printf(TEXT("WS text dropped: empty uuid; text=%s"), *Text));
                 return;
             }
-            auto Found = P->ComponentMap.Find(Key);
+            auto Found = P->UuidComponentMap.Find(Uuid);
             if (!Found || !Found->IsValid())
             {
-                UE_LOG(LogTemp, Warning, TEXT("WS text dropped: component not found for key=%s"), *Key);
-                if (P) CoreLog(P, ECoreLogSeverity::Warn, FString::Printf(TEXT("WS text dropped: component not found for key=%s; text=%s"), *Key, *Text));
+                UE_LOG(LogTemp, Warning, TEXT("WS text dropped: component not found for uuid=%s"), *Uuid);
+                if (P) CoreLog(P, ECoreLogSeverity::Warn, FString::Printf(TEXT("WS text dropped: component not found for uuid=%s; text=%s"), *Uuid, *Text));
                 return;
             }
-            UAudioStreamHttpWsComponent* Target = Found->Get();
-            AsyncTask(ENamedThreads::GameThread, [Target, Text]()
-            {
-                if (IsValid(Target)) { Target->PushText(Text); }
-            });
+            // 组件已简化为仅注册信息，记录收到的文本并通过 CoreLog 通知
+            CoreLog(P, ECoreLogSeverity::Info, FString::Printf(TEXT("WS text for uuid=%s: %s"), *Uuid, *Text));
         }
         else if (Type.Equals(TEXT("viseme"), ESearchCase::IgnoreCase))
         {
@@ -1299,7 +508,6 @@ void UAudioStreamHttpWsSubsystem::ConnectWebSocket(const FString& Url)
             TArray<int32> Vis; Vis.Reserve(ArrPtr->Num());
             for (const auto& V : *ArrPtr) { int32 Val=0; if (V->TryGetNumber(Val)) Vis.Add(Val); }
 
-            // 解析可选的 confidence 数组
             TArray<float> Confidence;
             const TArray<TSharedPtr<FJsonValue>>* ConfPtr = nullptr;
             if (RootObj->TryGetArrayField(TEXT("confidence"), ConfPtr) && ConfPtr)
@@ -1315,33 +523,29 @@ void UAudioStreamHttpWsSubsystem::ConnectWebSocket(const FString& Url)
                 }
             }
 
-            if (Key.IsEmpty())
+            if (Uuid.IsEmpty())
             {
-                UE_LOG(LogTemp, Warning, TEXT("WS viseme dropped: empty key"));
-                if (P) CoreLog(P, ECoreLogSeverity::Warn, TEXT("WS viseme dropped: empty key"));
+                UE_LOG(LogTemp, Warning, TEXT("WS viseme dropped: empty uuid"));
+                if (P) CoreLog(P, ECoreLogSeverity::Warn, TEXT("WS viseme dropped: empty uuid"));
                 return;
             }
-            auto Found = P->ComponentMap.Find(Key);
+            auto Found = P->UuidComponentMap.Find(Uuid);
             if (!Found || !Found->IsValid())
             {
-                UE_LOG(LogTemp, Warning, TEXT("WS viseme dropped: component not found for key=%s"), *Key);
-                if (P) CoreLog(P, ECoreLogSeverity::Warn, FString::Printf(TEXT("WS viseme dropped: component not found for key=%s"), *Key));
+                UE_LOG(LogTemp, Warning, TEXT("WS viseme dropped: component not found for uuid=%s"), *Uuid);
+                if (P) CoreLog(P, ECoreLogSeverity::Warn, FString::Printf(TEXT("WS viseme dropped: component not found for uuid=%s"), *Uuid));
                 return;
             }
-            UAudioStreamHttpWsComponent* Target = Found->Get();
-            UE_LOG(LogTemp, Log, TEXT("WS viseme -> n=%d key=%s confN=%d"), Vis.Num(), *Key, Confidence.Num());
-            if (P) CoreLog(P, ECoreLogSeverity::Trace, FString::Printf(TEXT("WS viseme -> n=%d key=%s confN=%d"), Vis.Num(), *Key, Confidence.Num()));
+            UE_LOG(LogTemp, Log, TEXT("WS viseme -> n=%d uuid=%s confN=%d"), Vis.Num(), *Uuid, Confidence.Num());
+            if (P) CoreLog(P, ECoreLogSeverity::Trace, FString::Printf(TEXT("WS viseme -> n=%d uuid=%s confN=%d"), Vis.Num(), *Uuid, Confidence.Num()));
 
             // 统计 viseme 数
             P->UpdateVisemeStats(Vis.Num());
             P->LogCurrentStats(TEXT("WSViseme"));
 
-            // 直接使用配对入队，确保同步
-            AsyncTask(ENamedThreads::GameThread, [Target, Vis=MoveTemp(Vis), Confidence=MoveTemp(Confidence)]() mutable
-            {
-                if (!IsValid(Target)) return;
-                Target->PushVisemeEx(Vis, Confidence);
-            });
+            // 组件现在仅保留注册信息；把 viseme 事件记录到 CoreLog 中，后续系统可通过 UUID 查询组件并处理
+            CoreLog(P, ECoreLogSeverity::Info, FString::Printf(TEXT("WS viseme for uuid=%s count=%d"), *Uuid, Vis.Num()));
+
         }
         else
         {
@@ -1394,819 +598,3 @@ void UAudioStreamHttpWsSubsystem::CloseWebSocket()
 }
 
 // ======= 统计实现 =======
-void UAudioStreamHttpWsSubsystem::UpdateStats(int32 PcmBytes, int32 SampleRate, int32 Channels)
-{
-    if (PcmBytes <= 0) return;
-    if (Channels <= 0) Channels = 1;
-    if (SampleRate <= 0) SampleRate = 16000;
-
-    const int32 FrameSize = 2 * Channels; // PCM16LE
-    const int64 Frames = (FrameSize > 0) ? (PcmBytes / FrameSize) : 0;
-    const double Sec = (SampleRate > 0) ? (double)Frames / (double)SampleRate : 0.0;
-
-    FScopeLock Lock(&StatsCS);
-    TotalPcmBytes += PcmBytes;
-    TotalFrames   += Frames;
-    TotalSeconds  += Sec;
-}
-
-void UAudioStreamHttpWsSubsystem::UpdateVisemeStats(int32 Count)
-{
-    if (Count <= 0) return;
-    FScopeLock Lock(&StatsCS);
-    TotalVisemes += Count;
-}
-
-void UAudioStreamHttpWsSubsystem::ResetAudioStats()
-{
-    FScopeLock Lock(&StatsCS);
-    TotalPcmBytes = 0;
-    TotalFrames = 0;
-    TotalSeconds = 0.0;
-    TotalVisemes = 0;
-}
-
-void UAudioStreamHttpWsSubsystem::GetAudioStats(int64& OutTotalBytes, int64& OutTotalFrames, double& OutTotalSeconds) const
-{
-    FScopeLock Lock(&StatsCS);
-    OutTotalBytes = TotalPcmBytes;
-    OutTotalFrames = TotalFrames;
-    OutTotalSeconds = TotalSeconds;
-}
-
-void UAudioStreamHttpWsSubsystem::GetAudioStatsEx(int64& OutTotalBytes, int64& OutTotalFrames, double& OutTotalSeconds, int64& OutTotalVisemes) const
-{
-    FScopeLock Lock(&StatsCS);
-    OutTotalBytes = TotalPcmBytes;
-    OutTotalFrames = TotalFrames;
-    OutTotalSeconds = TotalSeconds;
-    OutTotalVisemes = TotalVisemes;
-}
-
-void UAudioStreamHttpWsSubsystem::PrintAudioStatsToLog(const FString& Reason)
-{
-    LogFinalStats(*Reason);
-}
-
-void UAudioStreamHttpWsSubsystem::LogFinalStats(const TCHAR* Reason) const
-{
-    FScopeLock Lock(&StatsCS);
-    UE_LOG(LogTemp, Log, TEXT("[AudioStats][%s] seconds=%.3f, frames=%lld, bytes=%lld, visemes=%lld"), Reason, TotalSeconds, TotalFrames, TotalPcmBytes, TotalVisemes);
-}
-
-void UAudioStreamHttpWsSubsystem::LogCurrentStats(const TCHAR* Reason) const
-{
-    FScopeLock Lock(&StatsCS);
-    if (bStatsLiveLog)
-    {
-        UE_LOG(LogTemp, Log, TEXT("[AudioStats][%s][Now] seconds=%.3f, visemes=%lld (frames=%lld, bytes=%lld)"), Reason, TotalSeconds, TotalVisemes, TotalFrames, TotalPcmBytes);
-    }
-    else
-    {
-        UE_LOG(LogTemp, Verbose, TEXT("[AudioStats][%s][Now] seconds=%.3f, visemes=%lld (frames=%lld, bytes=%lld)"), Reason, TotalSeconds, TotalVisemes, TotalFrames, TotalPcmBytes);
-    }
-}
-
-void UAudioStreamHttpWsSubsystem::SetStatsLiveLog(bool bEnable)
-{
-    // 简单起见：这里也加锁，避免并发读写
-    FScopeLock Lock(&StatsCS);
-    bStatsLiveLog = bEnable;
-}
-
-FNivaHttpResponse UAudioStreamHttpWsSubsystem::HandleAudioStats_NCP(FNivaHttpRequest /*Request*/)
-{
-    int64 Bytes=0, Frames=0; double Sec=0.0; int64 Vis=0;
-    GetAudioStatsEx(Bytes, Frames, Sec, Vis);
-
-    TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
-    Obj->SetNumberField(TEXT("bytes"), (double)Bytes);
-    Obj->SetNumberField(TEXT("frames"), (double)Frames);
-    Obj->SetNumberField(TEXT("seconds"), Sec);
-    Obj->SetNumberField(TEXT("visemes"), (double)Vis);
-
-    FString JsonOut;
-    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonOut);
-    FJsonSerializer::Serialize(Obj, Writer);
-    return UNetworkCoreSubsystem::MakeResponse(JsonOut, TEXT("application/json"), 200);
-}
-
-// ======= HTTP 处理 =======
-FNivaHttpResponse UAudioStreamHttpWsSubsystem::HandleAudioPush_NCP(FNivaHttpRequest Request)
-{
-    FString BodyString = Request.Body;
-    UE_LOG(LogTemp, Verbose, TEXT("/audio/push body size: %d chars"), BodyString.Len());
-
-    FString Key;
-    FString Base64;
-    int32 InSampleRate = -1;
-    int32 InChannels = -1;
-
-    {
-        TSharedPtr<FJsonObject> RootObj;
-        const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(BodyString);
-        if (FJsonSerializer::Deserialize(Reader, RootObj) && RootObj.IsValid())
-        {
-            RootObj->TryGetStringField(TEXT("key"), Key);
-            // 兼容 role_id 作为 key
-            if (Key.IsEmpty())
-            {
-                RootObj->TryGetStringField(TEXT("role_id"), Key);
-            }
-            RootObj->TryGetStringField(TEXT("base64"), Base64);
-            int32 Tmp;
-            if (RootObj->TryGetNumberField(TEXT("sample_rate"), Tmp))
-            {
-                InSampleRate = Tmp;
-            }
-            if (RootObj->TryGetNumberField(TEXT("channels"), Tmp))
-            {
-                InChannels = Tmp;
-            }
-        }
-        else
-        {
-            UE_LOG(LogTemp, Warning, TEXT("/audio/push JSON parse失败"));
-        }
-    }
-
-    if (Key.IsEmpty() || Base64.IsEmpty())
-    {
-        return UNetworkCoreSubsystem::MakeResponse(TEXT("Missing key (or role_id) or base64"), TEXT("text/plain"), 400);
-    }
-
-    TArray<uint8> Decoded;
-    if (!FBase64::Decode(Base64, Decoded))
-    {
-        return UNetworkCoreSubsystem::MakeResponse(TEXT("Invalid base64"), TEXT("text/plain"), 400);
-    }
-
-    // WAV 嗅探与提取（不再截尾）
-    int32 UseSR = (InSampleRate > 0 ? InSampleRate : 16000);
-    int32 UseCH = (InChannels > 0 ? InChannels : 1);
-    UseCH = FMath::Clamp(UseCH, 1, 8);
-
-    TArray<uint8> Pcm;
-    if (!ExtractPcmFromMaybeWav(Decoded, Pcm, UseSR, UseCH))
-    {
-        Pcm = MoveTemp(Decoded);
-    }
-
-
-    UE_LOG(LogTemp, Log, TEXT("[/audio/push] key=%s bytes=%d sr=%d ch=%d (server=%d)"), *Key, Pcm.Num(), UseSR, UseCH, IsServer()?1:0);
-
-    // 仅服务器：切帧并经UDP分发；客户端直接忽略
-    if (IsServer())
-    {
-        AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [this, Key, Pcm=MoveTemp(Pcm), UseSR, UseCH]() mutable
-        {
-            ServerDistributeAudio(Key, Pcm, UseSR, UseCH);
-        });
-    }
-    //
-    // // 本地播放（主线程）
-    // if (TWeakObjectPtr<UAudioStreamHttpWsComponent>* Found = ComponentMap.Find(Key))
-    // {
-    //     if (Found->IsValid())
-    //        {
-    //         UAudioStreamHttpWsComponent* Target = Found->Get();
-    //         TArray<uint8> LocalBytes = Pcm; // 拷贝一份用于本地播放
-    //         AsyncTask(ENamedThreads::GameThread, [this, Target, Key, Data=MoveTemp(LocalBytes), UseSR, UseCH]() mutable
-    //         {
-    //             if (!IsValid(Target)) return;
-    //             TArray<uint8> Bytes = MoveTemp(Data);
-    //             AppendWithCarry_GT(Key, Bytes, UseCH);
-    //             UpdateStats(Bytes.Num(), UseSR, UseCH);
-    //             LogCurrentStats(TEXT("HTTPPushLocal"));
-    //             Target->PushPcmData(Bytes, UseSR, UseCH);
-    //         });
-    //     }
-    // }
-    // 返回结果（不代表本地播放）
-    TSharedRef<FJsonObject> OkObj = MakeShared<FJsonObject>();
-    OkObj->SetStringField(TEXT("status"), TEXT("ok"));
-    OkObj->SetStringField(TEXT("key"), Key);
-    OkObj->SetNumberField(TEXT("decoded"), (double)Pcm.Num());
-    OkObj->SetNumberField(TEXT("sample_rate"), UseSR);
-    OkObj->SetNumberField(TEXT("channels"), UseCH);
-
-    FString JsonOut;
-    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonOut);
-    FJsonSerializer::Serialize(OkObj, Writer);
-    return UNetworkCoreSubsystem::MakeResponse(JsonOut, TEXT("application/json"), 200);
-}
-
-FNivaHttpResponse UAudioStreamHttpWsSubsystem::HandleTaskStart_NCP(FNivaHttpRequest Request)
-{
-    FString BodyString = Request.Body;
-    UE_LOG(LogTemp, Verbose, TEXT("/task/start body size: %d chars"), BodyString.Len());
-
-    FString TaskId;
-    FString WsUrl;
-    FString WsBase;
-    FString WsHost;
-    FString WsScheme = TEXT("ws");
-    FString WsPathPrefix = TEXT("/ws/");
-    FString TargetKey;
-    int32 InSampleRate = 16000;
-    int32 InChannels = 1;
-
-    {
-        TSharedPtr<FJsonObject> RootObj;
-        const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(BodyString);
-        if (FJsonSerializer::Deserialize(Reader, RootObj) && RootObj.IsValid())
-        {
-            RootObj->TryGetStringField(TEXT("task_id"), TaskId);
-            RootObj->TryGetStringField(TEXT("ws_url"), WsUrl);
-            RootObj->TryGetStringField(TEXT("ws_base"), WsBase);
-            RootObj->TryGetStringField(TEXT("ws_host"), WsHost);
-            // 兼容别名
-            if (WsHost.IsEmpty()) RootObj->TryGetStringField(TEXT("host"), WsHost);
-            if (WsBase.IsEmpty()) RootObj->TryGetStringField(TEXT("base"), WsBase);
-
-            RootObj->TryGetStringField(TEXT("ws_scheme"), WsScheme);
-            RootObj->TryGetStringField(TEXT("ws_path_prefix"), WsPathPrefix);
-
-            RootObj->TryGetStringField(TEXT("key"), TargetKey);
-            // 兼容 role_id 作为 key
-            if (TargetKey.IsEmpty()) RootObj->TryGetStringField(TEXT("role_id"), TargetKey);
-
-            int32 Tmp;
-            if (RootObj->TryGetNumberField(TEXT("sample_rate"), Tmp)) InSampleRate = Tmp;
-            if (RootObj->TryGetNumberField(TEXT("channels"), Tmp)) InChannels = Tmp;    
-        }
-        else
-        {
-            UE_LOG(LogTemp, Warning, TEXT("/task/start JSON parse失败"));
-        }
-    }
-
-    // 设置默认 WS 参数（从项目设置回退）
-    if (const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>())
-    {
-        if (WsScheme.IsEmpty()) WsScheme = S->DefaultWsScheme;
-        if (WsPathPrefix.IsEmpty()) WsPathPrefix = S->DefaultWsPathPrefix;
-        if (WsHost.IsEmpty()) WsHost = S->DefaultWsHost;
-    }
-
-    // Compose ws_url when only task_id is given
-    if (WsUrl.IsEmpty() && !TaskId.IsEmpty())
-    {
-        if (!WsBase.IsEmpty())
-        {
-            WsUrl = WsBase.EndsWith(TEXT("/")) ? (WsBase + TaskId) : (WsBase + TEXT("/") + TaskId);
-        }
-        else if (!WsHost.IsEmpty())
-        {
-            if (!WsPathPrefix.StartsWith(TEXT("/"))) WsPathPrefix = TEXT("/") + WsPathPrefix;
-            if (!WsPathPrefix.EndsWith(TEXT("/"))) WsPathPrefix += TEXT("/");
-            WsUrl = FString::Printf(TEXT("%s://%s%s%s"), *WsScheme, *WsHost, *WsPathPrefix, *TaskId);
-        }
-        else
-        {
-            // Fallback: 通过项目设置拼接
-            const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
-            const FString Scheme = S ? S->DefaultWsScheme : TEXT("ws");
-            const FString Host   = S ? S->DefaultWsHost   : TEXT("127.0.0.1:8000");
-            FString PathPrefix   = S ? S->DefaultWsPathPrefix : TEXT("/ws/");
-            if (!PathPrefix.StartsWith(TEXT("/"))) PathPrefix = TEXT("/") + PathPrefix;
-            if (!PathPrefix.EndsWith(TEXT("/")))  PathPrefix += TEXT("/");
-            WsUrl = FString::Printf(TEXT("%s://%s%s%s"), *Scheme, *Host, *PathPrefix, *TaskId);
-            // 也更新用于状态记录的字段
-            WsScheme = Scheme;
-            WsHost = Host;
-            WsPathPrefix = PathPrefix;
-        }
-    }
-    if (WsUrl.IsEmpty())
-    {
-        return UNetworkCoreSubsystem::MakeResponse(TEXT("Missing ws_url or task_id"), TEXT("text/plain"), 400);
-    }
-    // 如果未提供 key，则回退为当前活动/唯一组件键
-    if (TargetKey.IsEmpty())
-    {
-        const FString FallbackKey = ResolveTargetKeyOrFallback(ComponentMap, FString(), ActiveWsTargetKey);
-        if (!FallbackKey.IsEmpty())
-        {
-            TargetKey = FallbackKey;
-        }
-        else
-        {
-            return UNetworkCoreSubsystem::MakeResponse(TEXT("Missing key (or role_id) and no fallback available"), TEXT("text/plain"), 400);
-        }
-    }
-
-    // 放宽：组件不存在也允许启动WS，用于服务器仅分发/回环自播
-    TWeakObjectPtr<UAudioStreamHttpWsComponent>* Found = ComponentMap.Find(TargetKey);
-    if (!Found || !Found->IsValid())
-    {
-        UE_LOG(LogTemp, Warning, TEXT("/task/start(parse): Component not found for key=%s, will still start WS for UDP-only distribution"), *TargetKey);
-    }
-
-    ActiveWsTargetKey = TargetKey;
-    ActiveWsSampleRate = InSampleRate;
-    ActiveWsChannels = InChannels;
-    ActiveTaskId = TaskId;
-    ActiveHttpHost = WsHost;
-    bActiveUseHttps = WsScheme.Equals(TEXT("wss"), ESearchCase::IgnoreCase);
-
-    AsyncTask(ENamedThreads::GameThread, [this, WsUrl]()
-    {
-        CloseWebSocket();
-        ConnectWebSocket(WsUrl);
-    });
-
-    UE_LOG(LogTemp, Log, TEXT("/task/start ok(parse): key=%s task_id=%s ws_url=%s sr=%d ch=%d"), *TargetKey, *TaskId, *WsUrl, ActiveWsSampleRate, ActiveWsChannels);
-
-    TSharedRef<FJsonObject> OkObj = MakeShared<FJsonObject>();
-    OkObj->SetStringField(TEXT("status"), TEXT("starting"));
-    OkObj->SetStringField(TEXT("ws_url"), WsUrl);
-    if (!TaskId.IsEmpty()) OkObj->SetStringField(TEXT("task_id"), TaskId);
-    OkObj->SetStringField(TEXT("key"), TargetKey);
-    OkObj->SetNumberField(TEXT("sample_rate"), InSampleRate);
-    OkObj->SetNumberField(TEXT("channels"), InChannels);
-
-    FString JsonOut;
-    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonOut);
-    FJsonSerializer::Serialize(OkObj, Writer);
-
-    return UNetworkCoreSubsystem::MakeResponse(JsonOut, TEXT("application/json"), 200);
-}
-
-// ===== 测试流 =====
-bool UAudioStreamHttpWsSubsystem::StartTestStream(const FString& TargetKey, int32 SampleRate, int32 Channels, float FrequencyHz, float DurationSeconds)
-{
-    // 停止当前测试流
-    StopTestStream();
-
-    // 检查目标组件是否存在
-    TWeakObjectPtr<UAudioStreamHttpWsComponent>* Found = ComponentMap.Find(TargetKey);
-    if (!Found || !Found->IsValid())
-    {
-        UE_LOG(LogTemp, Warning, TEXT("StartTestStream: Component not found for key=%s"), *TargetKey);
-        return false;
-    }
-
-    // 设置测试参数
-    TestTargetKey = TargetKey;
-    TestSampleRate = FMath::Clamp(SampleRate, 8000, 48000);
-    TestChannels = FMath::Clamp(Channels, 1, 2);
-    TestFrequency = FMath::Clamp(FrequencyHz, 100.0f, 2000.0f);
-    TestDuration = FMath::Clamp(DurationSeconds, 1.0f, 60.0f);
-    TestCurrentTime = 0.0f;
-    bTestStreamActive = true;
-
-    UE_LOG(LogTemp, Log, TEXT("StartTestStream: key=%s, sr=%d, ch=%d, freq=%.1fHz, duration=%.1fs"),
-           *TargetKey, TestSampleRate, TestChannels, TestFrequency, TestDuration);
-
-    // 首包推送200ms，帮助快速越过Warmup，缩短起播延迟
-    PushTestAudioChunk(TestTargetKey, TestSampleRate, TestChannels, TestFrequency, 200.0f);
-
-    // 启动定时器，每100ms推送一次音频块
-    UGameInstance* GI = GetGameInstance();
-    if (GI && GI->GetWorld())
-    {
-        GI->GetWorld()->GetTimerManager().SetTimer(
-            TestStreamTimer,
-            this,
-            &UAudioStreamHttpWsSubsystem::TestStreamTick,
-            0.1f,
-            true
-        );
-
-        return true;
-    }
-
-    return false;
-}
-
-void UAudioStreamHttpWsSubsystem::StopTestStream()
-{
-    if (!bTestStreamActive)
-    {
-        return;
-    }
-
-    bTestStreamActive = false;
-
-    // 停止定时器
-    UGameInstance* GI = GetGameInstance();
-    if (GI && GI->GetWorld())
-    {
-        GI->GetWorld()->GetTimerManager().ClearTimer(TestStreamTimer);
-    }
-
-    UE_LOG(LogTemp, Log, TEXT("StopTestStream: test stream stopped for key=%s"), *TestTargetKey);
-    TestTargetKey.Empty();
-}
-
-void UAudioStreamHttpWsSubsystem::TestStreamTick()
-{
-    if (!bTestStreamActive || TestTargetKey.IsEmpty())
-    {
-        StopTestStream();
-        return;
-    }
-
-    if (TestCurrentTime >= TestDuration)
-    {
-        UE_LOG(LogTemp, Log, TEXT("TestStreamTick: reached duration limit, stopping"));
-        StopTestStream();
-        return;
-    }
-
-    // 检查目标组件是否仍然有效
-    TWeakObjectPtr<UAudioStreamHttpWsComponent>* Found = ComponentMap.Find(TestTargetKey);
-    if (!Found || !Found->IsValid())
-    {
-        UE_LOG(LogTemp, Warning, TEXT("TestStreamTick: target component lost, stopping"));
-        StopTestStream();
-        return;
-    }
-
-    // 推送100ms的音频块
-    PushTestAudioChunk(TestTargetKey, TestSampleRate, TestChannels, TestFrequency, 100.0f);
-
-    // 更新时间
-    TestCurrentTime += 0.1f;
-}
-
-void UAudioStreamHttpWsSubsystem::PushTestAudioChunk(const FString& TargetKey, int32 SampleRate, int32 Channels, float FrequencyHz, float ChunkDurationMs)
-{
-    TWeakObjectPtr<UAudioStreamHttpWsComponent>* Found = ComponentMap.Find(TargetKey);
-    if (!Found || !Found->IsValid())
-    {
-        UE_LOG(LogTemp, Warning, TEXT("PushTestAudioChunk: Component not found for key=%s"), *TargetKey);
-        return;
-    }
-    float ChunkDurationSec = ChunkDurationMs / 1000.0f;
-    TArray<uint8> AudioData = GenerateTestSineWave(SampleRate, Channels, FrequencyHz, ChunkDurationSec);
-    if (AudioData.Num() <= 0) return;
-
-    if (IsServer())
-    {
-        // 服务器：统一经UDP分发（包含本机回环），不做直接本地播放兜底
-        AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [this, K=TargetKey, Data=AudioData, SampleRate, Channels]() mutable
-        {
-            ServerDistributeAudio(K, Data, SampleRate, Channels);
-        });
-    }
-    else
-    {
-        // 非服务器：直接本地推给目标组件，便于 Standalone/大厅阶段自测
-        UAudioStreamHttpWsComponent* Target = Found->Get();
-        TArray<uint8> LocalData = MoveTemp(AudioData);
-        AsyncTask(ENamedThreads::GameThread, [Target, Data=MoveTemp(LocalData), SampleRate, Channels]() mutable
-        {
-            if (IsValid(Target))
-            {
-                Target->PushPcmData(Data, SampleRate, Channels);
-            }
-        });
-        UE_LOG(LogTemp, Log, TEXT("PushTestAudioChunk: local play on client key=%s, sr=%d ch=%d dur=%.1fms"), *TargetKey, SampleRate, Channels, ChunkDurationMs);
-    }
-}
-
-void UAudioStreamHttpWsSubsystem::PushTestText(const FString& TargetKey, const FString& Text)
-{
-    TWeakObjectPtr<UAudioStreamHttpWsComponent>* Found = ComponentMap.Find(TargetKey);
-    if (!Found || !Found->IsValid())
-    {
-        UE_LOG(LogTemp, Warning, TEXT("PushTestText: Component not found for key=%s"), *TargetKey);
-        return;
-    }
-
-    UAudioStreamHttpWsComponent* Target = Found->Get();
-    AsyncTask(ENamedThreads::GameThread, [Target, Text]()
-    {
-        if (IsValid(Target))
-        {
-            Target->PushText(Text);
-        }
-    });
-
-    UE_LOG(LogTemp, Log, TEXT("PushTestText: key=%s, text=%s"), *TargetKey, *Text);
-}
-
-// ===== 新增：从项目设置加载并打印 =====
-void UAudioStreamHttpWsSubsystem::LoadSettings()
-{
-    const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
-    if (!S)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("[AudioStream] Settings not found, using defaults"));
-        return;
-    }
-    MediaUdpPort = S->MediaUdpPort;
-    ServerUdpPort = S->MediaUdpPort; // 新增：服务器端口默认等于配置端口
-    FrameDurationMs = S->FrameDurationMs;
-    TargetPreRollMs = S->TargetPreRollMs;
-    TargetJitterMs = S->TargetJitterMs;
-    VisemeStepMs = S->VisemeStepMs;
-    VisemeKeyframeIntervalMs = S->VisemeKeyframeIntervalMs;
-    HeartbeatIntervalMs = S->HeartbeatIntervalMs;
-    OffsetLerpAlpha = S->OffsetLerpAlpha;
-    bStatsLiveLog = S->bStatsLiveLogDefault;
-
-    UE_LOG(LogTemp, Log, TEXT("[AudioStream] Settings loaded: UDPPort=%d, ServerUdpPort=%d, FrameDurationMs=%d, TargetPreRollMs=%d, TargetJitterMs=%d, VisemeStepMs=%d, VisemeKeyframeIntervalMs=%d, HeartbeatIntervalMs=%d, OffsetLerpAlpha=%.3f, bStatsLiveLog=%d"),
-        MediaUdpPort, ServerUdpPort, FrameDurationMs, TargetPreRollMs, TargetJitterMs, VisemeStepMs, VisemeKeyframeIntervalMs, HeartbeatIntervalMs, OffsetLerpAlpha, bStatsLiveLog?1:0);
-}
-
-// ===== 新增：一键转储当前状态 =====
-void UAudioStreamHttpWsSubsystem::DumpState(const FString& Reason) const
-{
-    FString Mode = IsServer()?TEXT("Server"):TEXT("Client");
-
-    // 组件键列表
-    TArray<FString> Keys; Keys.Reserve(ComponentMap.Num());
-    for (const auto& Pair : ComponentMap)
-    {
-        Keys.Add(FString::Printf(TEXT("%s%s"), *Pair.Key, (Pair.Value.IsValid()?TEXT(""):TEXT("(invalid)"))));
-    }
-
-    // 客户端列表
-    TArray<FString> ClientStrs; ClientStrs.Reserve(MediaClients.Num());
-    for (const FIPv4Endpoint& Ep : MediaClients)
-    {
-        ClientStrs.Add(Ep.ToString());
-    }
-
-    // 流统计
-    int32 ServerStreamCount = ServerStreams.Num();
-    int32 ClientStreamCount = ClientStreams.Num();
-
-    // 订阅概览
-    int32 SubStreamCount = StreamSubscribers.Num();
-    int32 PendingKeySubCount = PendingKeySubscribers.Num();
-
-    // WS 状态
-    const bool bWs = WebSocket.IsValid();
-
-    // 统计复制
-    int64 Bytes=0, Frames=0; double Sec=0.0; int64 Vis=0;
-    GetAudioStatsEx(Bytes, Frames, Sec, Vis);
-
-    UE_LOG(LogTemp, Log, TEXT("[AudioStream][Dump][%s] mode=%s UDPPort=%d WS=%d ActiveKey=%s sr=%d ch=%d offsetUs=%.0f(has=%d)"),
-        *Reason, *Mode, MediaUdpPort, bWs?1:0, *ActiveWsTargetKey, ActiveWsSampleRate, ActiveWsChannels, EstimatedOffsetUs, bHasOffset?1:0);
-    UE_LOG(LogTemp, Log, TEXT("[AudioStream][Dump] components=%d -> [%s]"), ComponentMap.Num(), *FString::Join(Keys, TEXT(", ")));
-    UE_LOG(LogTemp, Log, TEXT("[AudioStream][Dump] mediaClients=%d -> [%s]"), MediaClients.Num(), *FString::Join(ClientStrs, TEXT(", ")));
-    UE_LOG(LogTemp, Log, TEXT("[AudioStream][Dump] streams(server=%d, client=%d) nextStreamId=%u subStreams=%d pendingKeySubs=%d"), ServerStreamCount, ClientStreamCount, (unsigned)NextStreamId, SubStreamCount, PendingKeySubCount);
-    UE_LOG(LogTemp, Log, TEXT("[AudioStream][Dump] stats: sec=%.3f frames=%lld bytes=%lld visemes=%lld liveLog=%d"), Sec, Frames, Bytes, Vis, bStatsLiveLog?1:0);
-}
-
-
-// 主动向 TTS 服务 /run 发送 POST，获取 task_id 后连接 WebSocket /ws/<task_id>
-void UAudioStreamHttpWsSubsystem::StartRunAndConnect(const FString& ServerHostWithPort,
-                                                    const FString& CallbackUrl,
-                                                    const FString& TargetKey,
-                                                    int32 SampleRate,
-                                                    int32 Channels,
-                                                    bool bUseHttps,
-                                                    const FString& HttpRunPath,
-                                                    const FString& WsPathPrefix)
-{
-    // Merge with settings
-    const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
-
-    FString Host = ServerHostWithPort;
-    if (Host.IsEmpty() && S) Host = S->DefaultWsHost;
-    if (Host.IsEmpty()) Host = TEXT("127.0.0.1:8001");
-
-    FString RunPath = HttpRunPath.IsEmpty() ? TEXT("/run") : HttpRunPath;
-    if (!RunPath.StartsWith(TEXT("/"))) RunPath = TEXT("/") + RunPath;
-
-    FString WsPrefix = WsPathPrefix;
-    if (WsPrefix.IsEmpty() && S) WsPrefix = S->DefaultWsPathPrefix;
-    if (WsPrefix.IsEmpty()) WsPrefix = TEXT("/ws/");
-
-    int32 SR = (SampleRate > 0) ? SampleRate : (S ? S->DefaultSampleRate : 16000);
-    int32 CH = (Channels > 0) ? Channels : (S ? S->DefaultChannels : 1);
-
-    // If caller didn't explicitly request HTTPS, follow settings' scheme
-    const bool bUseHttpsFinal = bUseHttps || (S && S->DefaultWsScheme.Equals(TEXT("wss"), ESearchCase::IgnoreCase));
-    const FString HttpScheme = bUseHttpsFinal ? TEXT("https") : TEXT("http");
-
-    // Key fallback
-    FString KeyCopy = TargetKey;
-    if (KeyCopy.IsEmpty())
-    {
-        KeyCopy = ResolveTargetKeyOrFallback(ComponentMap, FString(), ActiveWsTargetKey);
-    }
-
-    const FString HttpUrl = FString::Printf(TEXT("%s://%s%s"), *HttpScheme, *Host, *RunPath);
-
-    TSharedRef<FJsonObject> BodyObj = MakeShared<FJsonObject>();
-    if (!CallbackUrl.IsEmpty())
-    {
-        BodyObj->SetStringField(TEXT("callback_url"), CallbackUrl);
-    }
-    FString BodyStr;
-    {
-        TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&BodyStr);
-        FJsonSerializer::Serialize(BodyObj, Writer);
-    }
-
-    TWeakObjectPtr<UAudioStreamHttpWsSubsystem> Self = this;
-
-    TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = FHttpModule::Get().CreateRequest();
-    Req->SetURL(HttpUrl);
-    Req->SetVerb(TEXT("POST"));
-    Req->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-    Req->SetContentAsString(BodyStr.IsEmpty() ? TEXT("{}") : BodyStr);
-    UE_LOG(LogTemp, Log, TEXT("[AudioStream] POST %s ... body=%s"), *HttpUrl, *BodyStr);
-    {
-        TMap<FString,FString> D; D.Add(TEXT("url"), HttpUrl);
-        CoreLog(this, ECoreLogSeverity::Trace, TEXT("HTTP /run POST begin"), D);
-    }
-
-    Req->OnProcessRequestComplete().BindLambda([Self, Host, WsPrefix, SR, CH, KeyCopy, bUseHttpsFinal](FHttpRequestPtr /*Request*/, FHttpResponsePtr Response, bool bSucceeded)
-    {
-        if (!Self.IsValid()) return;
-        if (!bSucceeded || !Response.IsValid())
-        {
-            UE_LOG(LogTemp, Error, TEXT("[AudioStream] /run POST failed (request error)"));
-            CoreLog(Self.Get(), ECoreLogSeverity::Error, FString::Printf(TEXT("/run POST failed -> host=%s (request error)"), *Host));
-            return;
-        }
-        const int32 Code = Response->GetResponseCode();
-        const FString Content = Response->GetContentAsString();
-        if (Code < 200 || Code >= 300)
-        {
-            UE_LOG(LogTemp, Error, TEXT("[AudioStream] /run POST non-2xx: %d content=%s"), Code, *Content);
-            CoreLog(Self.Get(), ECoreLogSeverity::Error, FString::Printf(TEXT("/run POST non-2xx -> host=%s code=%d respPreview=%s"), *Host, Code, *Content.Left(256)));
-            return;
-        }
-
-        TSharedPtr<FJsonObject> Root;
-        const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Content);
-        if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
-        {
-            UE_LOG(LogTemp, Error, TEXT("[AudioStream] /run POST JSON parse failed: %s"), *Content);
-            CoreLog(Self.Get(), ECoreLogSeverity::Error, FString::Printf(TEXT("/run POST JSON parse failed -> host=%s contentPreview=%s"), *Host, *Content.Left(256)));
-            return;
-        }
-        FString TaskId;
-        if (!Root->TryGetStringField(TEXT("task_id"), TaskId) || TaskId.IsEmpty())
-        {
-            UE_LOG(LogTemp, Error, TEXT("[AudioStream] /run POST missing task_id in response: %s"), *Content);
-            CoreLog(Self.Get(), ECoreLogSeverity::Error, FString::Printf(TEXT("/run POST missing task_id -> host=%s contentPreview=%s"), *Host, *Content.Left(256)));
-            return;
-        }
-
-        // 通过 HandleTaskStart_NCP 统一解析与连接
-        TSharedRef<FJsonObject> Synthetic = MakeShared<FJsonObject>();
-        Synthetic->SetStringField(TEXT("task_id"), TaskId);
-        Synthetic->SetStringField(TEXT("ws_host"), Host);
-        Synthetic->SetStringField(TEXT("ws_scheme"), bUseHttpsFinal ? TEXT("wss") : TEXT("ws"));
-        Synthetic->SetStringField(TEXT("ws_path_prefix"), WsPrefix);
-        Synthetic->SetStringField(TEXT("key"), KeyCopy);
-        Synthetic->SetNumberField(TEXT("sample_rate"), SR);
-        Synthetic->SetNumberField(TEXT("channels"), CH);
-
-        FString BodyForParser;
-        {
-            TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&BodyForParser);
-            FJsonSerializer::Serialize(Synthetic, W);
-        }
-
-        FNivaHttpRequest FakeReq; FakeReq.Body = BodyForParser;
-        {
-            TMap<FString,FString> D; D.Add(TEXT("task_id"), TaskId); D.Add(TEXT("ws_host"), Host);
-            CoreLog(Self.Get(), ECoreLogSeverity::Info, FString::Printf(TEXT("WS Post success -> task_id=%s host=%s"), *TaskId, *Host));
-        }
-        Self->HandleTaskStart_NCP(FakeReq);
-    });
-
-    Req->ProcessRequest();
-}
-
-// 第3步：向 /stream/{task_id} 发送文本块
-void UAudioStreamHttpWsSubsystem::PostStreamText(const FString& Text)
-{
-    UE_LOG(LogTemp, Warning, TEXT("[AudioStream][Subsystem] PostStreamText ignored: logic moved to component."));
-    CoreLog(this, ECoreLogSeverity::Warn, TEXT("Subsystem PostStreamText ignored: moved to component"));
-    return;
-    FString TaskId = ActiveTaskId;
-    if (TaskId.IsEmpty())
-    {
-        UE_LOG(LogTemp, Warning, TEXT("[AudioStream] PostStreamText: missing task_id. Call StartRunAndConnect first or pass TaskIdOverride."));
-        return;
-    }
-
-    FString Host = ActiveHttpHost;
-    const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
-    if (Host.IsEmpty() && S) Host = S->DefaultWsHost;
-    if (Host.IsEmpty()) Host = TEXT("127.0.0.1:8001");
-
-    bool bHttps = bActiveUseHttps;
-    if (!bHttps && S)
-    {
-        bHttps = S->DefaultWsScheme.Equals(TEXT("wss"), ESearchCase::IgnoreCase);
-    }
-    const FString HttpScheme = bHttps ? TEXT("https") : TEXT("http");
-
-    FString Prefix = TEXT("/stream/");
-    if (!Prefix.StartsWith(TEXT("/")) ) Prefix = TEXT("/") + Prefix;
-    if (!Prefix.EndsWith(TEXT("/")) ) Prefix += TEXT("/");
-
-    const FString Url = FString::Printf(TEXT("%s://%s%s%s"), *HttpScheme, *Host, *Prefix, *TaskId);
-
-    TSharedRef<FJsonObject> BodyObj = MakeShared<FJsonObject>();
-    BodyObj->SetStringField(TEXT("text"), Text);
-
-    FString BodyStr;
-    {
-        TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&BodyStr);
-        FJsonSerializer::Serialize(BodyObj, Writer);
-    }
-
-    TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = FHttpModule::Get().CreateRequest();
-    Req->SetURL(Url);
-    Req->SetVerb(TEXT("POST"));
-    Req->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-    Req->SetContentAsString(BodyStr);
-
-    UE_LOG(LogTemp, Log, TEXT("[AudioStream] POST %s ... textLen=%d"), *Url, Text.Len());
-    CoreLog(this, ECoreLogSeverity::Trace, FString::Printf(TEXT("/stream POST text =%s url=%s textLen=%d"), *Text.Left(64), *Url, Text.Len()));
-    
-    Req->OnProcessRequestComplete().BindLambda([SelfWeak=TWeakObjectPtr<UAudioStreamHttpWsSubsystem>(this)](FHttpRequestPtr /*Request*/, FHttpResponsePtr Response, bool bSucceeded)
-    {
-        if (!bSucceeded || !Response.IsValid())
-        {
-            UE_LOG(LogTemp, Warning, TEXT("[AudioStream] /stream POST failed (request error)"));
-            if (SelfWeak.IsValid()) { CoreLog(SelfWeak.Get(), ECoreLogSeverity::Warn, TEXT("/stream POST failed (request error)")); }
-            return;
-        }
-        const int32 Code = Response->GetResponseCode();
-        if (Code < 200 || Code >= 300)
-        {
-            UE_LOG(LogTemp, Warning, TEXT("[AudioStream] /stream POST non-2xx: %d, resp=%s"), Code, *Response->GetContentAsString());
-            if (SelfWeak.IsValid()) { CoreLog(SelfWeak.Get(), ECoreLogSeverity::Error, FString::Printf(TEXT("/stream POST failed -> url=%s code=%d respPreview=%s"), *Response->GetURL(), Code, *Response->GetContentAsString().Left(256))); }
-        }
-    });
-
-    Req->ProcessRequest();
-}
-
-// 新增：第4步 - 结束流，向 /end-stream/{task_id} 发送空的 POST 请求，通知服务器本次合成已完成
-void UAudioStreamHttpWsSubsystem::PostEndStream()
-{
-    FString TaskId = ActiveTaskId;
-    if (TaskId.IsEmpty())
-    {
-        UE_LOG(LogTemp, Warning, TEXT("[AudioStream] PostEndStream: missing task_id. Call StartRunAndConnect first."));
-        return;
-    }
-
-    FString Host = ActiveHttpHost;
-    const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
-    if (Host.IsEmpty() && S) Host = S->DefaultWsHost;
-    if (Host.IsEmpty()) Host = TEXT("127.0.0.1:8001");
-
-    bool bHttps = bActiveUseHttps;
-    if (!bHttps && S)
-    {
-        bHttps = S->DefaultWsScheme.Equals(TEXT("wss"), ESearchCase::IgnoreCase);
-    }
-    const FString HttpScheme = bHttps ? TEXT("https") : TEXT("http");
-
-    FString Prefix = TEXT("/end-stream/");
-    if (!Prefix.StartsWith(TEXT("/")) ) Prefix = TEXT("/") + Prefix;
-    if (!Prefix.EndsWith(TEXT("/")) ) Prefix += TEXT("/");
-
-    const FString Url = FString::Printf(TEXT("%s://%s%s%s"), *HttpScheme, *Host, *Prefix, *TaskId);
-
-    TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = FHttpModule::Get().CreateRequest();
-    Req->SetURL(Url);
-    Req->SetVerb(TEXT("POST"));
-    // Body should be empty per protocol; still set a content-type for clarity
-    Req->SetHeader(TEXT("Content-Type"), TEXT("text/plain"));
-
-    UE_LOG(LogTemp, Log, TEXT("[AudioStream] POST %s (end-stream)"), *Url);
-    CoreLog(this, ECoreLogSeverity::Trace, FString::Printf(TEXT("/end-stream POST begin -> url=%s task_id=%s"), *Url, *TaskId));
-
-    TWeakObjectPtr<UAudioStreamHttpWsSubsystem> SelfWeak(this);
-    Req->OnProcessRequestComplete().BindLambda([SelfWeak](FHttpRequestPtr /*Request*/, FHttpResponsePtr Response, bool bSucceeded)
-    {
-        if (!bSucceeded || !Response.IsValid())
-        {
-            UE_LOG(LogTemp, Warning, TEXT("[AudioStream] /end-stream POST failed (request error)"));
-            if (SelfWeak.IsValid()) { CoreLog(SelfWeak.Get(), ECoreLogSeverity::Warn, TEXT("/end-stream POST failed (request error)")); }
-            return;
-        }
-        const int32 Code = Response->GetResponseCode();
-        const FString Content = Response->GetContentAsString();
-        if (Code < 200 || Code >= 300)
-        {
-            UE_LOG(LogTemp, Warning, TEXT("[AudioStream] /end-stream non-2xx: %d resp=%s"), Code, *Content);
-            if (SelfWeak.IsValid()) { CoreLog(SelfWeak.Get(), ECoreLogSeverity::Error, FString::Printf(TEXT("/end-stream POST failed -> code=%d respPreview=%s"), Code, *Content.Left(256))); }
-            return;
-        }
-
-        UE_LOG(LogTemp, Log, TEXT("[AudioStream] /end-stream POST succeeded -> server will send final audio/viseme and then a {status:completed} message over WS"));
-        if (SelfWeak.IsValid()) { CoreLog(SelfWeak.Get(), ECoreLogSeverity::Info, TEXT("/end-stream POST succeeded")); }
-        // Note: server is expected to push final messages over the existing WebSocket; OnMessage handles "completed" and will close WS.
-    });
-
-    Req->ProcessRequest();
-}

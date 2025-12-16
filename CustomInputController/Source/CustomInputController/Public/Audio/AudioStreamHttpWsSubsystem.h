@@ -31,8 +31,13 @@ public:
     UFUNCTION(BlueprintCallable, Category="AudioStream")
     void StopHttpListener();
 
-    bool RegisterComponent(UAudioStreamHttpWsComponent* Comp, FString& OutKey, const FString& PreferredKey = TEXT(""));
+    // RegisterComponent now returns UUID in OutUuid and keeps a uuid->component map for quick lookup
+    bool RegisterComponent(UAudioStreamHttpWsComponent* Comp, FString& OutUuid);
     void UnregisterComponent(UAudioStreamHttpWsComponent* Comp);
+
+    // 新：通过 UUID 快速查找已注册组件
+    UFUNCTION(BlueprintCallable, Category="AudioStream|Routing")
+    UAudioStreamHttpWsComponent* FindComponentByUuid(const FString& Uuid) const;
 
     UFUNCTION(BlueprintCallable, Category="AudioStream")
     void StopStreaming();
@@ -56,17 +61,17 @@ public:
     UFUNCTION(BlueprintCallable, Category="AudioStream|Debug")
     void DumpState(const FString& Reason = TEXT("Manual")) const;
 
-    // 测试接口
+    // 测试接口（改为通过 UUID 指定目标组件）
     UFUNCTION(BlueprintCallable, Category="AudioStream|Test", meta=(CallInEditor="true"))
-    bool StartTestStream(const FString& TargetKey, int32 SampleRate = 16000, int32 Channels = 1, float FrequencyHz = 440.0f, float DurationSeconds = 5.0f);
+    bool StartTestStreamByUuid(const FString& TargetUuid, int32 SampleRate = 16000, int32 Channels = 1, float FrequencyHz = 440.0f, float DurationSeconds = 5.0f);
     UFUNCTION(BlueprintCallable, Category="AudioStream|Test", meta=(CallInEditor="true"))
     void StopTestStream();
     UFUNCTION(BlueprintCallable, Category="AudioStream|Test")
-    void PushTestAudioChunk(const FString& TargetKey, int32 SampleRate = 16000, int32 Channels = 1, float FrequencyHz = 440.0f, float ChunkDurationMs = 100.0f);
+    void PushTestAudioChunkByUuid(const FString& TargetUuid, int32 SampleRate = 16000, int32 Channels = 1, float FrequencyHz = 440.0f, float ChunkDurationMs = 100.0f);
     UFUNCTION(BlueprintCallable, Category="AudioStream|Test")
-    void PushTestText(const FString& TargetKey, const FString& Text);
+    void PushTestTextByUuid(const FString& TargetUuid, const FString& Text);
     UFUNCTION(BlueprintCallable, Category="AudioStream|Test")
-    void PushTestViseme(const FString& TargetKey, const TArray<int32>& VisemeIndices);
+    void PushTestVisemeByUuid(const FString& TargetUuid, const TArray<int32>& VisemeIndices);
     UFUNCTION(BlueprintCallable, Category="AudioStream|Test")
     TArray<uint8> GenerateTestSineWave(int32 SampleRate, int32 Channels, float FrequencyHz, float DurationSeconds);
 
@@ -79,7 +84,8 @@ private:
     bool bHttpStarted = false;
     // 是否作为本机“媒体服务器”角色（唯一实例）
     bool bActAsMediaServer = false;
-    TMap<FString, TWeakObjectPtr<UAudioStreamHttpWsComponent>> ComponentMap;
+    // 按 UUID 的快速查找表（UUID -> WeakComponent）
+    TMap<FString, TWeakObjectPtr<UAudioStreamHttpWsComponent>> UuidComponentMap;
 
     // HTTP路由
     UFUNCTION()
@@ -91,7 +97,7 @@ private:
 
     // WebSocket
     TSharedPtr<class IWebSocket> WebSocket;
-    FString ActiveWsTargetKey;
+    FString ActiveWsTargetUuid;
     int32 ActiveWsSampleRate = 16000;
     int32 ActiveWsChannels = 1;
 
@@ -107,7 +113,7 @@ private:
     UFUNCTION(BlueprintCallable, Category="AudioStream")
     void StartRunAndConnect(const FString& ServerHostWithPort = TEXT("127.0.0.1:8001"),
                             const FString& CallbackUrl = TEXT(""),
-                            const FString& TargetKey = TEXT(""),
+                            const FString& TargetUuid = TEXT(""),
                             int32 SampleRate = 16000,
                             int32 Channels = 1,
                             bool bUseHttps = false,
@@ -159,11 +165,11 @@ private:
 
     // 服务器-客户端映射
     TSet<FIPv4Endpoint> MediaClients; // hello 注册的客户端池
-    // 订阅（按流与按key的待分配）
+    // 订阅（按流的待分配）
     TMap<uint16, TSet<FIPv4Endpoint>> StreamSubscribers; // 已有stream的精确订阅
-    TMap<FString, TSet<FIPv4Endpoint>> PendingKeySubscribers; // 尚未分配streamId的key订阅
-    TMap<uint16, FString> StreamIdToKey;
-    TMap<FString, uint16> KeyToStreamId;
+    TMap<FString, TSet<FIPv4Endpoint>> PendingUuidSubscribers; // 尚未分配streamId的uuid订阅
+    TMap<uint16, FString> StreamIdToUuid;
+    TMap<FString, uint16> UuidToStreamId;
     uint16 NextStreamId = 1;
 
     // 时间同步
@@ -219,7 +225,7 @@ private:
     // 选取收件人（优先按流订阅，否则按全局）
     void CollectRecipients(uint16 StreamId, TArray<FIPv4Endpoint>& OutRecipients) const;
 
-    // 服务器：音频分发
+    // 服务器：音频分发（改为基于 Key 字段传输，这里保留 Key 参数以兼容外部传入）
     void ServerDistributeAudio(const FString& Key, const TArray<uint8>& PcmBytes, int32 InSR, int32 InCH);
     void ServerSendFrame(uint16 StreamId, const uint8* FrameData, int32 FrameBytes, uint64 PtsUs, bool bKeyframe);
 
@@ -254,15 +260,15 @@ public:
     UFUNCTION(BlueprintCallable, Category="AudioStream|Sync")
     void ServerAddClient(const FString& ClientIp, int32 Port/*=0*/);
 
-    // 服务器为指定Key添加/移除订阅者（主动多播控制）
+    // 服务器为指定UUID添加/移除订阅者（主动多播控制）
     UFUNCTION(BlueprintCallable, Category="AudioStream|Sync")
-    void ServerAddSubscriberForKey(const FString& Key, const FString& ClientIp, int32 Port/*=0*/);
+    void ServerAddSubscriberForUuid(const FString& Uuid, const FString& ClientIp, int32 Port/*=0*/);
 
     UFUNCTION(BlueprintCallable, Category="AudioStream|Sync")
-    void ServerRemoveSubscriberForKey(const FString& Key, const FString& ClientIp, int32 Port/*=0*/);
+    void ServerRemoveSubscriberForUuid(const FString& Uuid, const FString& ClientIp, int32 Port/*=0*/);
 
     UFUNCTION(BlueprintCallable, Category="AudioStream|Sync")
-    void ServerClearSubscribersForKey(const FString& Key);
+    void ServerClearSubscribersForUuid(const FString& Uuid);
 
 private:
     // 自动化 hello

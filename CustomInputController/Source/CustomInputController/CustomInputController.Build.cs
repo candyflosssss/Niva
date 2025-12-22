@@ -38,6 +38,7 @@ public class CustomInputController : ModuleRules
 				"AudioCapture",
 				"WebSockets",
 				"UMG",
+				"CoreManager",
 				// ... add other public dependencies that you statically link with here ...
 			}
 			);
@@ -50,19 +51,19 @@ public class CustomInputController : ModuleRules
 				"Engine",
 				"Slate",
 				"SlateCore",
-    "DeveloperSettings",
-    "InputCore",
-    "Json",
-    "JsonUtilities",
-    "Projects",
-    "Settings",
-    "OpenColorIOLib", 
-    "WebSockets",
-    "HTTP",
-    "AudioExtensions",
-    "AudioMixer",
-    "DeveloperSettings",
-    "CoreManager"
+			    "DeveloperSettings",
+			    "InputCore",
+			    "Json",
+			    "JsonUtilities",
+			    "Projects",
+			    "Settings",
+			    "OpenColorIOLib", 
+			    "WebSockets",
+			    "HTTP",
+			    "AudioExtensions",
+			    "AudioMixer",
+			    "DeveloperSettings",
+			    "CoreManager",
     // ... add private dependencies that you statically link with here ... 
 }
 );

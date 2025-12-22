@@ -16,6 +16,16 @@ public:
     UPROPERTY(EditAnywhere, Config, Category="Network")
     FString DefaultServerIp = TEXT("127.0.0.1");
 
+    // HTTP 路径（可在配置中覆盖）
+    UPROPERTY(EditAnywhere, Config, Category="HttpPaths")
+    FString DefaultHttpRunPath = TEXT("/run");
+
+    UPROPERTY(EditAnywhere, Config, Category="HttpPaths")
+    FString DefaultHttpStreamPath = TEXT("/stream");
+
+    UPROPERTY(EditAnywhere, Config, Category="HttpPaths")
+    FString DefaultHttpEndStreamPath = TEXT("/end-stream");
+
     // 音频
     UPROPERTY(EditAnywhere, Config, Category="Audio")
     int32 UdpRecvBufferBytes = 4*1024*1024; // 4MB
@@ -112,4 +122,10 @@ public:
     // 日志
     UPROPERTY(EditAnywhere, Config, Category="Debug")
     bool bStatsLiveLogDefault = false;
+
+    // 静态访问器，方便统一读取设置
+    static const UAudioStreamSettings* Get();
+
+    // 确保在对象初始化时加载 Config（便于在早期读取）
+    virtual void PostInitProperties() override;
 };

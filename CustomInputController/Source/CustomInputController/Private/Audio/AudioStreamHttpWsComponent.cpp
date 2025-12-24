@@ -16,6 +16,10 @@
 #include "Interfaces/IHttpRequest.h"
 #include "Interfaces/IHttpResponse.h"
 #include "Async/Async.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonReader.h"
+#include "Dom/JsonObject.h"
+#include "Misc/Base64.h"
 
 // Helper: Sanitize a string so it contains no newline characters (replace with spaces) and optionally truncate.
 static FString SanitizeNoNewline(const FString& In, int32 MaxLen = 1024)
@@ -28,15 +32,187 @@ static FString SanitizeNoNewline(const FString& In, int32 MaxLen = 1024)
     return Out;
 }
 
+// Helper: whether this component should initiate network operations (server-only)
+static bool ComponentHasServerAuthority(const UAudioStreamHttpWsComponent* Comp)
+{
+    if (!Comp) return false;
+    const AActor* Owner = Comp->GetOwner();
+    return Owner && Owner->HasAuthority();
+}
+
+// Helper: role label for logs
+static const TCHAR* GetRoleLabel(const UObject* Obj)
+{
+    if (!Obj) return TEXT("Unknown");
+    const UWorld* W = Obj->GetWorld();
+    if (!W) return TEXT("Unknown");
+    switch (W->GetNetMode())
+    {
+        case NM_Standalone:      return TEXT("Server");
+        case NM_ListenServer:    return TEXT("Server");
+        case NM_DedicatedServer: return TEXT("Server");
+        case NM_Client:          return TEXT("Client");
+        default:                 return TEXT("Unknown");
+    }
+}
+
+// Minimal WAV extractor: if data is RIFF/WAVE, extract PCM16 or convert float32->PCM16
+static bool ExtractPcmFromMaybeWav_Local(const TArray<uint8>& InBytes, TArray<uint8>& OutPcm, int32& InOutSR, int32& InOutCH)
+{
+    auto ReadLE16 = [](const uint8* p) -> uint16 { return (uint16)p[0] | ((uint16)p[1] << 8); };
+    auto ReadLE32 = [](const uint8* p) -> uint32 { return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24); };
+    if (InBytes.Num() < 44) return false;
+    const uint8* B = InBytes.GetData();
+    if (!(B[0]=='R' && B[1]=='I' && B[2]=='F' && B[3]=='F' && B[8]=='W' && B[9]=='A' && B[10]=='V' && B[11]=='E')) return false;
+
+    int32 sr = InOutSR;
+    int32 ch = InOutCH;
+    uint16 fmtTag = 1; // 1=PCM, 3=IEEE_FLOAT
+    uint16 bps = 16;
+
+    int32 dataOffset = -1, dataSize = 0;
+    int32 ofs = 12, N = InBytes.Num();
+    while (ofs + 8 <= N)
+    {
+        const uint8* H = B + ofs;
+        const uint32 sz = ReadLE32(H + 4);
+        const int32 payloadBegin = ofs + 8;
+        const int32 payloadEnd = payloadBegin + (int32)sz;
+        if (payloadBegin < 0 || sz > (uint32)FMath::Max(0, N - payloadBegin)) return false;
+        const bool isFmt = (H[0]=='f' && H[1]=='m' && H[2]=='t' && H[3]==' ');
+        const bool isData = (H[0]=='d' && H[1]=='a' && H[2]=='t' && H[3]=='a');
+        if (isFmt && sz >= 16)
+        {
+            fmtTag = ReadLE16(B + payloadBegin + 0);
+            ch     = ReadLE16(B + payloadBegin + 2);
+            sr     = (int32)ReadLE32(B + payloadBegin + 4);
+            bps    = ReadLE16(B + payloadBegin + 14);
+        }
+        else if (isData)
+        {
+            dataOffset = payloadBegin;
+            dataSize   = FMath::Min<int32>((int32)sz, N - dataOffset);
+        }
+        ofs = payloadEnd + ((sz & 1) ? 1 : 0);
+    }
+    if (dataOffset < 0 || dataSize <= 0) return false;
+    const uint8* pd = B + dataOffset;
+    if (fmtTag == 1 && bps == 16)
+    {
+        OutPcm.Reset(); OutPcm.Append(pd, dataSize);
+    }
+    else if (fmtTag == 3 && bps == 32)
+    {
+        const int32 samples = dataSize / 4;
+        OutPcm.Reset(); OutPcm.AddUninitialized(samples * 2);
+        int16* pi = reinterpret_cast<int16*>(OutPcm.GetData());
+        for (int32 i=0;i<samples;++i)
+        {
+            float v; FMemory::Memcpy(&v, pd + i*4, 4);
+            v = FMath::Clamp(v, -1.0f, 1.0f);
+            pi[i] = (int16)FMath::RoundToInt(v * 32767.0f);
+        }
+    }
+    else { return false; }
+    InOutSR = sr; InOutCH = ch; return true;
+}
+
+void UAudioStreamHttpWsComponent::ProcessWebSocketMessage(const FString& Message)
+{
+    TSharedPtr<FJsonObject> RootObj;
+    const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Message);
+    if (!FJsonSerializer::Deserialize(Reader, RootObj) || !RootObj.IsValid())
+    {
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), TEXT("WS text parse failed (component)"));
+        return;
+    }
+
+    FString StatusStr;
+    if (RootObj->TryGetStringField(TEXT("status"), StatusStr))
+    {
+        if (StatusStr.Equals(TEXT("completed"), ESearchCase::IgnoreCase))
+        {
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流数据处理"), TEXT("流程更新"), TEXT("WS status=completed (component)"));
+            return;
+        }
+    }
+
+    FString Type; RootObj->TryGetStringField(TEXT("type"), Type);
+    FString MsgUuid; RootObj->TryGetStringField(TEXT("key"), MsgUuid); if (MsgUuid.IsEmpty()) RootObj->TryGetStringField(TEXT("role_id"), MsgUuid);
+    const FString Uuid = !MsgUuid.IsEmpty() ? MsgUuid : RegisteredUuid;
+
+    if (Type.Equals(TEXT("audio"), ESearchCase::IgnoreCase))
+    {
+        int32 SR = ActiveWsSampleRate;
+        int32 CH = ActiveWsChannels;
+        int32 Tmp;
+        if (RootObj->TryGetNumberField(TEXT("sample_rate"), Tmp)) SR = Tmp;
+        if (RootObj->TryGetNumberField(TEXT("channels"), Tmp)) CH = FMath::Clamp(Tmp, 1, 8);
+
+        FString Base64; RootObj->TryGetStringField(TEXT("data"), Base64);
+        if (Base64.IsEmpty()) { FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), TEXT("WS audio dropped: empty base64 (component)")); return; }
+        TArray<uint8> Decoded; if (!FBase64::Decode(Base64, Decoded)) { FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), TEXT("WS audio base64 decode failed (component)")); return; }
+        TArray<uint8> Pcm; int32 UseSR = SR, UseCH = CH; const bool bWav = ExtractPcmFromMaybeWav_Local(Decoded, Pcm, UseSR, UseCH);
+        const int32 Bytes = bWav ? Pcm.Num() : Decoded.Num();
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("WS audio parsed (component) -> kind=%s uuid=%s bytes=%d sr=%d ch=%d"), bWav?TEXT("WAV"):TEXT("RAW"), *Uuid, Bytes, UseSR, UseCH));
+        // 后续：转发到播放/队列/统计，先注释
+        if (UGameInstance* GI = GetWorld()?GetWorld()->GetGameInstance():nullptr) { if (auto* SS = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>()) { SS->UpdateStats(Bytes, UseSR, UseCH); } }
+    }
+    else if (Type.Equals(TEXT("text"), ESearchCase::IgnoreCase))
+    {
+        FString Text; RootObj->TryGetStringField(TEXT("data"), Text);
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("WS text (component) for uuid=%s: %s"), *Uuid, *Text));
+        // 后续：事件分发，先注释
+        // ...
+    }
+    else if (Type.Equals(TEXT("viseme"), ESearchCase::IgnoreCase))
+    {
+        const TArray<TSharedPtr<FJsonValue>>* ArrPtr = nullptr;
+        if (!RootObj->TryGetArrayField(TEXT("data"), ArrPtr) || !ArrPtr)
+        {
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), TEXT("WS viseme dropped: no array (component)"));
+            return;
+        }
+        TArray<int32> Vis; Vis.Reserve(ArrPtr->Num());
+        for (const auto& V : *ArrPtr) { int32 Val=0; if (V->TryGetNumber(Val)) Vis.Add(Val); }
+        TArray<float> Confidence;
+        const TArray<TSharedPtr<FJsonValue>>* ConfPtr = nullptr;
+        if (RootObj->TryGetArrayField(TEXT("confidence"), ConfPtr) && ConfPtr)
+        {
+            Confidence.Reserve(ConfPtr->Num());
+            for (const auto& C : *ConfPtr) { double D=0.0; if (C->TryGetNumber(D)) Confidence.Add((float)D); }
+        }
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("WS viseme (component) -> n=%d uuid=%s confN=%d"), Vis.Num(), *Uuid, Confidence.Num()));
+        // 后续：统计/驱动动画，先注释
+        // if (UGameInstance* GI = GetWorld()?GetWorld()->GetGameInstance():nullptr) { if (auto* SS = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>()) { SS->UpdateVisemeStats(Vis.Num()); } }
+    }
+    else
+    {
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("WS ignored (component): type=%s"), *Type));
+    }
+}
+
 UAudioStreamHttpWsComponent::UAudioStreamHttpWsComponent()
 {
     PrimaryComponentTick.bCanEverTick = false;
+    SetIsReplicatedByDefault(true);
 }
 
 void UAudioStreamHttpWsComponent::BeginPlay()
 {
     Super::BeginPlay();
-    RegisterToSubsystem();
+    // 仅在服务器上触发服务器RPC（客户端无需主动调用）
+    if (ComponentHasServerAuthority(this))
+    {
+        RegisterToSubsystem();
+    }
+
+    // Only the server should attempt to run/connect
+    if (!ComponentHasServerAuthority(this))
+    {
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("音频流组件"), TEXT("权限"), TEXT("Skip StartRunAndConnect on client (server-only)"));
+        return;
+    }
 
     // 使用设置中的默认值（如果存在），优先使用 settings 的 DefaultWsHost / DefaultWsScheme / DefaultWsPathPrefix
     const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
@@ -53,14 +229,14 @@ void UAudioStreamHttpWsComponent::BeginPlay()
 
 void UAudioStreamHttpWsComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-    // 尝试优雅结束
+    // 尝试优雅结束（这些调用在客户端上会早退，无副作用）
     PostEndStream();
     CloseWebSocket();
     UnregisterFromSubsystem();
     Super::EndPlay(EndPlayReason);
 }
 
-void UAudioStreamHttpWsComponent::RegisterToSubsystem()
+void UAudioStreamHttpWsComponent::RegisterToSubsystem_Implementation()
 {
     if (bRegistered) return;
     UGameInstance* GI = GetWorld() ? GetWorld()->GetGameInstance() : nullptr;
@@ -68,44 +244,75 @@ void UAudioStreamHttpWsComponent::RegisterToSubsystem()
     UAudioStreamHttpWsSubsystem* Subsys = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>();
     if (!Subsys) return;
 
+    const TCHAR* Role = GetRoleLabel(this);
+
+    // 服务器上：如果已存在UUID，尝试携带UUID注册，否则由服务器分配
     FString OutUuid;
-    if (Subsys->RegisterComponent(this, OutUuid))
+    bool bOk = false;
+    if (!RegisteredUuid.IsEmpty())
     {
-        RegisteredUuid = OutUuid;
-        bRegistered = true;
-        const FString Msg = FString::Printf(TEXT("Component registered uuid=%s"), *RegisteredUuid);
-        UE_LOG(LogTemp, Log, TEXT("[AudioStream][Registry] %s"), *Msg);
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流组件注册"), TEXT("组件注册"), Msg);
+        bOk = Subsys->RegisterComponentWithUuid(this, RegisteredUuid, OutUuid);
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("服务器注册"), FString::Printf(TEXT("Register with existing uuid on %s: %s"), Role, *RegisteredUuid));
     }
     else
     {
-        const FString Msg = FString(TEXT("Component registration failed"));
-        UE_LOG(LogTemp, Warning, TEXT("[AudioStream][Registry] %s"), *Msg);
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流组件注册"), TEXT("组件注册"), Msg);
+        bOk = Subsys->RegisterServerAllocateUuid(this, OutUuid);
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("服务器注册"), FString::Printf(TEXT("Allocated uuid on %s: %s"), Role, *OutUuid));
+    }
+
+    if (bOk)
+    {
+        RegisteredUuid = OutUuid;
+        bRegistered = true;
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("服务器注册"), FString::Printf(TEXT("RegisterToSubsystem OK (%s) uuid=%s"), Role, *RegisteredUuid));
+        // 多播给客户端，同步UUID并在各端注册
+        MulticastAssignAndRegisterUuid(RegisteredUuid);
+    }
+    else
+    {
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Error, TEXT("音频流组件"), TEXT("服务器注册"), FString::Printf(TEXT("RegisterToSubsystem FAILED (%s)"), Role));
     }
 }
 
-void UAudioStreamHttpWsComponent::UnregisterFromSubsystem()
+void UAudioStreamHttpWsComponent::MulticastAssignAndRegisterUuid_Implementation(const FString& InUuid)
 {
-    if (!bRegistered) return;
+    const TCHAR* Role = GetRoleLabel(this);
+    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("音频流组件"), TEXT("客户端注册"), FString::Printf(TEXT("Multicast assign uuid on %s: %s"), Role, *InUuid));
+
+    // 在所有端执行：设置UUID并在本地子系统进行携带UUID注册
+    RegisteredUuid = InUuid;
+
+    // 若本端已注册则跳过（避免服务器端重复注册）
+    if (bRegistered) return;
+
     UGameInstance* GI = GetWorld() ? GetWorld()->GetGameInstance() : nullptr;
     if (!GI) return;
-    UAudioStreamHttpWsSubsystem* Subsys = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>();
-    if (!Subsys) return;
-
-    Subsys->UnregisterComponent(this);
-    const FString Msg = FString::Printf(TEXT("Component unregistered uuid=%s"), *RegisteredUuid);
-    UE_LOG(LogTemp, Log, TEXT("[AudioStream][Registry] %s"), *Msg);
-    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流组件注册"), TEXT("组件注销"), Msg);
-
-    bRegistered = false;
-    RegisteredUuid.Reset();
+    if (UAudioStreamHttpWsSubsystem* Subsys = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>())
+    {
+        FString Dummy;
+        if (Subsys->RegisterComponentWithUuid(this, RegisteredUuid, Dummy))
+        {
+            bRegistered = true;
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("客户端注册"), FString::Printf(TEXT("Client registered (%s) uuid=%s"), Role, *RegisteredUuid));
+        }
+        else
+        {
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Error, TEXT("音频流组件"), TEXT("客户端注册"), FString::Printf(TEXT("Client register FAILED (%s) uuid=%s"), Role, *RegisteredUuid));
+        }
+    }
 }
 
 // ===== 网络逻辑：StartRunAndConnect / POST / WS =====
 
 void UAudioStreamHttpWsComponent::StartRunAndConnect(const FString& ServerHostWithPort, const FString& CallbackUrl, const FString& TargetUuid, int32 SampleRate, int32 Channels, bool bUseHttps, const FString& HttpRunPath, const FString& WsPathPrefix)
 {
+    // Server-authority gating
+    if (!ComponentHasServerAuthority(this))
+    {
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("音频流组件"), TEXT("权限"), TEXT("Skip StartRunAndConnect on client (server-only)"));
+        return;
+    }
+
     // 记住会话信息
     ActiveHttpHost = ServerHostWithPort;
     bActiveUseHttps = bUseHttps;
@@ -128,6 +335,13 @@ void UAudioStreamHttpWsComponent::StartRunAndConnect(const FString& ServerHostWi
 // 新方法：执行 /run POST 并解析 task_id，成功后发起 WebSocket 连接
 void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPort, const FString& CallbackUrl, const FString& TargetUuid, int32 SampleRate, int32 Channels, bool bUseHttps, const FString& HttpRunPath, const FString& WsPathPrefix)
 {
+    // Server-authority gating
+    if (!ComponentHasServerAuthority(this))
+    {
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("音频流组件"), TEXT("权限"), TEXT("Skip RequestRunTask on client (server-only)"));
+        return;
+    }
+
     const FString Scheme = bUseHttps ? TEXT("https") : TEXT("http");
     const FString RunUrl = FString::Printf(TEXT("%s://%s%s"), *Scheme, *ServerHostWithPort, *HttpRunPath);
 
@@ -138,8 +352,7 @@ void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPo
 
     TSharedRef<FJsonObject> Body = MakeShared<FJsonObject>();
     if (!CallbackUrl.IsEmpty()) Body->SetStringField(TEXT("callback"), CallbackUrl);
-    const FString UseKey = !TargetUuid.IsEmpty() ? TargetUuid : RegisteredUuid;
-    Body->SetStringField(TEXT("key"), UseKey);
+    Body->SetStringField(TEXT("key"), RegisteredUuid);
     Body->SetNumberField(TEXT("sample_rate"), SampleRate);
     Body->SetNumberField(TEXT("channels"), Channels);
     FString BodyStr; const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&BodyStr);
@@ -164,7 +377,6 @@ void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPo
         {
             TMap<FString,FString> Data;
             Data.Add(TEXT("host"), ServerHostWithPort);
-            FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Error, TEXT("音频流组件"), TEXT("连接握手"), TEXT("/run request failed"), Data);
             return;
         }
         FString Content = Resp->GetContentAsString();
@@ -182,7 +394,6 @@ void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPo
             P->ActiveTaskId = TaskId;
             const FString WsScheme = bUseHttps ? TEXT("wss") : TEXT("ws");
             const FString WsUrl = FString::Printf(TEXT("%s://%s%s%s"), *WsScheme, *ServerHostWithPort, *WsPathPrefix, *TaskId);
-            // FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Debug, FString::Printf(TEXT("Connecting WS -> %s"), *WsUrl));
             // 尝试连接到websocket
             AsyncTask(ENamedThreads::GameThread, [P, WsUrl]() { if (P) P->ConnectWebSocket(WsUrl); });
         }
@@ -199,6 +410,13 @@ void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPo
 
 void UAudioStreamHttpWsComponent::PostStreamText(const FString& Text)
 {
+    // Server-authority gating
+    if (!ComponentHasServerAuthority(this))
+    {
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("音频流组件"), TEXT("权限"), TEXT("Skip PostStreamText on client (server-only)"));
+        return;
+    }
+
     if (ActiveTaskId.IsEmpty() || ActiveHttpHost.IsEmpty()) return;
     const FString Scheme = bActiveUseHttps ? TEXT("https") : TEXT("http");
     const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
@@ -238,6 +456,13 @@ void UAudioStreamHttpWsComponent::PostStreamText(const FString& Text)
 
 void UAudioStreamHttpWsComponent::PostEndStream()
 {
+    // Server-authority gating
+    if (!ComponentHasServerAuthority(this))
+    {
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("音频流组件"), TEXT("权限"), TEXT("Skip PostEndStream on client (server-only)"));
+        return;
+    }
+
     if (ActiveTaskId.IsEmpty() || ActiveHttpHost.IsEmpty()) return;
     const FString Scheme = bActiveUseHttps ? TEXT("https") : TEXT("http");
     const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
@@ -267,6 +492,13 @@ void UAudioStreamHttpWsComponent::PostEndStream()
 
 void UAudioStreamHttpWsComponent::ConnectWebSocket(const FString& Url)
 {
+    // Server-authority gating
+    if (!ComponentHasServerAuthority(this))
+    {
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("音频流组件"), TEXT("权限"), TEXT("Skip ConnectWebSocket on client (server-only)"));
+        return;
+    }
+
     CloseWebSocket();
 
     if (!FModuleManager::Get().IsModuleLoaded("WebSockets"))
@@ -330,16 +562,11 @@ void UAudioStreamHttpWsComponent::ConnectWebSocket(const FString& Url)
     {
         if (!Self.IsValid()) return;
         UAudioStreamHttpWsComponent* P = Self.Get();
-        // 将解析委托给子系统的 ProcessWebSocketMessage（在 GameThread 调用以确保线程安全）
-        AsyncTask(ENamedThreads::GameThread, [P, Message]() {
+        // 在组件内解析（仅解析；后续转发/播放暂时注释）
+        AsyncTask(ENamedThreads::GameThread, [P, Message]()
+        {
             if (!P) return;
-            if (UGameInstance* GI = P->GetWorld()?P->GetWorld()->GetGameInstance():nullptr)
-            {
-                if (UAudioStreamHttpWsSubsystem* SS = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>())
-                {
-                    SS->ProcessWebSocketMessage(Message, P->RegisteredUuid, P->ActiveWsSampleRate, P->ActiveWsChannels);
-                }
-            }
+            P->ProcessWebSocketMessage(Message);
         });
     });
 
@@ -387,7 +614,7 @@ void UAudioStreamHttpWsComponent::ScheduleReconnect()
         W2->GetTimerManager().SetTimer(ReconnectTimerHandle, [WeakThis]() {
             if (UAudioStreamHttpWsComponent* P = WeakThis.Get())
             {
-                // 使用上次的 host 和注册 uuid 发起 /run 并重连
+                // 使用上次的 host 和注册 uuid 发起 /run 并重连（仅服务器侧会执行 RequestRunTask 自身的权限检查）
                 P->RequestRunTask(P->ActiveHttpHost, FString(), P->RegisteredUuid, P->ActiveWsSampleRate, P->ActiveWsChannels, P->bActiveUseHttps, P->ActiveHttpRunPath, P->ActiveWsPathPrefix);
             }
         }, Delay, false);
@@ -405,4 +632,18 @@ void UAudioStreamHttpWsComponent::CancelReconnect()
             ReconnectTimerHandle.Invalidate();
         }
     }
+}
+
+void UAudioStreamHttpWsComponent::UnregisterFromSubsystem()
+{
+    if (!bRegistered) return;
+    const TCHAR* Role = GetRoleLabel(this);
+    UGameInstance* GI = GetWorld() ? GetWorld()->GetGameInstance() : nullptr;
+    if (!GI) return;
+    if (UAudioStreamHttpWsSubsystem* Subsys = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>())
+    {
+        Subsys->UnregisterComponent(this);
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("组件注销"), FString::Printf(TEXT("Unregistered from subsystem (%s) uuid=%s"), Role, *RegisteredUuid));
+    }
+    bRegistered = false;
 }

@@ -24,10 +24,19 @@
 #include "Interfaces/IHttpRequest.h"
 #include "Interfaces/IHttpResponse.h"
 
+#include "Sockets.h"
+#include "SocketSubsystem.h"
+
 // CoreManager logging
 #include "Log/CoreLogSubsystem.h"
 #include "Log/CoreLogTypes.h"
 #include "Log/CoreLogHelpers.h"
+
+#include "HttpServerModule.h"
+#include "HttpServerResponse.h"
+#include "HttpServerRequest.h"
+#include "IHttpRouter.h"
+#include "HttpPath.h"
 
 // 进程级：最近一次成功HELLO的服务器IP（用于换房间/跨服务器时触发重新注册）
 static FString GLastHelloServerIp;
@@ -152,9 +161,7 @@ void UAudioStreamHttpWsSubsystem::Initialize(FSubsystemCollectionBase& Collectio
     LoadSettings();
     UE_LOG(LogTemp, Log, TEXT("[AudioStream] Initialize: mode=%s, UDP=%d, frame_ms=%d, preroll_ms=%d, jitter_ms=%d, viseme_step=%d, kf_ms=%d, hb_ms=%d, offsetAlpha=%.3f, statsLive=%d"),
         IsServer()?TEXT("Server"):TEXT("Client"), MediaUdpPort, FrameDurationMs, TargetPreRollMs, TargetJitterMs, VisemeStepMs, VisemeKeyframeIntervalMs, HeartbeatIntervalMs, OffsetLerpAlpha, bStatsLiveLog?1:0);
-
-    // 尝试自动向服务器 hello（客户端自动打洞/报到）
-    AutoRegisterClient();
+    
 }
 
 void UAudioStreamHttpWsSubsystem::Deinitialize()
@@ -191,7 +198,6 @@ bool UAudioStreamHttpWsSubsystem::RegisterComponent(UAudioStreamHttpWsComponent*
     }
 
     OutUuid = Uuid;
-    UE_LOG(LogTemp, Log, TEXT("[AudioStream] Component registered uuid=%s total=%d"), *Uuid, UuidComponentMap.Num());
     FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流组件注册"), TEXT("组件注册"), FString::Printf(TEXT("Component registered uuid=%s total=%d"), *Uuid, UuidComponentMap.Num()));
 
     // If this is the first component, log auto-start suggestion (networking now handled per-component)
@@ -329,7 +335,11 @@ void UAudioStreamHttpWsSubsystem::ClientRegisterToServer(const FString& ServerIp
 
 void UAudioStreamHttpWsSubsystem::AutoRegisterClient()
 {
-    if (IsServer()) return; // 仅客户端自动注册
+    if (IsServer())
+    {
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("子系统注册"), TEXT("自动注册跳过"), TEXT("AutoRegisterClient called on server; skipping"));
+        return;
+    }
 
     if (!GLastHelloServerIp.IsEmpty())
     {
@@ -354,13 +364,7 @@ void UAudioStreamHttpWsSubsystem::AutoRegisterClient()
         }
     }
 
-    // 兜底：使用设置中的默认IP
-    const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
-    FString Fallback = S ? S->DefaultServerIp : TEXT("127.0.0.1");
-    if (!Fallback.IsEmpty())
-    {
-        ClientRegisterToServer(Fallback);
-    }
+    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("子系统注册"), TEXT("自动注册失败"), TEXT("AutoRegisterClient could not determine server IP"));
 }
 
 // ======= Settings and role =======
@@ -388,154 +392,38 @@ void UAudioStreamHttpWsSubsystem::LoadSettings()
     bStatsLiveLog = S->bStatsLiveLogDefault;
 }
 
-// ======= Message processing (extracted from previous WebSocket handler) =======
-
-static FString ResolveTargetUuidOrFallback_local(const TMap<FString, TWeakObjectPtr<UAudioStreamHttpWsComponent>>& Map, const FString& Candidate)
-{
-    if (!Candidate.IsEmpty()) return Candidate;
-    if (Map.Num() == 1)
-    {
-        for (const auto& Pair : Map) { return Pair.Key; }
-    }
-    return FString();
-}
-
-void UAudioStreamHttpWsSubsystem::ProcessWebSocketMessage(const FString& Message, const FString& MsgUuidOverride, int32 SampleRateOverride, int32 ChannelsOverride)
-{
-    TSharedPtr<FJsonObject> RootObj;
-    const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Message);
-    if (!FJsonSerializer::Deserialize(Reader, RootObj) || !RootObj.IsValid())
-    {
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), TEXT("WS text parse failed"));
-        return;
-    }
-
-    FString StatusStr;
-    if (RootObj->TryGetStringField(TEXT("status"), StatusStr))
-    {
-        if (StatusStr.Equals(TEXT("completed"), ESearchCase::IgnoreCase))
-        {
-            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流数据处理"), TEXT("流程更新"), TEXT("WS status=completed"));
-            return;
-        }
-    }
-
-    FString Type; RootObj->TryGetStringField(TEXT("type"), Type);
-    // key 已废弃，已改为UUID TTS侧需要同步修改。
-    FString MsgUuid; if (!MsgUuidOverride.IsEmpty()) { MsgUuid = MsgUuidOverride; } else { RootObj->TryGetStringField(TEXT("key"), MsgUuid); if (MsgUuid.IsEmpty()) RootObj->TryGetStringField(TEXT("role_id"), MsgUuid); }
-    const FString Uuid = ResolveTargetUuidOrFallback_local(UuidComponentMap, MsgUuid);
-
-    if (Type.Equals(TEXT("audio"), ESearchCase::IgnoreCase))
-    {
-        int32 SR = SampleRateOverride > 0 ? SampleRateOverride : 16000;
-        int32 CH = ChannelsOverride > 0 ? ChannelsOverride : 1;
-        int32 Tmp;
-        if (RootObj->TryGetNumberField(TEXT("sample_rate"), Tmp)) SR = Tmp;
-        if (RootObj->TryGetNumberField(TEXT("channels"), Tmp)) CH = Tmp;
-        CH = FMath::Clamp(CH, 1, 8);
-
-        FString Base64; RootObj->TryGetStringField(TEXT("data"), Base64);
-
-        if (Uuid.IsEmpty()) { UE_LOG(LogTemp, Warning, TEXT("WS audio JSON dropped: empty uuid")); return; }
-
-        auto Found = UuidComponentMap.Find(Uuid);
-        if (!IsServer() && (!Found || !Found->IsValid()))
-        {
-            UE_LOG(LogTemp, Warning, TEXT("WS audio JSON dropped (client mode): component not found for uuid=%s"), *Uuid);
-            return;
-        }
-        if (Base64.IsEmpty()) { UE_LOG(LogTemp, Warning, TEXT("WS audio JSON dropped: empty base64")); return; }
-
-        TArray<uint8> Decoded; if (!FBase64::Decode(Base64, Decoded)) { UE_LOG(LogTemp, Warning, TEXT("WS audio JSON base64 decode failed (len=%d)"), Base64.Len()); return; }
-
-        TArray<uint8> Pcm; int32 UseSR = SR, UseCH = CH;
-        if (ExtractPcmFromMaybeWav(Decoded, Pcm, UseSR, UseCH))
-        {
-            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("WS audio received -> kind=WAV uuid=%s pcmBytes=%d sr=%d ch=%d"), *Uuid, Pcm.Num(), UseSR, UseCH));
-        }
-        else
-        {
-            Pcm = MoveTemp(Decoded);
-            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("WS audio received -> kind=RAW uuid=%s bytes=%d sr=%d ch=%d"), *Uuid, Pcm.Num(), UseSR, UseCH));
-        }
-
-        // FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("WS audio received for uuid=%s bytes=%d sr=%d ch=%d"), *Uuid, Pcm.Num(), UseSR, UseCH));
-        UpdateStats(Pcm.Num(), UseSR, UseCH);
-        LogCurrentStats(TEXT("WSAudio"));
-    }
-    else if (Type.Equals(TEXT("text"), ESearchCase::IgnoreCase))
-    {
-        FString Text; RootObj->TryGetStringField(TEXT("data"), Text);
-        if (Uuid.IsEmpty())
-        {
-            UE_LOG(LogTemp, Warning, TEXT("WS text dropped: empty uuid"));
-            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("WS text dropped: empty uuid; text=%s"), *Text));
-            return;
-        }
-        auto Found = UuidComponentMap.Find(Uuid);
-        if (!Found || !Found->IsValid())
-        {
-            UE_LOG(LogTemp, Warning, TEXT("WS text dropped: component not found for uuid=%s"), *Uuid);
-            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("WS text dropped: component not found for uuid=%s; text=%s"), *Uuid, *Text));
-            return;
-        }
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("WS text for uuid=%s: %s"), *Uuid, *Text));
-    }
-    else if (Type.Equals(TEXT("viseme"), ESearchCase::IgnoreCase))
-    {
-        const TArray<TSharedPtr<FJsonValue>>* ArrPtr = nullptr;
-        if (!RootObj->TryGetArrayField(TEXT("data"), ArrPtr) || !ArrPtr)
-        {
-            UE_LOG(LogTemp, Warning, TEXT("WS viseme dropped: no array"));
-            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), TEXT("WS viseme dropped: no array"));
-            return;
-        }
-        TArray<int32> Vis; Vis.Reserve(ArrPtr->Num());
-        for (const auto& V : *ArrPtr) { int32 Val=0; if (V->TryGetNumber(Val)) Vis.Add(Val); }
-
-        TArray<float> Confidence;
-        const TArray<TSharedPtr<FJsonValue>>* ConfPtr = nullptr;
-        if (RootObj->TryGetArrayField(TEXT("confidence"), ConfPtr) && ConfPtr)
-        {
-            Confidence.Reserve(ConfPtr->Num());
-            for (const auto& C : *ConfPtr)
-            {
-                double D = 0.0; // JSON数字默认 double
-                if (C->TryGetNumber(D))
-                {
-                    Confidence.Add((float)D);
-                }
-            }
-        }
-
-        if (Uuid.IsEmpty())
-        {
-            UE_LOG(LogTemp, Warning, TEXT("WS viseme dropped: empty uuid"));
-            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), TEXT("WS viseme dropped: empty uuid"));
-            return;
-        }
-        auto Found = UuidComponentMap.Find(Uuid);
-        if (!Found || !Found->IsValid())
-        {
-            UE_LOG(LogTemp, Warning, TEXT("WS viseme dropped: component not found for uuid=%s"), *Uuid);
-            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("WS viseme dropped: component not found for uuid=%s"), *Uuid));
-            return;
-        }
-        UE_LOG(LogTemp, Log, TEXT("WS viseme -> n=%d uuid=%s confN=%d"), Vis.Num(), *Uuid, Confidence.Num());
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("WS viseme -> n=%d uuid=%s confN=%d"), Vis.Num(), *Uuid, Confidence.Num()));
-
-        // 统计 viseme 数
-        UpdateVisemeStats(Vis.Num());
-        LogCurrentStats(TEXT("WSViseme"));
-
-
-    }
-    else
-    {
-        UE_LOG(LogTemp, Verbose, TEXT("WS text ignored: type=%s"), *Type);
-    }
-}
-
 // Previously, network initiation (StartRunAndConnect/PostStreamText/PostEndStream) and WebSocket management
 // were implemented here in the subsystem. Those responsibilities have been migrated to individual components.
 // The subsystem now only provides registry, routing, and parsing/statistics helpers.
+
+bool UAudioStreamHttpWsSubsystem::RegisterServerAllocateUuid(UAudioStreamHttpWsComponent* Comp, FString& OutUuid)
+{
+    if (!IsValid(Comp)) return false;
+    if (!IsServer()) return false;
+    FString Uuid;
+    {
+        FScopeLock Lock(&UuidMapCS);
+        FGuid G = FGuid::NewGuid();
+        Uuid = G.ToString(EGuidFormats::DigitsWithHyphens);
+        while (UuidComponentMap.Contains(Uuid))
+        {
+            Uuid = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens);
+        }
+        UuidComponentMap.Add(Uuid, Comp);
+    }
+    OutUuid = Uuid;
+    return true;
+}
+
+bool UAudioStreamHttpWsSubsystem::RegisterComponentWithUuid(UAudioStreamHttpWsComponent* Comp, const FString& InUuid, FString& OutUuid)
+{
+    if (!IsValid(Comp)) return false;
+    if (InUuid.IsEmpty()) return false;
+    {
+        FScopeLock Lock(&UuidMapCS);
+        UuidComponentMap.Add(InUuid, Comp);
+    }
+    OutUuid = InUuid;
+    return true;
+}
+

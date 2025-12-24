@@ -55,12 +55,20 @@ public:
     UFUNCTION(BlueprintCallable, Category="AudioStream")
     void CloseWebSocket();
 
+    // 在组件里解析 WebSocket 文本消息（仅解析，后续的转发/播放先注释）
+    void ProcessWebSocketMessage(const FString& Message);
+
 private:
     // 注册态
     bool bRegistered = false;
 
-    // 便捷：注册/注销到子系统
+    // 注册/注销到子系统（使用UE RPC约束）
+    UFUNCTION(Server, Reliable)
     void RegisterToSubsystem();
+
+    UFUNCTION(NetMulticast, Reliable)
+    void MulticastAssignAndRegisterUuid(const FString& InUuid);
+
     void UnregisterFromSubsystem();
 
     // ===== 组件持有的会话状态 =====

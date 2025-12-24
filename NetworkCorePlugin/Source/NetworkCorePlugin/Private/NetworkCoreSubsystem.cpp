@@ -392,8 +392,8 @@ void UMCPTransportSubsystem::RegisterToolProperties(FMCPTool tool, FMCPRouteDele
         }
     }
 
-    // 最终记录更详细的日志
-    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Info, TEXT("Registered tool route (detailed)"), DetailLog);
+    // message要显示具体的工具名称
+    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Info, tool.Name + TEXT(" registered."), DetailLog);
 	}
 }
 
@@ -429,7 +429,7 @@ TSharedPtr<FJsonObject> UMCPTransportSubsystem::GetToolbyTarget(FString ActorNam
 
 TSharedPtr<FJsonObject> UMCPTransportSubsystem::GetToolTargets(FString ToolName)
 {
-    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Info, FString::Printf(TEXT("Query targets by tool: %s"), *ToolName));
+    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Off, FString::Printf(TEXT("Query targets by tool: %s"), *ToolName));
     // 通过json来存储结果
     // 构建一个JSON对象
     TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
@@ -1584,7 +1584,7 @@ TArray<AActor*> UMCPToolPropertyActorPtr::FindActors()
     if (ActorClass)
     {
         UGameplayStatics::GetAllActorsOfClass(World, ActorClass, Actors);
-        UE_LOG(LogTemp, Log, TEXT("FindActors: Searching for actors of class %s"), *ActorClass->GetName());
+        // UE_LOG(LogTemp, Log, TEXT("FindActors: Searching for actors of class %s"), *ActorClass->GetName());
     }
 
     // 更新ActorMap，使用弱指针存储引用
@@ -1599,7 +1599,7 @@ TArray<AActor*> UMCPToolPropertyActorPtr::FindActors()
     }
 
     // 输出找到的Actor数量
-    UE_LOG(LogTemp, Log, TEXT("FindActors: Found %d actors"), Actors.Num());
+    // UE_LOG(LogTemp, Log, TEXT("FindActors: Found %d actors"), Actors.Num());
 
     return Actors;
 }

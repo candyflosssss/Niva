@@ -23,6 +23,14 @@ public:
     virtual void Deinitialize() override;
     
     // ===== 组件注册 / UUID 管理 =====
+    // 服务器分配UUID的注册（仅服务器允许）
+    UFUNCTION(BlueprintCallable, Category="AudioStream|Registry")
+    bool RegisterServerAllocateUuid(UAudioStreamHttpWsComponent* Comp, FString& OutUuid);
+    // 携带UUID的注册（客户端/服务器皆可，子系统将映射到该UUID）
+    UFUNCTION(BlueprintCallable, Category="AudioStream|Registry")
+    bool RegisterComponentWithUuid(UAudioStreamHttpWsComponent* Comp, const FString& InUuid, FString& OutUuid);
+
+    // 兼容入口：若组件已有UUID则用之，否则走服务器分配
     UFUNCTION(BlueprintCallable, Category="AudioStream|Registry")
     bool RegisterComponent(UAudioStreamHttpWsComponent* Comp, FString& OutUuid);
     UFUNCTION(BlueprintCallable, Category="AudioStream|Registry")
@@ -31,10 +39,6 @@ public:
     UFUNCTION(BlueprintCallable, Category="AudioStream|Registry")
     UAudioStreamHttpWsComponent* FindComponentByUuid(const FString& Uuid) const;
     
-    // NOTE: 网络发送/连接逻辑已迁移到每个组件实例，子系统仅保留解析/统计/路由相关的可复用方法。
-    // 组件在接收 WebSocket 文本消息后可调用此方法以复用子系统的解析与统计实现。
-    void ProcessWebSocketMessage(const FString& Message, const FString& MsgUuidOverride = FString(), int32 SampleRateOverride = -1, int32 ChannelsOverride = -1);
-
 public:
     // ===== 同步：客户端注册 =====
     UFUNCTION(BlueprintCallable, Category="AudioStream|Sync")
@@ -42,6 +46,7 @@ public:
 
     UFUNCTION(BlueprintCallable, Category="AudioStream|Sync")
     void AutoRegisterClient();
+
 
 private:
     // ===== 组件映射 / 路由 =====
@@ -90,3 +95,6 @@ private:
     // ===== HTTP 监听状态 =====
     bool bHttpStarted = false;
 };
+
+
+

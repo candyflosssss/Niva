@@ -8,8 +8,6 @@
 #include "Dom/JsonObject.h"
 #include "Misc/Base64.h"
 
-#include "WebSocketsModule.h"
-#include "IWebSocket.h"
 #include "Modules/ModuleManager.h"
 #include "Engine/GameInstance.h"
 #include "Async/Async.h"
@@ -20,9 +18,6 @@
 
 #include "Engine/NetConnection.h"
 #include "Engine/NetDriver.h"
-#include "HttpModule.h"
-#include "Interfaces/IHttpRequest.h"
-#include "Interfaces/IHttpResponse.h"
 
 #include "Sockets.h"
 #include "SocketSubsystem.h"
@@ -32,127 +27,103 @@
 #include "Log/CoreLogTypes.h"
 #include "Log/CoreLogHelpers.h"
 
-#include "HttpServerModule.h"
-#include "HttpServerResponse.h"
-#include "HttpServerRequest.h"
-#include "IHttpRouter.h"
-#include "HttpPath.h"
+// Helper: compute PCM16 bytes per ms for framing
+static inline int32 ComputeBytesPerMs(int32 SampleRate, int32 Channels)
+{
+    if (SampleRate <= 0 || Channels <= 0) return 0;
+    const int64 BytesPerSec = (int64)SampleRate * (int64)Channels * 2; // PCM16
+    return (int32)FMath::Max<int64>(1, BytesPerSec / 1000);
+}
+
+// --- Packet Protocol Definitions ---
+namespace AudioStreamPacket
+{
+    static uint32 Swap32(uint32 Val)
+    {
+        return ((Val >> 24) & 0xff) | ((Val >> 8) & 0xff00) | ((Val << 8) & 0xff0000) | ((Val << 24) & 0xff000000);
+    }
+
+    void BuildPacket(uint8 Type, const TArray<uint8>& Payload, TArray<uint8>& OutPacket, const FGuid* InUuid)
+    {
+        static uint32 GlobalSeq = 0;
+
+        FHeader H;
+        H.Type = Type;
+        H.Flags = (InUuid != nullptr) ? 1 : 0;
+        H.Seq = ++GlobalSeq;
+        // Simple timestamp in ms
+        H.Timestamp = (uint32)(FPlatformTime::Seconds() * 1000.0);
+        if (InUuid) H.Uuid = *InUuid;
+
+        OutPacket.Reset();
+        OutPacket.Add(H.Type);
+        OutPacket.Add(H.Flags);
+
+        // Network Byte Order (Big Endian)
+        uint32 SeqBE = H.Seq;
+        uint32 TimeBE = H.Timestamp;
+        #if PLATFORM_LITTLE_ENDIAN
+            SeqBE = Swap32(SeqBE);
+            TimeBE = Swap32(TimeBE);
+        #endif
+        
+        OutPacket.Append((uint8*)&SeqBE, 4);
+        OutPacket.Append((uint8*)&TimeBE, 4);
+
+        if (H.HasUuid())
+        {
+            OutPacket.Append((uint8*)&H.Uuid, 16);
+        }
+
+        OutPacket.Append(Payload);
+    }
+
+    bool ParsePacket(const TArray<uint8>& InData, FHeader& OutHeader, TArray<uint8>& OutPayload)
+    {
+        if (InData.Num() < 10) return false;
+
+        const uint8* Ptr = InData.GetData();
+        OutHeader.Type = Ptr[0];
+        OutHeader.Flags = Ptr[1];
+
+        uint32 SeqNet = 0;
+        uint32 TimeNet = 0;
+        FMemory::Memcpy(&SeqNet, Ptr + 2, 4);
+        FMemory::Memcpy(&TimeNet, Ptr + 6, 4);
+
+        OutHeader.Seq = SeqNet;
+        OutHeader.Timestamp = TimeNet;
+        #if PLATFORM_LITTLE_ENDIAN
+            OutHeader.Seq = Swap32(OutHeader.Seq);
+            OutHeader.Timestamp = Swap32(OutHeader.Timestamp);
+        #endif
+
+        int32 Offset = 10;
+        if (OutHeader.HasUuid())
+        {
+            if (InData.Num() < Offset + 16) return false;
+            FMemory::Memcpy(&OutHeader.Uuid, Ptr + Offset, 16);
+            Offset += 16;
+        }
+
+        int32 PayloadSize = InData.Num() - Offset;
+        if (PayloadSize > 0)
+        {
+            OutPayload.Reset(PayloadSize);
+            OutPayload.Append(Ptr + Offset, PayloadSize);
+        }
+        else
+        {
+            OutPayload.Empty();
+        }
+        return true;
+    }
+}
+
+DEFINE_LOG_CATEGORY(LogAudioStreamWs);
 
 // 进程级：最近一次成功HELLO的服务器IP（用于换房间/跨服务器时触发重新注册）
 static FString GLastHelloServerIp;
-
-
-// --- WAV 提取工具：若是 RIFF/WAVE，就提取 data 块 PCM；支持 PCM16 与 Float32 转 S16 ---
-static bool ExtractPcmFromMaybeWav(const TArray<uint8>& InBytes, TArray<uint8>& OutPcm, int32& InOutSR, int32& InOutCH)
-{
-    auto ReadLE16 = [](const uint8* p) -> uint16 { return (uint16)p[0] | ((uint16)p[1] << 8); };
-    auto ReadLE32 = [](const uint8* p) -> uint32 { return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24); };
-
-    if (InBytes.Num() < 44) return false;
-    const uint8* B = InBytes.GetData();
-    // 仅支持 RIFF/WAVE
-    if (!(B[0]=='R' && B[1]=='I' && B[2]=='F' && B[3]=='F' && B[8]=='W' && B[9]=='A' && B[10]=='V' && B[11]=='E'))
-    {
-        return false; // 非 WAV，按原始PCM处理
-    }
-
-    int32 sr = InOutSR;
-    int32 ch = InOutCH;
-    uint16 fmtTag = 1; // 1=PCM, 3=IEEE_FLOAT
-    uint16 bps = 16;
-
-    int32 dataOffset = -1;
-    int32 dataSize = 0;
-
-    int32 ofs = 12; // 从第一个chunk开始
-    const int32 N = InBytes.Num();
-    while (ofs + 8 <= N)
-    {
-        const uint8* H = B + ofs;
-        const uint32 sz = ReadLE32(H + 4);
-        const int32 payloadBegin = ofs + 8;
-        const int32 payloadEnd = payloadBegin + (int32)sz;
-
-        // 边界保护：长度非法直接停止/返回
-        if (payloadBegin < 0 || sz > (uint32)FMath::Max(0, N - payloadBegin))
-        {
-            // 格式损坏
-            return false;
-        }
-
-        const bool isFmt  = (H[0]=='f' && H[1]=='m' && H[2]=='t' && H[3]==' ');
-        const bool isData = (H[0]=='d' && H[1]=='a' && H[2]=='t' && H[3]=='a');
-
-        if (isFmt && sz >= 16)
-        {
-            fmtTag = ReadLE16(B + payloadBegin + 0);
-            ch     = ReadLE16(B + payloadBegin + 2);
-            sr     = (int32)ReadLE32(B + payloadBegin + 4);
-            bps    = ReadLE16(B + payloadBegin + 14);
-
-            // 可选：基本一致性检查
-            const uint16 blockAlign = ReadLE16(B + payloadBegin + 12);
-            const uint16 expectAlign = (uint16)(FMath::Max(1, ch) * (bps / 8));
-            if (blockAlign != expectAlign)
-            {
-                UE_LOG(LogTemp, Warning, TEXT("WAV fmt mismatch: blockAlign=%u, expect=%u (ch=%d, bps=%u)"), blockAlign, expectAlign, ch, bps);
-            }
-
-            if (fmtTag == 0xFFFE)
-            {
-                // WAVE_FORMAT_EXTENSIBLE 暂不支持
-                UE_LOG(LogTemp, Warning, TEXT("WAVE_FORMAT_EXTENSIBLE not supported"));
-                return false;
-            }
-        }
-        else if (isData)
-        {
-            dataOffset = payloadBegin;
-            dataSize   = FMath::Min<int32>((int32)sz, N - dataOffset);
-        }
-
-        // RIFF padding：chunk size 为奇数时需要补一个 pad 字节
-        ofs = payloadEnd + ((sz & 1) ? 1 : 0);
-    }
-
-    if (dataOffset < 0 || dataSize <= 0)
-    {
-        return false;
-    }
-
-    const uint8* pd = B + dataOffset;
-
-    if (fmtTag == 1 && bps == 16)
-    {
-        // 直接拷贝PCM16LE
-        OutPcm.Reset();
-        OutPcm.Append(pd, dataSize);
-    }
-    else if (fmtTag == 3 && bps == 32)
-    {
-        // Float32 -> PCM16LE（避免未对齐访问）
-        const int32 samples = dataSize / 4;
-        OutPcm.Reset();
-        OutPcm.AddUninitialized(samples * 2);
-        int16* pi = reinterpret_cast<int16*>(OutPcm.GetData());
-        for (int32 i = 0; i < samples; ++i)
-        {
-            float v;
-            FMemory::Memcpy(&v, pd + i * 4, 4);
-            v = FMath::Clamp(v, -1.0f, 1.0f);
-            pi[i] = (int16)FMath::RoundToInt(v * 32767.0f);
-        }
-    }
-    else
-    {
-        // 不支持的格式
-        return false;
-    }
-
-    InOutSR = sr;
-    InOutCH = ch;
-    return true;
-}
 
 void UAudioStreamHttpWsSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
@@ -162,12 +133,24 @@ void UAudioStreamHttpWsSubsystem::Initialize(FSubsystemCollectionBase& Collectio
     UE_LOG(LogTemp, Log, TEXT("[AudioStream] Initialize: mode=%s, UDP=%d, frame_ms=%d, preroll_ms=%d, jitter_ms=%d, viseme_step=%d, kf_ms=%d, hb_ms=%d, offsetAlpha=%.3f, statsLive=%d"),
         IsServer()?TEXT("Server"):TEXT("Client"), MediaUdpPort, FrameDurationMs, TargetPreRollMs, TargetJitterMs, VisemeStepMs, VisemeKeyframeIntervalMs, HeartbeatIntervalMs, OffsetLerpAlpha, bStatsLiveLog?1:0);
     
+    // if (IsServer())
+    // {
+    //     StartSocketServer();
+    // }
 }
 
 void UAudioStreamHttpWsSubsystem::Deinitialize()
 {
     UE_LOG(LogTemp, Log, TEXT("[AudioStream] Deinitialize begin"));
     FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("音频流子系统"), TEXT("开始销毁"), TEXT("Deinitialize begin"));
+
+    StopSocketServer();
+
+    {
+        // Clear audio buffers
+        FScopeLock L(&AudioBufCS);
+        AudioBufferMap.Empty();
+    }
 
     UuidComponentMap.Empty();
     Super::Deinitialize();
@@ -227,18 +210,17 @@ void UAudioStreamHttpWsSubsystem::UnregisterComponent(UAudioStreamHttpWsComponen
         if (Pair.Value.Get() == Comp) { ToRemove.Add(Pair.Key); }
     }
     for (const FString& K : ToRemove) { UuidComponentMap.Remove(K); UE_LOG(LogTemp, Log, TEXT("[AudioStream] Uuid entry removed: %s"), *K); }
-}
 
-// Helper: resolve target UUID or fallback to active or single-entry if available
-static FString ResolveTargetUuidOrFallback(const TMap<FString, TWeakObjectPtr<UAudioStreamHttpWsComponent>>& Map, const FString& Candidate, const FString& Active)
-{
-    if (!Candidate.IsEmpty()) return Candidate;
-    if (!Active.IsEmpty()) return Active;
-    if (Map.Num() == 1)
+    // 同时清理该组件相关的音频缓存（按UUID）
+    if (ToRemove.Num() > 0)
     {
-        for (const auto& Pair : Map) { return Pair.Key; }
+        FScopeLock L(&AudioBufCS);
+        for (const FString& K : ToRemove)
+        {
+            FGuid G; FGuid::Parse(K, G);
+            AudioBufferMap.Remove(G);
+        }
     }
-    return FString();
 }
 
 
@@ -302,27 +284,6 @@ void UAudioStreamHttpWsSubsystem::GetAudioStatsEx(int64& OutBytes, int64& OutFra
     OutVisemes = TotalVisemes;
 }
 
-static FNivaHttpResponse MakePlainResponse(int32 StatusCode, const FString& Body)
-{
-    FNivaHttpResponse R;
-    // Fill response code
-    R.HttpServerResponse.Code = static_cast<EHttpServerResponseCodes>(StatusCode);
-    // Convert Body (FString) to UTF-8 bytes for Body array
-    FTCHARToUTF8 Utf8(*Body);
-    const uint8* Bytes = reinterpret_cast<const uint8*>(Utf8.Get());
-    R.HttpServerResponse.Body.Empty();
-    if (Utf8.Length() > 0)
-    {
-        R.HttpServerResponse.Body.Append(Bytes, Utf8.Length());
-    }
-    // Headers: FHttpServerResponse expects TMap<FString,TArray<FString>>
-    R.HttpServerResponse.Headers.Add(TEXT("Content-Type"), TArray<FString>{ TEXT("text/plain; charset=utf-8") });
-    return R;
-}
-
-
-
-
 // ======= Client register / auto =======
 
 void UAudioStreamHttpWsSubsystem::ClientRegisterToServer(const FString& ServerIp)
@@ -330,41 +291,80 @@ void UAudioStreamHttpWsSubsystem::ClientRegisterToServer(const FString& ServerIp
     // 记忆最后成功的服务器IP
     GLastHelloServerIp = ServerIp;
     LastHelloServerIp = ServerIp;
-    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流组件注册"), TEXT("组件成功注册"), FString::Printf(TEXT("Registered to server %s"), *ServerIp));
+    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("客户端注册"), TEXT("获取服务器"), FString::Printf(TEXT("Registered to server %s"), *ServerIp));
+}
+
+void UAudioStreamHttpWsSubsystem::Client_OnServerPortReceived(int32 Port)
+{
+    if (IsServer()) return;
+    if (Port <= 0) return;
+
+    // [防重] 如果端口没变，且当前Socket连接正常，则忽略此次请求
+    if (CachedServerPort == Port)
+    {
+        if (ClientConnectionSocket && ClientConnectionSocket->GetConnectionState() == SCS_Connected)
+        {
+            return;
+        }
+    }
+
+    UE_LOG(LogAudioStreamWs, Log, TEXT("[Socket] Client received server port via RPC: %d"), Port);
+    
+    // 缓存端口
+    CachedServerPort = Port;
+
+    // 尝试触发连接（如果 IP 已知）
+    AutoRegisterClient();
 }
 
 void UAudioStreamHttpWsSubsystem::AutoRegisterClient()
 {
-    if (IsServer())
-    {
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("子系统注册"), TEXT("自动注册跳过"), TEXT("AutoRegisterClient called on server; skipping"));
-        return;
-    }
+    if (IsServer()) return;
 
-    if (!GLastHelloServerIp.IsEmpty())
+    // 1. 尝试解析服务器 IP (通过 UE 原生网络连接)
+    FString TargetIp = GLastHelloServerIp;
+    
+    if (TargetIp.IsEmpty())
     {
-        ClientRegisterToServer(GLastHelloServerIp);
-        return;
-    }
-
-    // 简化：尝试从NetDriver获取服务器地址
-    UWorld* W = GetWorld(); if (!W) return;
-    if (UNetDriver* ND = W->GetNetDriver())
-    {
-        if (ND->ServerConnection && ND->ServerConnection->LowLevelGetRemoteAddress(true) != TEXT(""))
+        if (UWorld* W = GetWorld())
         {
-            FString Remote = ND->ServerConnection->LowLevelGetRemoteAddress(true);
-            // 解析出 IP
-            FString Ip, Port;
-            if (Remote.Split(TEXT(":"), &Ip, &Port))
+            if (UNetDriver* ND = W->GetNetDriver())
             {
-                ClientRegisterToServer(Ip);
-                return;
+                // 只有当连接建立后 ServerConnection 才有效
+                if (ND->ServerConnection)
+                {
+                    FString Remote = ND->ServerConnection->LowLevelGetRemoteAddress(true);
+                    FString Ip, P;
+                    if (Remote.Split(TEXT(":"), &Ip, &P))
+                    {
+                        TargetIp = Ip;
+                        ClientRegisterToServer(TargetIp); // 缓存 IP
+                    }
+                }
             }
         }
     }
 
-    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("子系统注册"), TEXT("自动注册失败"), TEXT("AutoRegisterClient could not determine server IP"));
+    // 2. 决策连接：必须同时拥有 IP 和 Port
+    if (!TargetIp.IsEmpty())
+    {
+        if (CachedServerPort > 0)
+        {
+            // IP 和 端口 都有了，发起连接
+            ConnectToSocketServer(TargetIp, CachedServerPort);
+        }
+        else
+        {
+            // 只有 IP 没有端口，说明 RPC 还没到，等待 RPC
+            UE_LOG(LogAudioStreamWs, Log, TEXT("[Socket] Client IP resolved (%s), waiting for Server Port via RPC..."), *TargetIp);
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("客户端注册"), TEXT("等待端口"), FString::Printf(TEXT("Client IP resolved (%s), waiting for Server Port via RPC..."), *TargetIp));
+        }
+    }
+    else
+    {
+        // 还没连上游戏服务器，无法获取 IP
+        // UE_LOG(LogAudioStreamWs, Verbose, TEXT("[Socket] AutoRegisterClient waiting for NetDriver connection..."));
+    }
 }
 
 // ======= Settings and role =======
@@ -381,14 +381,9 @@ void UAudioStreamHttpWsSubsystem::LoadSettings()
 {
     const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
     if (!S) return;
-    MediaUdpPort = S->MediaUdpPort;
     FrameDurationMs = S->FrameDurationMs;
     TargetPreRollMs = S->TargetPreRollMs;
     TargetJitterMs = S->TargetJitterMs;
-    VisemeStepMs = S->VisemeStepMs;
-    VisemeKeyframeIntervalMs = S->VisemeKeyframeIntervalMs;
-    HeartbeatIntervalMs = S->HeartbeatIntervalMs;
-    OffsetLerpAlpha = S->OffsetLerpAlpha;
     bStatsLiveLog = S->bStatsLiveLogDefault;
 }
 
@@ -426,4 +421,504 @@ bool UAudioStreamHttpWsSubsystem::RegisterComponentWithUuid(UAudioStreamHttpWsCo
     OutUuid = InUuid;
     return true;
 }
+
+
+// ======= Socket Server Implementation =======
+
+void UAudioStreamHttpWsSubsystem::StartSocketServer()
+{
+    if (!IsServer()) return;
+    if (ListenSocket) return;
+
+    ISocketSubsystem* SocketSubsystem = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+    if (!SocketSubsystem) return;
+
+    // Try ports 19001 to 19010 to find a valid one
+    int32 BoundPort = 0;
+    for (int32 Port = 19001; Port <= 19010; Port++)
+    {
+        // UDP: NAME_DGram
+        FSocket* NewSocket = SocketSubsystem->CreateSocket(NAME_DGram, TEXT("AudioStreamServerSocket"), false);
+        if (!NewSocket) break;
+
+        NewSocket->SetReuseAddr(true);
+        NewSocket->SetNonBlocking(true); // UDP should be non-blocking
+        
+        TSharedRef<FInternetAddr> Addr = SocketSubsystem->CreateInternetAddr();
+        Addr->SetAnyAddress();
+        Addr->SetPort(Port);
+
+        if (NewSocket->Bind(*Addr))
+        {
+            // UDP: No Listen()
+            ListenSocket = NewSocket;
+            BoundPort = Port;
+            break;
+        }
+        
+        NewSocket->Close();
+        SocketSubsystem->DestroySocket(NewSocket);
+    }
+
+    if (ListenSocket && BoundPort > 0)
+    {
+        CurrentSocketPort = BoundPort;
+        UE_LOG(LogAudioStreamWs, Log, TEXT("[Socket] UDP Server bound to port %d"), CurrentSocketPort);
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("SocketServer"), TEXT("启动成功"), FString::Printf(TEXT("UDP Bound to port %d"), CurrentSocketPort));
+        
+        // Start Tick
+        if (UWorld* World = GetWorld())
+        {
+            World->GetTimerManager().SetTimer(SocketServerTimerHandle, this, &UAudioStreamHttpWsSubsystem::SocketServerTick, 0.01f, true); // Faster tick for UDP
+        }
+    }
+    else
+    {
+        UE_LOG(LogAudioStreamWs, Error, TEXT("[Socket] Failed to bind UDP to any port 19001-19010"));
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Error, TEXT("SocketServer"), TEXT("启动失败"), TEXT("Failed to bind UDP port 19001-19010"));
+    }
+}
+
+void UAudioStreamHttpWsSubsystem::StopSocketServer()
+{
+    ISocketSubsystem* SocketSubsystem = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+    
+    // Stop Server
+    if (ListenSocket)
+    {
+        ListenSocket->Close();
+        if (SocketSubsystem) SocketSubsystem->DestroySocket(ListenSocket);
+        ListenSocket = nullptr;
+    }
+    
+    // Clear Clients Map
+    ClientMap.Empty();
+    
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(SocketServerTimerHandle);
+    }
+
+    // Stop Client (if we were a client)
+    if (ClientConnectionSocket)
+    {
+        ClientConnectionSocket->Close();
+        if (SocketSubsystem) SocketSubsystem->DestroySocket(ClientConnectionSocket);
+        ClientConnectionSocket = nullptr;
+    }
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(SocketClientTimerHandle);
+    }
+}
+
+void UAudioStreamHttpWsSubsystem::ConnectToSocketServer(const FString& Ip, int32 Port)
+{
+    if (IsServer()) return;
+    
+    // 如果已经连接，且目标一致，则跳过
+    if (ClientConnectionSocket)
+    {
+        // UDP doesn't have "Connected" state in the same way, but we check if socket exists
+        return; 
+    }
+
+    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SocketClient"), TEXT("尝试连接"), FString::Printf(TEXT("Subsystem UDP Connecting to %s:%d"), *Ip, Port));
+    
+    if (Ip.IsEmpty() || Port <= 0) return;
+
+    ISocketSubsystem* SocketSubsystem = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+    if (!SocketSubsystem) return;
+
+    // UDP: NAME_DGram
+    ClientConnectionSocket = SocketSubsystem->CreateSocket(NAME_DGram, TEXT("AudioStreamClientSocket"), false);
+    if (!ClientConnectionSocket) return;
+
+    ClientConnectionSocket->SetNonBlocking(true);
+
+    TSharedRef<FInternetAddr> Addr = SocketSubsystem->CreateInternetAddr();
+    bool bValid;
+    Addr->SetIp(*Ip, bValid);
+    Addr->SetPort(Port);
+    
+    if (bValid)
+    {
+        // UDP Connect sets default destination
+        bool bConnected = ClientConnectionSocket->Connect(*Addr);
+        if (bConnected)
+        {
+             UE_LOG(LogAudioStreamWs, Log, TEXT("[Socket] UDP Client connected to %s:%d"), *Ip, Port);
+             FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("SocketClient"), TEXT("连接成功"), FString::Printf(TEXT("Subsystem UDP Connected to %s:%d"), *Ip, Port));
+             
+             // Send Hello Packet to register with server
+             FString HelloMsg = TEXT("HELLO_SERVER");
+             FTCHARToUTF8 Utf8(*HelloMsg);
+             TArray<uint8> Payload;
+             Payload.Append((const uint8*)Utf8.Get(), Utf8.Length());
+             SendPacket(AudioStreamPacket::Text, Payload);
+
+             if (UWorld* World = GetWorld())
+             {
+                 World->GetTimerManager().SetTimer(SocketClientTimerHandle, this, &UAudioStreamHttpWsSubsystem::SocketClientTick, 0.01f, true);
+             }
+        }
+        else
+        {
+             UE_LOG(LogAudioStreamWs, Warning, TEXT("[Socket] UDP Client failed to connect to %s:%d"), *Ip, Port);
+             ClientConnectionSocket->Close();
+             SocketSubsystem->DestroySocket(ClientConnectionSocket);
+             ClientConnectionSocket = nullptr;
+        }
+    }
+}
+
+void UAudioStreamHttpWsSubsystem::SocketServerTick()
+{
+    if (!ListenSocket) return;
+    
+    uint32 PendingDataSize = 0;
+    while (ListenSocket->HasPendingData(PendingDataSize) && PendingDataSize > 0)
+    {
+        TArray<uint8> Buffer;
+        Buffer.SetNumUninitialized(PendingDataSize);
+        int32 BytesRead = 0;
+        
+        TSharedRef<FInternetAddr> SenderAddr = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->CreateInternetAddr();
+        
+        if (ListenSocket->RecvFrom(Buffer.GetData(), PendingDataSize, BytesRead, *SenderAddr))
+        {
+            if (BytesRead > 0)
+            {
+                Buffer.SetNum(BytesRead);
+                
+                // Register Client if new
+                // [Hello 处理逻辑] 实际上，服务器收到任何来自新地址的 UDP 包都会将其视为“注册”
+                // 客户端发送 "HELLO_SERVER" 主要是为了触发这里的逻辑
+                FString SenderKey = SenderAddr->ToString(true);
+                if (!ClientMap.Contains(SenderKey))
+                {
+                    ClientMap.Add(SenderKey, SenderAddr);
+                    UE_LOG(LogAudioStreamWs, Log, TEXT("[Socket] New UDP Client registered: %s"), *SenderKey);
+                }
+
+                HandleSocketData(Buffer, SenderKey, true);
+            }
+        }
+    }
+}
+
+void UAudioStreamHttpWsSubsystem::SocketClientTick()
+{
+    if (!ClientConnectionSocket) return;
+    
+    uint32 PendingDataSize = 0;
+    while (ClientConnectionSocket->HasPendingData(PendingDataSize) && PendingDataSize > 0)
+    {
+        TArray<uint8> Buffer;
+        Buffer.SetNumUninitialized(PendingDataSize);
+        int32 BytesRead = 0;
+        
+        // Since we used Connect(), we can use Recv, or RecvFrom. Recv is simpler.
+        if (ClientConnectionSocket->Recv(Buffer.GetData(), PendingDataSize, BytesRead))
+        {
+            if (BytesRead > 0)
+            {
+                Buffer.SetNum(BytesRead);
+                HandleSocketData(Buffer, TEXT("Server"), false);
+            }
+        }
+    }
+}
+
+void UAudioStreamHttpWsSubsystem::HandleSocketData(const TArray<uint8>& Data, const FString& SenderInfo, bool bIsServer)
+{
+    // 定义包头和负载变量
+    AudioStreamPacket::FHeader Header;
+    TArray<uint8> Payload;
+    
+    // 尝试解析数据包，如果解析失败则记录警告并返回
+    if (!AudioStreamPacket::ParsePacket(Data, Header, Payload))
+    {
+        UE_LOG(LogAudioStreamWs, Warning, TEXT("[Socket] Failed to parse packet from %s (len=%d)"), *SenderInfo, Data.Num());
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("SocketData"), TEXT("解析失败"), FString::Printf(TEXT("Failed to parse packet from %s (len=%d)"), *SenderInfo, Data.Num()));
+        return;
+    }
+    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SocketData"), TEXT("服务器接收"), FString::Printf(/*type用实际文本*/TEXT("Parsed packet from %s (Type=%s, Seq=%d, Size=%d)"), 
+        *SenderInfo, Header.GetTypeName(), Header.Seq, Payload.Num()));
+    // 标记是否需要转发该消息（仅在作为服务器时有效）
+    bool bShouldForward = false;
+
+    // 处理文本或控制类型的消息
+    if (Header.Type == AudioStreamPacket::Text || Header.Type == AudioStreamPacket::Control)
+    {
+        // 确保负载数据以 null 结尾，以便安全转换为字符串
+        Payload.Add(0);
+        // 将 UTF8 编码的负载转换为 TCHAR 字符串
+        FString ReceivedMsg = UTF8_TO_TCHAR((const char*)Payload.GetData());
+        
+        // 记录详细日志和核心日志
+        UE_LOG(LogAudioStreamWs, Verbose, TEXT("[Socket] %s received from %s (Type=%d, Seq=%d): %s"), 
+            bIsServer ? TEXT("Server") : TEXT("Client"), *SenderInfo, Header.Type, Header.Seq, *ReceivedMsg);
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SocketData"), TEXT("文本消息"), FString::Printf(TEXT("From Subsystem %s: %s"), *SenderInfo, *ReceivedMsg));
+
+        // 处理特定的握手消息 "HELLO_SERVER"
+        if (ReceivedMsg.StartsWith(TEXT("HELLO_SERVER")))
+        {
+            if (bIsServer)
+            {
+                // 服务器收到 Hello 消息，记录日志。客户端通常已通过 UDP 数据包到达注册。
+                UE_LOG(LogAudioStreamWs, Log, TEXT("[Socket] Server received HELLO from %s. Client is already registered by UDP packet arrival."), *SenderInfo);
+                FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SocketServer"), TEXT("收到HELLO"), FString::Printf(TEXT("Received HELLO from Subsystem %s"), *SenderInfo));
+                // Optional: Send Welcome back
+                // SendToClient(SenderInfo, "WELCOME_CLIENT"); 
+            }
+        }
+        else 
+        {
+            // 处理测试包消息
+            if (ReceivedMsg.StartsWith(TEXT("TEST_PACKET")))
+            {
+                UE_LOG(LogAudioStreamWs, Log, TEXT("[Socket] Test packet received: %s"), *ReceivedMsg);
+                FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SocketData"), TEXT("测试包"), FString::Printf(TEXT("Test packet received: %s"), *ReceivedMsg));
+            }
+            
+            // 如果是服务器，标记需要转发此消息給其他客户端
+            if (bIsServer)
+            {
+                bShouldForward = true;
+            }
+        }
+    }
+    // 处理音频或图像类型的消息
+    else if (Header.Type == AudioStreamPacket::Audio || Header.Type == AudioStreamPacket::Image || Header.Type == AudioStreamPacket::Viseme)
+    {
+        // 音频/图像处理占位符，记录日志
+        UE_LOG(LogAudioStreamWs, Verbose, TEXT("[Socket] Binary packet received from %s (Seq=%d, Size=%d)"), *SenderInfo, Header.Seq, Payload.Num());
+        // 在message里写明收到的类型，和来源uuid
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("SocketData"),TEXT("收到二进制数据"), FString::Printf(TEXT("UUID=%s, Type=%d, Size=%d from %s"), 
+            Header.HasUuid() ? /*只保留前几位*/ *Header.Uuid.ToString(EGuidFormats::DigitsWithHyphens).Left(8) : TEXT("None"), Header.Type, Payload.Num(), *SenderInfo));
+        // 如果是服务器，标记需要转发此二进制数据
+        if (bIsServer)
+        {
+            bShouldForward = true;
+        }
+    }
+
+    // 如果是服务器且标记为需要转发，并且监听 socket 有效
+    if (bIsServer && bShouldForward && ListenSocket)
+    {
+        ForwardPacket(Data, SenderInfo);
+    }
+
+    // 如果有 UUID，尝试分发给组件
+    if (Header.HasUuid())
+    {
+        FString UuidStr = Header.Uuid.ToString(EGuidFormats::DigitsWithHyphens);
+        if (UAudioStreamHttpWsComponent* Comp = FindComponentByUuid(UuidStr))
+        {
+            Comp->ReceiveSocketMessage(Header, Payload);
+        }
+    }
+}
+
+void UAudioStreamHttpWsSubsystem::SendPacket(uint8 Type, const TArray<uint8>& Payload, const FGuid& Uuid)
+{
+    // Audio: pool by UUID, emit full frames, cache leftovers
+    if (Type == AudioStreamPacket::Audio)
+    {
+        const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
+        const int32 SampleRate = S ? S->DefaultSampleRate : 16000;
+        const int32 Channels   = S ? S->DefaultChannels   : 1;
+        const int32 FrameMs    = FMath::Max(1, FrameDurationMs);
+        const int32 BytesPerMs = ComputeBytesPerMs(SampleRate, Channels);
+        const int32 FrameBytes = BytesPerMs * FrameMs;
+
+        if (!Uuid.IsValid())
+        {
+            // 没有UUID无法为其建立独立缓冲，直接走单包发送（仍更新统计）
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Error, TEXT("SendPacket"), TEXT("无UUID"), TEXT("音频包无UUID，降级为单包发送"));
+            UpdateStats(Payload.Num(), SampleRate, Channels);
+        }
+        else if (FrameBytes > 0)
+        {
+            // 追加到该UUID的缓冲池
+            {
+                FScopeLock L(&AudioBufCS);
+                TArray<uint8>& Buf = AudioBufferMap.FindOrAdd(Uuid);
+                Buf.Append(Payload);
+            }
+
+            // 循环取整帧
+            while (true)
+            {
+                int32 Available = 0;
+                bool bHasBuf = false;
+                {
+                    FScopeLock L(&AudioBufCS);
+                    if (TArray<uint8>* BufPtr = AudioBufferMap.Find(Uuid))
+                    {
+                        Available = BufPtr->Num();
+                        bHasBuf = true;
+                    }
+                }
+                if (!bHasBuf || Available < FrameBytes) break;
+
+                // 取一帧数据并发送
+                TArray<uint8> FramePayload;
+                FramePayload.SetNumUninitialized(FrameBytes);
+                {
+                    FScopeLock L(&AudioBufCS);
+                    if (TArray<uint8>* BufPtr = AudioBufferMap.Find(Uuid))
+                    {
+                        FMemory::Memcpy(FramePayload.GetData(), BufPtr->GetData(), FrameBytes);
+                        // 移除已消费数据
+                        BufPtr->RemoveAt(0, FrameBytes, EAllowShrinking::No);
+                    }
+                    else
+                    {
+                        break; // 缓冲在期间被移除，退出
+                    }
+                }
+
+                // 统计
+                UpdateStats(FrameBytes, SampleRate, Channels);
+
+                // 打包并发送
+                TArray<uint8> Packet;
+                const FGuid* UuidPtr = &Uuid;
+                FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SendPacket"), TEXT("发送整帧音频"), FString::Printf(TEXT("Sending full audio frame (Size=%d bytes) for UUID=%s"), FrameBytes, *Uuid.ToString(EGuidFormats::DigitsWithHyphens)));
+                AudioStreamPacket::BuildPacket(Type, FramePayload, Packet, UuidPtr);
+
+                if (IsServer())
+                {
+                    ForwardPacket(Packet, TEXT(""));
+                }
+                else if (ClientConnectionSocket)
+                {
+                    int32 Sent = 0;
+                    ClientConnectionSocket->Send(Packet.GetData(), Packet.Num(), Sent);
+                }
+            }
+            return; // 已经按整帧发送，剩余不足帧的已缓存
+        }
+        else
+        {
+            // 无效帧配置，降级为单包发送
+            UpdateStats(Payload.Num(), SampleRate, Channels);
+        }
+    }
+
+    // 非音频或无法分帧：单包发送
+    TArray<uint8> Packet;
+    // 如果 UUID 有效（非零），则传递指针，否则传 nullptr
+    const FGuid* UuidPtr = Uuid.IsValid() ? &Uuid : nullptr;
+    AudioStreamPacket::BuildPacket(Type, Payload, Packet, UuidPtr);
+
+    if (IsServer())
+    {
+        // Server: 广播给所有客户端 (不排除任何人)
+        ForwardPacket(Packet, TEXT(""));
+    }
+    else
+    {
+        // Client: 发送给 Server
+        if (ClientConnectionSocket)
+        {
+            int32 Sent = 0;
+            ClientConnectionSocket->Send(Packet.GetData(), Packet.Num(), Sent);
+        }
+    }
+}
+
+void UAudioStreamHttpWsSubsystem::ForwardPacket(const TArray<uint8>& RawData, const FString& ExcludeClientKey)
+{
+    if (!IsServer() || !ListenSocket) return;
+
+    for (auto& Pair : ClientMap)
+    {
+        // 如果指定了排除的客户端 Key，则跳过
+        if (!ExcludeClientKey.IsEmpty() && Pair.Key == ExcludeClientKey) continue;
+
+        TSharedRef<FInternetAddr> ClientAddr = Pair.Value;
+        int32 Sent = 0;
+        ListenSocket->SendTo(RawData.GetData(), RawData.Num(), Sent, *ClientAddr);
+    }
+}
+
+void UAudioStreamHttpWsSubsystem::BroadcastTestPacket(uint8 PacketType)
+{
+    FGuid TestUuid = FGuid::NewGuid();
+    bool bUseUuid = false;
+
+    // If Audio, try to pick a registered component UUID
+    if (PacketType == AudioStreamPacket::Audio)
+    {
+        bUseUuid = true;
+        FScopeLock Lock(&UuidMapCS);
+        if (UuidComponentMap.Num() > 0)
+        {
+            // Pick random
+            int32 Index = FMath::RandRange(0, UuidComponentMap.Num() - 1);
+            int32 i = 0;
+            for (const auto& Pair : UuidComponentMap)
+            {
+                if (i == Index)
+                {
+                    FGuid::Parse(Pair.Key, TestUuid);
+                    break;
+                }
+                i++;
+            }
+        }
+    }
+
+    TArray<uint8> Payload;
+    
+    if (PacketType == AudioStreamPacket::Audio)
+    {
+        // Generate fake audio (100ms of sine wave)
+        // 16kHz, 1ch, 16bit -> 32000 bytes/sec -> 32 bytes/ms
+        // Let's send 100ms -> 3200 bytes
+        int32 SampleCount = 1600; // 100ms at 16kHz
+        Payload.SetNumUninitialized(SampleCount * 2);
+        int16* Ptr = (int16*)Payload.GetData();
+        for(int32 i=0; i<SampleCount; ++i)
+        {
+            // Simple sine wave 440Hz
+            float t = (float)i / 16000.0f;
+            float v = FMath::Sin(t * 440.0f * 2.0f * PI);
+            Ptr[i] = (int16)(v * 10000.0f);
+        }
+    }
+    else // Text or others
+    {
+        FString TestMsg;
+        if (IsServer())
+            TestMsg = FString::Printf(TEXT("TEST_PACKET_SERVER_TIME_%lld"), FDateTime::Now().ToUnixTimestamp());
+        else
+            TestMsg = FString::Printf(TEXT("TEST_PACKET_CLIENT_TIME_%lld"), FDateTime::Now().ToUnixTimestamp());
+            
+        FTCHARToUTF8 Utf8(*TestMsg);
+        Payload.Append((const uint8*)Utf8.Get(), Utf8.Length());
+    }
+
+    // 使用新的 SendPacket 方法
+    SendPacket(PacketType, Payload, bUseUuid ? TestUuid : FGuid());
+
+    FString UuidStr = bUseUuid ? TestUuid.ToString() : TEXT("None");
+    if (IsServer())
+    {
+        UE_LOG(LogAudioStreamWs, Log, TEXT("[Socket] Server broadcasted test packet (Type=%d, Size=%d, UUID=%s)"), PacketType, Payload.Num(), *UuidStr);
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("SocketServer"), TEXT("广播测试包"), FString::Printf(TEXT("Type: %d, Size: %d, UUID: %s"), PacketType, Payload.Num(), *UuidStr));
+    }
+    else
+    {
+        UE_LOG(LogAudioStreamWs, Log, TEXT("[Socket] Client sent test packet (Type=%d, Size=%d, UUID=%s)"), PacketType, Payload.Num(), *UuidStr);
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("SocketClient"), TEXT("发送测试包"), FString::Printf(TEXT("Type: %d, Size: %d, UUID: %s"), PacketType, Payload.Num(), *UuidStr));
+    }
+}
+
+
+
+
 

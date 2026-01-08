@@ -94,24 +94,21 @@ void UUDPHandler::StopUDPReceiver()
 
     bIsListening = false;
 
-
-    // Close the socket to unblock any pending Wait/Recv on receiver thread, but don't destroy yet 
-    if (ListenSocket)
-    {
-        ListenSocket->Close();
-    }
-
-    // Stop and delete the UDP receiver thread after unblocking
+    // Stop and delete the UDP receiver thread first.
+    // We rely on the short timeout (3ms) in FUdpSocketReceiver to exit the loop.
+    // Closing the socket while the thread is using it can cause issues/hangs on some platforms.
     if (UDPReceiver)
     {
+
         UDPReceiver->Stop();
         delete UDPReceiver;
         UDPReceiver = nullptr;
     }
 
-    // Now safely destroy the socket object
+    // Now safely close and destroy the socket object
     if (ListenSocket)
     {
+        ListenSocket->Close();
         ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(ListenSocket);
         ListenSocket = nullptr;
     }
@@ -122,6 +119,11 @@ void UUDPHandler::StopUDPReceiver()
 
 void UUDPHandler::OnUDPMessageReceived(const FArrayReaderPtr& ArrayReaderPtr, const FIPv4Endpoint& EndPt)
 {
+    if (!bIsListening)
+    {
+        return;
+    }
+
     if (!ArrayReaderPtr.IsValid())
     {
         return;
@@ -154,15 +156,19 @@ void UUDPHandler::OnUDPMessageReceived(const FArrayReaderPtr& ArrayReaderPtr, co
         ReceivedString = FString(UTF8_TO_TCHAR(reinterpret_cast<const char*>(Raw.GetData())));
     }
 
-    AsyncTask(ENamedThreads::GameThread, [this, Msg = MoveTemp(ReceivedString)]()
+    TWeakObjectPtr<UUDPHandler> WeakThis(this);
+    AsyncTask(ENamedThreads::GameThread, [WeakThis, Msg = MoveTemp(ReceivedString)]()
     {
-        if (OnDataReceived.IsBound())
+        if (UUDPHandler* StrongThis = WeakThis.Get())
         {
-            OnDataReceived.Broadcast(Msg);
-        }
-        if (OnDataReceivedDynamic.IsBound())
-        {
-            OnDataReceivedDynamic.Broadcast(Msg);
+            if (StrongThis->OnDataReceived.IsBound())
+            {
+                StrongThis->OnDataReceived.Broadcast(Msg);
+            }
+            if (StrongThis->OnDataReceivedDynamic.IsBound())
+            {
+                StrongThis->OnDataReceivedDynamic.Broadcast(Msg);
+            }
         }
     });
 }

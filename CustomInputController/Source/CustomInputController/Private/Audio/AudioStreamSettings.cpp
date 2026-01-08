@@ -11,7 +11,10 @@ void UAudioStreamSettings::PostInitProperties()
     Super::PostInitProperties();
     // Force load config to ensure values from DefaultGame.ini are applied early
     LoadConfig();
-    UE_LOG(LogTemp, Log, TEXT("[AudioStreamSettings] Loaded: DefaultServerIp=%s MediaUdpPort=%d DefaultWsHost=%s DefaultWsScheme=%s DefaultHttpRunPath=%s DefaultHttpStreamPath=%s DefaultHttpEndStreamPath=%s bStatsLiveLogDefault=%d"),
-        *DefaultServerIp, MediaUdpPort, *DefaultWsHost, *DefaultWsScheme, *DefaultHttpRunPath, *DefaultHttpStreamPath, *DefaultHttpEndStreamPath, bStatsLiveLogDefault?1:0);
-}
 
+    // Print only core, actively used settings to avoid clutter
+    UE_LOG(LogTemp, Log, TEXT("[AudioStreamSettings] Loaded: Ws=%s://%s%s SampleRate=%d Channels=%d FrameMs=%d StatsLive=%d"),
+        *DefaultWsScheme, *DefaultWsHost, *DefaultWsPathPrefix,
+        DefaultSampleRate, DefaultChannels, FrameDurationMs,
+        bStatsLiveLogDefault?1:0);
+}

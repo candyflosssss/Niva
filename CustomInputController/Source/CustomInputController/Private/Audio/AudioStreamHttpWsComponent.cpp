@@ -5,7 +5,6 @@
 #include "Engine/World.h"
 
 // CoreManager logging
-#include "Log/CoreLogSubsystem.h"
 #include "Log/CoreLogTypes.h"
 #include "Log/CoreLogHelpers.h"
 
@@ -117,14 +116,19 @@ static bool ExtractPcmFromMaybeWav_Local(const TArray<uint8>& InBytes, TArray<ui
     InOutSR = sr; InOutCH = ch; return true;
 }
 
+// TTS生成后的首次WebSocket消息处理
 void UAudioStreamHttpWsComponent::ProcessWebSocketMessage(const FString& Message)
 {
     TSharedPtr<FJsonObject> RootObj;
     const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Message);
     if (!FJsonSerializer::Deserialize(Reader, RootObj) || !RootObj.IsValid())
     {
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), TEXT("WS text parse failed (component)"));
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("首次接收处理"), TEXT("WS parse failed (component)"));
         return;
+    }
+    else
+    {
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("流数据处理"), TEXT("首次接收处理"), TEXT("WS parsed (component)"));
     }
 
     FString StatusStr;
@@ -137,9 +141,18 @@ void UAudioStreamHttpWsComponent::ProcessWebSocketMessage(const FString& Message
         }
     }
 
+    // 获取 type 字段
     FString Type; RootObj->TryGetStringField(TEXT("type"), Type);
-    FString MsgUuid; RootObj->TryGetStringField(TEXT("key"), MsgUuid); if (MsgUuid.IsEmpty()) RootObj->TryGetStringField(TEXT("role_id"), MsgUuid);
-    const FString Uuid = !MsgUuid.IsEmpty() ? MsgUuid : RegisteredUuid;
+    // 尝试从 key 或 role_id 字段获取 UUID,如果都没有则使用 RegisteredUuid
+    // FString MsgUuid; RootObj->TryGetStringField(TEXT("key"), MsgUuid); if (MsgUuid.IsEmpty()) RootObj->TryGetStringField(TEXT("role_id"), MsgUuid);
+    // const FString Uuid = !MsgUuid.IsEmpty() ? MsgUuid : RegisteredUuid;
+
+    // 暂时只用 RegisteredUuid
+    const FString Uuid = RegisteredUuid;
+    
+    // 准备 UUID (用于转发)
+    FGuid Guid;
+    FGuid::Parse(RegisteredUuid, Guid);
 
     if (Type.Equals(TEXT("audio"), ESearchCase::IgnoreCase))
     {
@@ -150,41 +163,125 @@ void UAudioStreamHttpWsComponent::ProcessWebSocketMessage(const FString& Message
         if (RootObj->TryGetNumberField(TEXT("channels"), Tmp)) CH = FMath::Clamp(Tmp, 1, 8);
 
         FString Base64; RootObj->TryGetStringField(TEXT("data"), Base64);
-        if (Base64.IsEmpty()) { FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), TEXT("WS audio dropped: empty base64 (component)")); return; }
-        TArray<uint8> Decoded; if (!FBase64::Decode(Base64, Decoded)) { FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), TEXT("WS audio base64 decode failed (component)")); return; }
-        TArray<uint8> Pcm; int32 UseSR = SR, UseCH = CH; const bool bWav = ExtractPcmFromMaybeWav_Local(Decoded, Pcm, UseSR, UseCH);
+        // Base64 数据为空
+        if (Base64.IsEmpty())
+        {
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), TEXT("WS audio dropped: empty base64 (component)"));
+            return;
+        }
+        // 解码 Base64 失败
+        TArray<uint8> Decoded;
+        if (!FBase64::Decode(Base64, Decoded))
+        {
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), TEXT("WS audio base64 decode failed (component)"));
+            return;
+        }
+        TArray<uint8> Pcm;
+        int32 UseSR = SR, UseCH = CH;
+        // 先尝试从 WAV 中提取 PCM
+        const bool bWav = ExtractPcmFromMaybeWav_Local(Decoded, Pcm, UseSR, UseCH);
         const int32 Bytes = bWav ? Pcm.Num() : Decoded.Num();
         FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("WS audio parsed (component) -> kind=%s uuid=%s bytes=%d sr=%d ch=%d"), bWav?TEXT("WAV"):TEXT("RAW"), *Uuid, Bytes, UseSR, UseCH));
-        // 后续：转发到播放/队列/统计，先注释
-        if (UGameInstance* GI = GetWorld()?GetWorld()->GetGameInstance():nullptr) { if (auto* SS = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>()) { SS->UpdateStats(Bytes, UseSR, UseCH); } }
+
+        const TArray<uint8>& FinalPayload = bWav ? Pcm : Decoded;
+
+        // 转发到 Socket
+        if (UGameInstance* GI = GetWorld() ? GetWorld()->GetGameInstance() : nullptr)
+        {
+            if (UAudioStreamHttpWsSubsystem* SS = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>())
+            {
+                // 发送解码后的 PCM 数据
+                SS->SendPacket(AudioStreamPacket::Audio, FinalPayload, Guid);
+                SS->UpdateStats(Bytes, UseSR, UseCH);
+
+                // 临时移除，数据应经由子系统处理后再分发
+                
+                // // 额外转发给自己一份
+                // AudioStreamPacket::FHeader Header;
+                // Header.Type = AudioStreamPacket::Audio;
+                // Header.Flags = 0x01; // HasUuid
+                // Header.Uuid = Guid;
+                // Header.Seq = ++LocalAudioSeq;
+                // ReceiveSocketMessage(Header, FinalPayload);
+            }
+        }
     }
     else if (Type.Equals(TEXT("text"), ESearchCase::IgnoreCase))
     {
         FString Text; RootObj->TryGetStringField(TEXT("data"), Text);
         FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("WS text (component) for uuid=%s: %s"), *Uuid, *Text));
-        // 后续：事件分发，先注释
-        // ...
+        
+        // 转发到 Socket
+        if (UGameInstance* GI = GetWorld() ? GetWorld()->GetGameInstance() : nullptr)
+        {
+            if (UAudioStreamHttpWsSubsystem* SS = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>())
+            {
+                FTCHARToUTF8 Utf8(*Text);
+                TArray<uint8> Payload;
+                Payload.Append((const uint8*)Utf8.Get(), Utf8.Length());
+                
+                SS->SendPacket(AudioStreamPacket::Text, Payload, Guid);
+
+                // 额外转发给自己一份
+                // AudioStreamPacket::FHeader Header;
+                // Header.Type = AudioStreamPacket::Text;
+                // Header.Flags = 0x01; // HasUuid
+                // Header.Uuid = Guid;
+                // ReceiveSocketMessage(Header, Payload);
+            }
+        }
     }
     else if (Type.Equals(TEXT("viseme"), ESearchCase::IgnoreCase))
     {
+        // 第一步：解析 viseme 数组
+        TArray<int32> Vis; 
         const TArray<TSharedPtr<FJsonValue>>* ArrPtr = nullptr;
         if (!RootObj->TryGetArrayField(TEXT("data"), ArrPtr) || !ArrPtr)
         {
-            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), TEXT("WS viseme dropped: no array (component)"));
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("Audio处理"), TEXT("WS viseme dropped: no array"));
             return;
         }
-        TArray<int32> Vis; Vis.Reserve(ArrPtr->Num());
+        // 从 JSON 数组中提取整数 viseme 数据
+        Vis.Reserve(ArrPtr->Num());
         for (const auto& V : *ArrPtr) { int32 Val=0; if (V->TryGetNumber(Val)) Vis.Add(Val); }
+        
+        // 第二步：解析 confidence 数组
         TArray<float> Confidence;
         const TArray<TSharedPtr<FJsonValue>>* ConfPtr = nullptr;
         if (RootObj->TryGetArrayField(TEXT("confidence"), ConfPtr) && ConfPtr)
         {
             Confidence.Reserve(ConfPtr->Num());
-            for (const auto& C : *ConfPtr) { double D=0.0; if (C->TryGetNumber(D)) Confidence.Add((float)D); }
+            for (const auto& C : *ConfPtr)
+            {
+                double D=0.0;
+                if (C->TryGetNumber(D)) Confidence.Add((float)D);
+            }
         }
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("WS viseme (component) -> n=%d uuid=%s confN=%d"), Vis.Num(), *Uuid, Confidence.Num()));
-        // 后续：统计/驱动动画，先注释
-        // if (UGameInstance* GI = GetWorld()?GetWorld()->GetGameInstance():nullptr) { if (auto* SS = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>()) { SS->UpdateVisemeStats(Vis.Num()); } }
+        //控制uuid输出为前8位
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("流数据处理"), TEXT("Viseme处理"), FString::Printf(TEXT("WS viseme -> n=%d confN=%d uuid=%s "), Vis.Num(), Confidence.Num(),/*取前八位*/ *Uuid.Left(8)));
+        // 转发到 Socket
+        if (UGameInstance* GI = GetWorld() ? GetWorld()->GetGameInstance() : nullptr)
+        {
+            if (UAudioStreamHttpWsSubsystem* SS = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>())
+            {
+                // TODO:感觉这个viseme的序列化有点问题,后续需要重新设计viseme的标准格式
+                // 序列化 Viseme 数据: [NumVis:4][VisData...][NumConf:4][ConfData...]
+                TArray<uint8> Payload;
+                FMemoryWriter Writer(Payload);
+                Writer << Vis;
+                Writer << Confidence;
+                
+                SS->SendPacket(AudioStreamPacket::Viseme, Payload, Guid);
+                SS->UpdateVisemeStats(Vis.Num());
+
+                // // 额外转发给自己一份
+                // AudioStreamPacket::FHeader Header;
+                // Header.Type = AudioStreamPacket::Viseme;
+                // Header.Flags = 0x01; // HasUuid
+                // Header.Uuid = Guid;
+                // ReceiveSocketMessage(Header, Payload);
+            }
+        }
     }
     else
     {
@@ -194,13 +291,16 @@ void UAudioStreamHttpWsComponent::ProcessWebSocketMessage(const FString& Message
 
 UAudioStreamHttpWsComponent::UAudioStreamHttpWsComponent()
 {
-    PrimaryComponentTick.bCanEverTick = false;
+    PrimaryComponentTick.bCanEverTick = true;
     SetIsReplicatedByDefault(true);
 }
 
 void UAudioStreamHttpWsComponent::BeginPlay()
 {
     Super::BeginPlay();
+    
+    InitAudioComponents();
+
     // 仅在服务器上触发服务器RPC（客户端无需主动调用）
     if (ComponentHasServerAuthority(this))
     {
@@ -248,7 +348,7 @@ void UAudioStreamHttpWsComponent::RegisterToSubsystem_Implementation()
 
     // 服务器上：如果已存在UUID，尝试携带UUID注册，否则由服务器分配
     FString OutUuid;
-    bool bOk = false;
+    bool bOk;
     if (!RegisteredUuid.IsEmpty())
     {
         bOk = Subsys->RegisterComponentWithUuid(this, RegisteredUuid, OutUuid);
@@ -316,8 +416,30 @@ void UAudioStreamHttpWsComponent::StartRunAndConnect(const FString& ServerHostWi
     // 记住会话信息
     ActiveHttpHost = ServerHostWithPort;
     bActiveUseHttps = bUseHttps;
-    ActiveWsSampleRate = SampleRate;
-    ActiveWsChannels = Channels;
+    ActiveWsSampleRate = (SampleRate > 0) ? SampleRate : 16000;
+    ActiveWsChannels = (Channels > 0) ? Channels : 1;
+
+    // 总是重新初始化音频组件以清除旧缓冲
+    // 停止播放
+    if (AudioPlayer)
+    {
+        AudioPlayer->Stop();
+        AudioPlayer->SetSound(nullptr);
+    }
+    
+    // 重新创建 SoundStream
+    SoundStream = NewObject<USoundWaveProcedural>(this);
+    SoundStream->SetSampleRate(ActiveWsSampleRate);
+    SoundStream->NumChannels = ActiveWsChannels;
+    SoundStream->Duration = 1000000.0f;
+    SoundStream->bLooping = false;
+    SoundStream->bProcedural = true;
+
+    // 更新 AudioPlayer
+    if (AudioPlayer)
+    {
+        AudioPlayer->SetSound(SoundStream);
+    }
 
     // 保存当前会话的路径，以便重连时复用
     ActiveHttpRunPath = HttpRunPath;
@@ -327,6 +449,13 @@ void UAudioStreamHttpWsComponent::StartRunAndConnect(const FString& ServerHostWi
     bManualClose = false;
     // 从新启动时重置尝试计数
     ReconnectAttempts = 0;
+
+    // 重置播放状态
+    bIsPlaying = false;
+    LastPlayedSeq = 0;
+    LocalAudioSeq = 0;
+    AudioPacketQueue.Empty();
+    TotalAudioFedDuration = 0.0;
 
     // 把 /run 请求逻辑分离为 RequestRunTask
     RequestRunTask(ServerHostWithPort, CallbackUrl, TargetUuid, SampleRate, Channels, bUseHttps, HttpRunPath, WsPathPrefix);
@@ -647,3 +776,246 @@ void UAudioStreamHttpWsComponent::UnregisterFromSubsystem()
     }
     bRegistered = false;
 }
+
+void UAudioStreamHttpWsComponent::ReceiveSocketMessage(const AudioStreamPacket::FHeader& Header, const TArray<uint8>& Payload)
+{
+    if (Header.Type == AudioStreamPacket::Audio)
+    {
+        // type用文本写明，而不是数字！
+        auto GetPacketTypeName = [](uint8 InType) -> const TCHAR*
+        {
+            switch (InType)
+            {
+            case AudioStreamPacket::Text:    return TEXT("Text");
+            case AudioStreamPacket::Audio:   return TEXT("Audio");
+            case AudioStreamPacket::Image:   return TEXT("Image");
+            case AudioStreamPacket::Control: return TEXT("Control");
+            case AudioStreamPacket::Viseme:  return TEXT("Viseme");
+            default:                         return TEXT("Unknown");
+            }
+        };
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("流数据处理"), TEXT("Socket接收"), FString::Printf(TEXT("received socket msg type=%s size=%d"), GetPacketTypeName(Header.Type), Payload.Num()));
+
+        // 自动重置逻辑更新：
+        // 如果收到 Seq=0 或者极小的 Seq (<=1) 且当前播放进度明显靠后 (>10)，则认为是新流开始
+        // 注意：Websocket 接收时现已使用 LocalAudioSeq (从1开始)，所以 Seq=1 也是可能的重置信号
+        bool bIsRestart = (Header.Seq == 0) || (Header.Seq == 1 && LastPlayedSeq > 10);
+
+        if (bIsPlaying && !bPendingStreamReset && bIsRestart)
+        {
+            // 标记重置
+            bPendingStreamReset = true;
+            
+            // 立即清空队列
+            AudioPacketQueue.Empty();
+            
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流数据处理"), TEXT("Socket接收"), 
+                FString::Printf(TEXT("Stream reset detected (Seq=%d), scheduled reset. Previous LastSeq=%d"), Header.Seq, LastPlayedSeq));
+        }
+
+        // 丢弃过时包 (仅当已开始播放且有历史记录时才检查)
+        // 如果正在等待重置，则不丢弃任何包（视为新流的开始）
+        if (bIsPlaying && !bPendingStreamReset && Header.Seq <= LastPlayedSeq)
+        {
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("调试"), TEXT("Discard"),
+                FString::Printf(TEXT("Discarding Seq=%d because <= LastPlayedSeq=%d"), Header.Seq, LastPlayedSeq));
+            return;
+        }
+
+        // 插入排序
+        FAudioPacketBuffer NewPacket;
+        NewPacket.Seq = Header.Seq;
+        NewPacket.Data = Payload;
+
+        bool bInserted = false;
+        for (int32 i = 0; i < AudioPacketQueue.Num(); ++i)
+        {
+            if (AudioPacketQueue[i].Seq == NewPacket.Seq)
+            {
+                // 重复包，忽略
+                FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("调试"), TEXT("Duplicate"), FString::Printf(TEXT("Ignoring Duplicate Seq=%d"), NewPacket.Seq));
+                return;
+            }
+            if (AudioPacketQueue[i].Seq > NewPacket.Seq)
+            {
+                AudioPacketQueue.Insert(NewPacket, i);
+                bInserted = true;
+                break;
+            }
+        }
+        if (!bInserted)
+        {
+            AudioPacketQueue.Add(NewPacket);
+        }
+
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("调试"), TEXT("QueueStatus"), FString::Printf(TEXT("QueueSize=%d AddedSeq=%d"), AudioPacketQueue.Num(), NewPacket.Seq));
+    }
+}
+
+void UAudioStreamHttpWsComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
+{
+    Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+
+    // 处理延迟的流重置
+    if (bPendingStreamReset)
+    {
+        bPendingStreamReset = false;
+
+        bIsPlaying = false;
+        LastPlayedSeq = 0;
+        TotalAudioFedDuration = 0.0;
+
+        // 安全地重建 SoundStream
+        if (AudioPlayer)
+        {
+            AudioPlayer->Stop();
+            AudioPlayer->SetSound(nullptr);
+        }
+
+        SoundStream = NewObject<USoundWaveProcedural>(this);
+        SoundStream->SetSampleRate(ActiveWsSampleRate);
+        SoundStream->NumChannels = ActiveWsChannels;
+        SoundStream->Duration = 1000000.0f;
+        SoundStream->bLooping = false;
+        SoundStream->bProcedural = true;
+
+        if (AudioPlayer)
+        {
+            AudioPlayer->SetSound(SoundStream);
+        }
+
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流数据处理"), TEXT("播放控制"), TEXT("Stream reset executed in Tick"));
+    }
+
+    FeedAudio();
+}
+
+void UAudioStreamHttpWsComponent::InitAudioComponents()
+{
+    if (ActiveWsSampleRate <= 0) ActiveWsSampleRate = 16000;
+    if (ActiveWsChannels <= 0) ActiveWsChannels = 1;
+
+    if (!SoundStream)
+    {
+        SoundStream = NewObject<USoundWaveProcedural>(this);
+        SoundStream->SetSampleRate(ActiveWsSampleRate);
+        SoundStream->NumChannels = ActiveWsChannels;
+        SoundStream->Duration = 1000000.0f; // Very long duration
+        SoundStream->bLooping = false;
+        SoundStream->bProcedural = true;
+    }
+
+    if (!AudioPlayer)
+    {
+        AudioPlayer = NewObject<UAudioComponent>(this);
+        AudioPlayer->bAutoActivate = false;
+        AudioPlayer->SetSound(SoundStream);
+        AudioPlayer->RegisterComponent();
+    }
+    else if (AudioPlayer->GetSound() != SoundStream)
+    {
+        AudioPlayer->SetSound(SoundStream);
+    }
+}
+
+void UAudioStreamHttpWsComponent::FeedAudio()
+{
+    if (!SoundStream || !AudioPlayer) return;
+
+    // 1. Check if we need to start playing
+    if (!bIsPlaying)
+    {
+        if (AudioPacketQueue.Num() == 0) return;
+
+        // Calculate total duration in queue
+        int32 TotalBytes = 0;
+        for (const auto& Pkt : AudioPacketQueue)
+        {
+            TotalBytes += Pkt.Data.Num();
+        }
+
+        const int32 BytesPerSample = sizeof(int16); // Assuming 16-bit
+        const int32 NumSamples = TotalBytes / (ActiveWsChannels * BytesPerSample);
+        const float Duration = (float)NumSamples / (float)ActiveWsSampleRate;
+
+        // Condition: Packet count threshold OR Duration threshold
+        // If packets are large, Duration threshold will trigger first.
+        // If packets are small, Packet count threshold might trigger first.
+        // We use a small minimum duration to avoid starting with just a tiny blip.
+        const float MinStartDuration = 0.1f;
+
+        bool bCanStart = (AudioPacketQueue.Num() >= JitterBufferThreshold) || (Duration >= TargetBufferedTime) || (Duration >= MinStartDuration && AudioPacketQueue.Num() >= 1);
+
+        // Debug info for buffering (only periodically or on change to avoid spam, but for deep debug print every few frames or use Info)
+        // Here we just print if it fails to start but has queue
+        if (!bCanStart)
+        {
+            static double LastLogTime = 0;
+            double Now = FPlatformTime::Seconds();
+            if (Now - LastLogTime > 1.0)
+            {
+                LastLogTime = Now;
+                FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("调试"), TEXT("Buffering"),
+                    FString::Printf(TEXT("Buffering... Queue=%d Duration=%.3f (Req: Thresh=%d or Time=%.2f)"),
+                    AudioPacketQueue.Num(), Duration, JitterBufferThreshold, TargetBufferedTime));
+            }
+        }
+
+        if (bCanStart)
+        {
+            bIsPlaying = true;
+            PlaybackStartTime = FPlatformTime::Seconds();
+            TotalAudioFedDuration = 0.0;
+
+            if (!AudioPlayer->IsPlaying())
+            {
+                AudioPlayer->Play();
+            }
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("播放控制"), FString::Printf(TEXT("Start playing: buffered %d pkts, %.2fs"), AudioPacketQueue.Num(), Duration));
+        }
+        else
+        {
+            // Buffering...
+            return;
+        }
+    }
+
+    // 2. Feed data
+    if (bIsPlaying && AudioPacketQueue.Num() > 0)
+    {
+        // Feed all available packets
+        int32 FedBytes = 0;
+        int32 FedPackets = 0;
+        int32 LastFeedSeq = -1;
+
+        while (AudioPacketQueue.Num() > 0)
+        {
+            FAudioPacketBuffer& Pkt = AudioPacketQueue[0];
+
+            if (Pkt.Data.Num() > 0)
+            {
+                SoundStream->QueueAudio(Pkt.Data.GetData(), Pkt.Data.Num());
+                FedBytes += Pkt.Data.Num();
+                FedPackets++;
+                LastPlayedSeq = Pkt.Seq;
+                LastFeedSeq = Pkt.Seq;
+            }
+
+            AudioPacketQueue.RemoveAt(0);
+        }
+
+        if (FedBytes > 0)
+        {
+             const int32 BytesPerSample = sizeof(int16);
+             const int32 NumSamples = FedBytes / (ActiveWsChannels * BytesPerSample);
+             const float Duration = (float)NumSamples / (float)ActiveWsSampleRate;
+             TotalAudioFedDuration += Duration;
+
+             FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("调试"), TEXT("FedAudio"),
+                FString::Printf(TEXT("Fed %d bytes (%d pkts) to SoundStream. LastSeq=%d AddedDuration=%.3f"), FedBytes, FedPackets, LastFeedSeq, Duration));
+        }
+    }
+}
+
+
+

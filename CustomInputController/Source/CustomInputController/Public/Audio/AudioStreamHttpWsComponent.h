@@ -4,9 +4,23 @@
 #include "Components/ActorComponent.h"
 // HTTP request typedef (FHttpRequestPtr)
 #include "Interfaces/IHttpRequest.h"
+#include "Audio/AudioStreamHttpWsSubsystem.h" // Include for AudioStreamPacket::FHeader
+#include "Sound/SoundWaveProcedural.h"
+#include "Components/AudioComponent.h"
 #include "AudioStreamHttpWsComponent.generated.h"
 
 class UAudioStreamHttpWsSubsystem;
+
+struct FAudioPacketBuffer
+{
+    uint32 Seq;
+    TArray<uint8> Data;
+
+    bool operator<(const FAudioPacketBuffer& Other) const
+    {
+        return Seq < Other.Seq;
+    }
+};
 
 /**
  * 组件版：每个挂载它的角色都可独立播放自己的流式音频。
@@ -58,6 +72,19 @@ public:
     // 在组件里解析 WebSocket 文本消息（仅解析，后续的转发/播放先注释）
     void ProcessWebSocketMessage(const FString& Message);
 
+    // 接收来自 Socket 的消息（由 Subsystem 分发）
+    void ReceiveSocketMessage(const AudioStreamPacket::FHeader& Header, const TArray<uint8>& Payload);
+
+    // 抖动缓冲包数量（收到多少包后开始播放）
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AudioStream|Playback")
+    int32 JitterBufferThreshold = 3;
+
+    // 目标缓冲时间（秒），用于控制向SoundWave投递的速度
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AudioStream|Playback")
+    float TargetBufferedTime = 0.2f;
+
+    virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
+
 private:
     // 注册态
     bool bRegistered = false;
@@ -103,4 +130,28 @@ private:
     // Schedule cancelable reconnect attempt
     void ScheduleReconnect();
     void CancelReconnect();
+
+    // 音频缓冲队列
+    TArray<FAudioPacketBuffer> AudioPacketQueue;
+    uint32 LastPlayedSeq = 0;
+    
+    // 播放时间追踪
+    double PlaybackStartTime = 0.0;
+    double TotalAudioFedDuration = 0.0;
+    bool bIsPlaying = false;
+    
+    // 标记是否需要重置音频流（在Tick中处理）
+    bool bPendingStreamReset = false;
+
+    // 本地生成的音频序列号（用于WebSocket接收到的无序包）
+    uint32 LocalAudioSeq = 0;
+
+    UPROPERTY()
+    USoundWaveProcedural* SoundStream;
+
+    UPROPERTY()
+    UAudioComponent* AudioPlayer;
+
+    void FeedAudio();
+    void InitAudioComponents();
 };

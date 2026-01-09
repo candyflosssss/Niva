@@ -51,7 +51,7 @@ public:
 
     // 单帧PCM时长（毫秒），用于分帧组包（已使用）
     UPROPERTY(EditAnywhere, Config, Category="Sync", meta=(ToolTip="单帧PCM时长（毫秒），影响分帧组包"))
-    int32 FrameDurationMs = 50;
+    int32 FrameDurationMs = 20;
     
     // ========== 调试与日志 ==========
     // 日志

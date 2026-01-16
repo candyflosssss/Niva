@@ -79,23 +79,24 @@ private:
 	/**
 	 * @brief 表示HTTP请求对象。
 	 *
-	 * 该变量封装了与HTTP请求相关的详细信息和数据，包括请求头、
-	 * 方法、URL和主体。它作为管理和访问HTTP请求信息的结构化方式。
+	 * 改变量 encapsulates the details and data associated with an HTTP request,
+	 * including headers, method, URL, and body. It serves as a structured
+	 * way to manage and access HTTP request information.
 	 */
-	TSharedPtr<IHttpRequest> HttpRequest = FHttpModule::Get().CreateRequest();
+	FHttpRequestPtr HttpRequest = FHttpModule::Get().CreateRequest();
 
 
 	/**
-	 * @brief 处理并获取HTTP请求对象。
+	 * @brief Process and obtain the HTTP request object.
 	 *
-	 * 此方法负责处理和返回HTTP请求。
-	 * 它便于从传入流中提取请求详细信息。
+	 * This method is responsible for handling and returning the HTTP request.
+	 * It facilitates the extraction of request details from incoming streams.
 	 *
-	 * @return 表示HTTP请求的对象，包含所有必要的
-	 *         请求头、主体和进一步处理所需的元数据。
+	 * @return An object representing the HTTP request, which contains all necessary
+	 *         headers, body, and metadata required for further processing.
 	 */
 public:
-	TSharedPtr<IHttpRequest> getHttpRequest() {
+	FHttpRequestPtr getHttpRequest() {
 		//if (HttpRequest.IsValid() == false)
 		//{
 		//	HttpRequest = FHttpModule::Get().CreateRequest();

@@ -27,6 +27,24 @@
 #include "Log/CoreLogTypes.h"
 #include "Log/CoreLogHelpers.h"
 
+// 可选：Opus 编码集成（需要在工程中集成 libopus 并定义 CUSTOMINPUT_USE_OPUS）
+#if defined(CUSTOMINPUT_USE_OPUS)
+#include "opus.h"
+static inline bool UE_OpusInitEncoder(int32 SampleRate, int32 Channels, int32 Bitrate, int32 Complexity, bool bUseFEC, int32 PacketLossPct, OpusEncoder** Out)
+{
+    int Error = 0;
+    OpusEncoder* Enc = opus_encoder_create(SampleRate, Channels, OPUS_APPLICATION_AUDIO, &Error);
+    if (!Enc || Error != OPUS_OK) return false;
+    opus_encoder_ctl(Enc, OPUS_SET_BITRATE(Bitrate));
+    opus_encoder_ctl(Enc, OPUS_SET_COMPLEXITY(Complexity));
+    opus_encoder_ctl(Enc, OPUS_SET_INBAND_FEC(bUseFEC ? 1 : 0));
+    opus_encoder_ctl(Enc, OPUS_SET_PACKET_LOSS_PERC(FMath::Clamp(PacketLossPct, 0, 100)));
+    *Out = Enc;
+    return true;
+}
+static inline void UE_OpusDestroyEncoder(OpusEncoder* Enc){ if (Enc) opus_encoder_destroy(Enc); }
+#endif
+
 // Helper: compute PCM16 bytes per ms for framing
 static inline int32 ComputeBytesPerMs(int32 SampleRate, int32 Channels)
 {
@@ -130,8 +148,8 @@ void UAudioStreamHttpWsSubsystem::Initialize(FSubsystemCollectionBase& Collectio
     Super::Initialize(Collection);
     // 配置加载
     LoadSettings();
-    UE_LOG(LogTemp, Log, TEXT("[AudioStream] Initialize: mode=%s, UDP=%d, frame_ms=%d, preroll_ms=%d, jitter_ms=%d, viseme_step=%d, kf_ms=%d, hb_ms=%d, offsetAlpha=%.3f, statsLive=%d"),
-        IsServer()?TEXT("Server"):TEXT("Client"), MediaUdpPort, FrameDurationMs, TargetPreRollMs, TargetJitterMs, VisemeStepMs, VisemeKeyframeIntervalMs, HeartbeatIntervalMs, OffsetLerpAlpha, bStatsLiveLog?1:0);
+    UE_LOG(LogTemp, Log, TEXT("[AudioStream] Initialize: mode=%s, UDP=%d, frame_ms=%d, viseme_step=%d, kf_ms=%d, hb_ms=%d, offsetAlpha=%.3f, statsLive=%d"),
+        IsServer()?TEXT("Server"):TEXT("Client"), MediaUdpPort, FrameDurationMs, VisemeStepMs, VisemeKeyframeIntervalMs, HeartbeatIntervalMs, OffsetLerpAlpha, bStatsLiveLog?1:0);
     
     // if (IsServer())
     // {
@@ -151,6 +169,19 @@ void UAudioStreamHttpWsSubsystem::Deinitialize()
         FScopeLock L(&AudioBufCS);
         AudioBufferMap.Empty();
     }
+
+    // 释放 Opus 编码器
+#if defined(CUSTOMINPUT_USE_OPUS)
+    {
+        FScopeLock L(&OpusCS);
+        for (auto& Pair : OpusEncoders)
+        {
+            OpusEncoder* Enc = (OpusEncoder*)Pair.Value.Encoder;
+            UE_OpusDestroyEncoder(Enc);
+        }
+        OpusEncoders.Empty();
+    }
+#endif
 
     UuidComponentMap.Empty();
     Super::Deinitialize();
@@ -382,8 +413,6 @@ void UAudioStreamHttpWsSubsystem::LoadSettings()
     const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
     if (!S) return;
     FrameDurationMs = S->FrameDurationMs;
-    TargetPreRollMs = S->TargetPreRollMs;
-    TargetJitterMs = S->TargetJitterMs;
     bStatsLiveLog = S->bStatsLiveLogDefault;
 }
 
@@ -643,7 +672,7 @@ void UAudioStreamHttpWsSubsystem::HandleSocketData(const TArray<uint8>& Data, co
         FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("SocketData"), TEXT("解析失败"), FString::Printf(TEXT("Failed to parse packet from %s (len=%d)"), *SenderInfo, Data.Num()));
         return;
     }
-    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SocketData"), TEXT("服务器接收"), FString::Printf(/*type用实际文本*/TEXT("Parsed packet from %s (Type=%s, Seq=%d, Size=%d)"), 
+    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SocketData"), TEXT("子系统接收"), FString::Printf(/*type用实际文本*/TEXT("Parsed packet from %s (Type=%s, Seq=%d, Size=%d)"), 
         *SenderInfo, Header.GetTypeName(), Header.Seq, Payload.Num()));
     // 标记是否需要转发该消息（仅在作为服务器时有效）
     bool bShouldForward = false;
@@ -763,7 +792,7 @@ void UAudioStreamHttpWsSubsystem::SendPacket(uint8 Type, const TArray<uint8>& Pa
                 }
                 if (!bHasBuf || Available < FrameBytes) break;
 
-                // 取一帧数据并发送
+                // 取一帧 PCM16 数据
                 TArray<uint8> FramePayload;
                 FramePayload.SetNumUninitialized(FrameBytes);
                 {
@@ -780,23 +809,99 @@ void UAudioStreamHttpWsSubsystem::SendPacket(uint8 Type, const TArray<uint8>& Pa
                     }
                 }
 
-                // 统计
+                // 统计（按原始PCM字节）
                 UpdateStats(FrameBytes, SampleRate, Channels);
 
-                // 打包并发送
-                TArray<uint8> Packet;
-                const FGuid* UuidPtr = &Uuid;
-                FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SendPacket"), TEXT("发送整帧音频"), FString::Printf(TEXT("Sending full audio frame (Size=%d bytes) for UUID=%s"), FrameBytes, *Uuid.ToString(EGuidFormats::DigitsWithHyphens)));
-                AudioStreamPacket::BuildPacket(Type, FramePayload, Packet, UuidPtr);
+                // 若启用 Opus，则进行编码
+                bool bEncodedWithOpus = false;
+#if defined(CUSTOMINPUT_USE_OPUS)
+                if (S && S->bEnableOpus)
+                {
+                    // 准备/获取编码器
+                    OpusEncoder* Encoder = nullptr;
+                    {
+                        FScopeLock L(&OpusCS);
+                        FOpusEncoderState& ES = OpusEncoders.FindOrAdd(Uuid);
+                        bool bNeedInit = (ES.Encoder == nullptr) || (ES.LastSampleRate != SampleRate) || (ES.LastChannels != Channels);
+                        if (bNeedInit)
+                        {
+                            if (ES.Encoder)
+                            {
+                                UE_OpusDestroyEncoder((OpusEncoder*)ES.Encoder);
+                                ES.Encoder = nullptr;
+                            }
+                            OpusEncoder* NewEnc = nullptr;
+                            const bool bOk = UE_OpusInitEncoder(SampleRate, Channels, S->OpusBitrate, S->OpusComplexity, S->bOpusUseFEC, S->OpusPacketLossPct, &NewEnc);
+                            if (bOk)
+                            {
+                                ES.Encoder = NewEnc;
+                                ES.LastSampleRate = SampleRate;
+                                ES.LastChannels = Channels;
+                            }
+                            else
+                            {
+                                UE_LOG(LogAudioStreamWs, Warning, TEXT("[Opus] Failed to init encoder (sr=%d ch=%d), fallback to PCM"), SampleRate, Channels);
+                            }
+                        }
+                        Encoder = (OpusEncoder*)ES.Encoder;
+                    }
 
-                if (IsServer())
-                {
-                    ForwardPacket(Packet, TEXT(""));
+                    if (Encoder)
+                    {
+                        // Opus 输入为 16-bit samples，计算样本数
+                        const int32 SamplesPerFrame = (FrameBytes / 2) / FMath::Max(1, Channels); // per channel? Opus expects interleaved total samples per channel
+                        // 实际上传递总样本数（每通道样本数），输入缓冲为 interleaved PCM16
+                        const opus_int16* Pcm = (const opus_int16*)FramePayload.GetData();
+                        // Opus 输出最大长度建议：帧时长相关，这里给出一个安全上限
+                        // 由官方建议：最大包 ~1275 bytes；我们给 4096 以确保安全
+                        TArray<uint8> EncBuf;
+                        EncBuf.SetNumUninitialized(4096);
+                        const int32 EncBytes = opus_encode(Encoder, Pcm, SamplesPerFrame, EncBuf.GetData(), EncBuf.Num());
+                        if (EncBytes > 0)
+                        {
+                            EncBuf.SetNum(EncBytes, EAllowShrinking::Yes);
+                            TArray<uint8> Packet;
+                            const FGuid* UuidPtr = &Uuid;
+                            // 为了与解码端区分，这里仍用 Audio 类型，但需要在组件侧知道负载是 Opus
+                            // 可选：在 Flags 中扩展标志位；当前先走约定：组件按设置 bEnableOpus 解码
+                            AudioStreamPacket::BuildPacket(Type, EncBuf, Packet, UuidPtr);
+                            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SendPacket"), TEXT("发送Opus帧"), FString::Printf(TEXT("UUID=%s EncBytes=%d PCM=%d"), *Uuid.ToString(), EncBytes, FrameBytes));
+
+                            if (IsServer())
+                            {
+                                ForwardPacket(Packet, TEXT(""));
+                            }
+                            else if (ClientConnectionSocket)
+                            {
+                                int32 Sent = 0;
+                                ClientConnectionSocket->Send(Packet.GetData(), Packet.Num(), Sent);
+                            }
+                            bEncodedWithOpus = true;
+                        }
+                        else
+                        {
+                            UE_LOG(LogAudioStreamWs, Warning, TEXT("[Opus] encode failed (%d), fallback to PCM"), EncBytes);
+                        }
+                    }
                 }
-                else if (ClientConnectionSocket)
+#endif
+                if (!bEncodedWithOpus)
                 {
-                    int32 Sent = 0;
-                    ClientConnectionSocket->Send(Packet.GetData(), Packet.Num(), Sent);
+                    // 打包并发送原始 PCM 帧
+                    TArray<uint8> Packet;
+                    const FGuid* UuidPtr = &Uuid;
+                    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SendPacket"), TEXT("发送整帧音频"), FString::Printf(TEXT("Sending full audio frame (Size=%d bytes) for UUID=%s"), FrameBytes, *Uuid.ToString(EGuidFormats::DigitsWithHyphens)));
+                    AudioStreamPacket::BuildPacket(Type, FramePayload, Packet, UuidPtr);
+
+                    if (IsServer())
+                    {
+                        ForwardPacket(Packet, TEXT(""));
+                    }
+                    else if (ClientConnectionSocket)
+                    {
+                        int32 Sent = 0;
+                        ClientConnectionSocket->Send(Packet.GetData(), Packet.Num(), Sent);
+                    }
                 }
             }
             return; // 已经按整帧发送，剩余不足帧的已缓存
@@ -917,6 +1022,7 @@ void UAudioStreamHttpWsSubsystem::BroadcastTestPacket(uint8 PacketType)
         FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("SocketClient"), TEXT("发送测试包"), FString::Printf(TEXT("Type: %d, Size: %d, UUID: %s"), PacketType, Payload.Num(), *UuidStr));
     }
 }
+
 
 
 

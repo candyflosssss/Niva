@@ -493,7 +493,7 @@ URefreshMCPClientAsyncAction* URefreshMCPClientAsyncAction::RefreshMCPClient(UOb
 
 void URefreshMCPClientAsyncAction::Activate()
 {
-    TSharedRef<IHttpRequest> Request = FHttpModule::Get().CreateRequest();
+    TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Request = FHttpModule::Get().CreateRequest();
     const UNivaNetworkCoreSettings* SettingsLocal = GetDefault<UNivaNetworkCoreSettings>();
     FString BaseURL = SettingsLocal ? SettingsLocal->MCPBaseURL : TEXT("");
     if (BaseURL.IsEmpty())

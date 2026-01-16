@@ -42,8 +42,11 @@ public:
     FString PreferredKey;
 
     // 注册后由子系统分配并保持的唯一识别码（UUID）
-    UPROPERTY(BlueprintReadOnly, Category="AudioStream|Routing")
+    UPROPERTY(BlueprintReadOnly, ReplicatedUsing=OnRep_RegisteredUuid, Category="AudioStream|Routing")
     FString RegisteredUuid;
+
+    UFUNCTION()
+    void OnRep_RegisteredUuid();
 
     // 查询此组件的注册 UUID
     UFUNCTION(BlueprintPure, Category="AudioStream|Routing")
@@ -58,7 +61,8 @@ public:
                             int32 Channels = 1,
                             bool bUseHttps = false,
                             const FString& HttpRunPath = TEXT("/run"),
-                            const FString& WsPathPrefix = TEXT("/ws/"));
+                            const FString& WsPathPrefix = TEXT("/ws/"),
+                            bool bSoftReconnect = false);
 
     UFUNCTION(BlueprintCallable, Category="AudioStream")
     void PostStreamText(const FString& Text);
@@ -67,7 +71,7 @@ public:
 
     // 强制关闭 WebSocket
     UFUNCTION(BlueprintCallable, Category="AudioStream")
-    void CloseWebSocket();
+    void CloseWebSocket(bool bKeepQueue = false);
 
     // 在组件里解析 WebSocket 文本消息（仅解析，后续的转发/播放先注释）
     void ProcessWebSocketMessage(const FString& Message);
@@ -81,7 +85,11 @@ public:
 
     // 目标缓冲时间（秒），用于控制向SoundWave投递的速度
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AudioStream|Playback")
-    float TargetBufferedTime = 0.2f;
+    float TargetBufferedTime = 0.1f;
+
+    // 抖动缓冲阈值（包数量）
+    // UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AudioStream|Playback")
+    // int32 JitterBufferThreshold = 3;  // Duplicate removed
 
     virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
@@ -93,8 +101,6 @@ private:
     UFUNCTION(Server, Reliable)
     void RegisterToSubsystem();
 
-    UFUNCTION(NetMulticast, Reliable)
-    void MulticastAssignAndRegisterUuid(const FString& InUuid);
 
     void UnregisterFromSubsystem();
 
@@ -105,7 +111,7 @@ private:
     bool bActiveUseHttps = false;
     int32 ActiveWsSampleRate = 16000;
     int32 ActiveWsChannels = 1;
-    TSharedPtr<IHttpRequest, ESPMode::ThreadSafe> CurrentHttpRequest;
+    // TSharedPtr<IHttpRequest, ESPMode::ThreadSafe> CurrentHttpRequest; // Removing unused member to avoid confusion/issues
 
     // 保存当前会话使用的路径（由 StartRunAndConnect 设置），用于重连时重用
     FString ActiveHttpRunPath = TEXT("/run");
@@ -115,6 +121,17 @@ private:
     void ConnectWebSocket(const FString& Url);
     // 发起 /run POST 并解析 task_id（从 StartRunAndConnect 中抽取的实现）
     void RequestRunTask(const FString& ServerHostWithPort, const FString& CallbackUrl, const FString& TargetUuid, int32 SampleRate, int32 Channels, bool bUseHttps, const FString& HttpRunPath, const FString& WsPathPrefix);
+
+    // Queue handling
+    struct FStreamQueueItem
+    {
+        enum class EType : uint8 { Text, EndStream };
+        EType Type;
+        FString TextContent;
+    };
+    TArray<FStreamQueueItem> StreamQueue;
+    bool bIsProcessingStreamQueue = false;
+    void ProcessNextStreamQueueItem();
 
     // Reconnect logic
     FTimerHandle ReconnectTimerHandle;
@@ -143,6 +160,9 @@ private:
     // 标记是否需要重置音频流（在Tick中处理）
     bool bPendingStreamReset = false;
 
+    // 强制下一次写入音频数据时应用淡入（用于平滑句子间或其他不连续处的衔接）
+    bool bForceNextFadeIn = false;
+
     // 本地生成的音频序列号（用于WebSocket接收到的无序包）
     uint32 LocalAudioSeq = 0;
 
@@ -154,4 +174,11 @@ private:
 
     void FeedAudio();
     void InitAudioComponents();
+
+#if defined(CUSTOMINPUT_USE_OPUS)
+    // Opus 解码器实例（单组件按当前会话的采样率/声道初始化）
+    void* OpusDecoderHandle = nullptr; // 实际类型为 OpusDecoder*
+    void InitOpusDecoder(int32 SampleRate, int32 Channels);
+    void DestroyOpusDecoder();
+#endif
 };

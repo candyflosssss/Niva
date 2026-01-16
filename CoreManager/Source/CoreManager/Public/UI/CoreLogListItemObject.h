@@ -17,4 +17,8 @@ class COREMANAGER_API UCoreLogListItemObject : public UObject
 public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="CoreLog")
     FCoreLogEntry Entry;
+
+    // 游戏时间（毫秒级），在初始化/加入 ListView 时自动赋值；默认 -1 表示未设置
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="CoreLog")
+    int64 GameTimeMs = -1;
 };

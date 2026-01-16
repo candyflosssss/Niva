@@ -92,7 +92,7 @@ public:
 
 	// request:
 	// UPROPERTY(BlueprintReadOnly, Category = "Request")
-	TSharedPtr<IHttpRequest> TTSRequest;
+	FHttpRequestPtr TTSRequest;
 
 	// 超时检测的定时器
 	FTimerHandle TimerHandle;

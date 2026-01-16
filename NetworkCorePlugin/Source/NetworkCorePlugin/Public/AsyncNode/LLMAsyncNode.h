@@ -83,7 +83,8 @@ public:
 	);
 
 
-	TSharedPtr<IHttpRequest> LLMRequest;
+	// FHttpRequestPtr is TSharedPtr<IHttpRequest, ESPMode::ThreadSafe>
+    FHttpRequestPtr LLMRequest;
 
 	UPROPERTY(BlueprintReadOnly, Category = "Sound")
 	bool Completed = false;

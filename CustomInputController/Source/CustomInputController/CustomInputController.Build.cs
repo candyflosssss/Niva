@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 using UnrealBuildTool;
+using System.IO;
 
 public class CustomInputController : ModuleRules
 {
@@ -39,6 +40,7 @@ public class CustomInputController : ModuleRules
 				"WebSockets",
 				"UMG",
 				"CoreManager",
+				"libOpus",
 				// ... add other public dependencies that you statically link with here ...
 			}
 			);
@@ -79,8 +81,10 @@ public class CustomInputController : ModuleRules
 				}
 			);
 		}
-		
-		
+
+		// Enable Opus support using Engine's built-in libopus module
+		PublicDefinitions.Add("CUSTOMINPUT_USE_OPUS=1");
+
 		DynamicallyLoadedModuleNames.AddRange(
 			new string[]
 			{

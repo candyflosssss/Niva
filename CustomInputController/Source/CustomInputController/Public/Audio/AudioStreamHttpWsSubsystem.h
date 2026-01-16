@@ -151,8 +151,6 @@ private:
     // ===== 设置（从 UAudioStreamSettings 加载） =====
     int32 MediaUdpPort = 18500;      // 仍保留配置打印
     int32 FrameDurationMs = 20;
-    int32 TargetPreRollMs = 180;
-    int32 TargetJitterMs = 180;
     int32 VisemeStepMs = 8;
     int32 VisemeKeyframeIntervalMs = 500;
     int32 HeartbeatIntervalMs = 1000;
@@ -175,6 +173,17 @@ private:
     mutable FCriticalSection AudioBufCS;
     TMap<FGuid, TArray<uint8>> AudioBufferMap;
 
+    // ===== 可选：Opus 编码器缓存（按UUID） =====
+    struct FOpusEncoderState
+    {
+        // 编码器指针（外部库类型）；为避免外部头依赖，这里用 void* 保存并在 .cpp 中转换
+        void* Encoder = nullptr;
+        int32 LastSampleRate = 0;
+        int32 LastChannels = 0;
+    };
+    mutable FCriticalSection OpusCS;
+    TMap<FGuid, FOpusEncoderState> OpusEncoders;
+
 private:
     // ===== Socket 成员 =====
     FSocket* ListenSocket = nullptr;
@@ -193,6 +202,4 @@ private:
     // 辅助：处理接收到的数据
     void HandleSocketData(const TArray<uint8>& Data, const FString& SenderInfo, bool bIsServer);
 };
-
-
 

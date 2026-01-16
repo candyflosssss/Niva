@@ -8,8 +8,7 @@ class CUSTOMINPUTCONTROLLER_API UAudioStreamSettings : public UDeveloperSettings
 {
     GENERATED_BODY()
 public:
-    // 网络
-    // HTTP 路径（UAudioStreamHttpWsComponent 使用）
+    // 网络（HTTP 路径仅由 UAudioStreamHttpWsComponent 使用）
     UPROPERTY(EditAnywhere, Config, Category="HttpPaths", meta=(ToolTip="组件HTTP启动任务路径 /run"))
     FString DefaultHttpRunPath = TEXT("/run");
 
@@ -19,12 +18,9 @@ public:
     UPROPERTY(EditAnywhere, Config, Category="HttpPaths", meta=(ToolTip="组件HTTP结束推流路径 /end-stream"))
     FString DefaultHttpEndStreamPath = TEXT("/end-stream");
 
-    // 音频
-    // UUDPHandler 使用的UDP接收缓冲区大小（仍在用）
-    UPROPERTY(EditAnywhere, Config, Category="Audio", meta=(AdvancedDisplay, ToolTip="UDP接收缓冲区大小（UUDPHandler 使用）"))
-    int32 UdpRecvBufferBytes = 4*1024*1024; // 4MB
 
     // ========== WebSocket 连接默认配置（组件使用） ==========
+    // 下列三个字段仅被 UAudioStreamHttpWsComponent 在主动建立 WS 连接时使用
     UPROPERTY(EditAnywhere, Config, Category="WebSocket", meta=(ToolTip="WebSocket 协议：ws/wss（组件连接使用）"))
     FString DefaultWsScheme = TEXT("ws"); // 或 "wss"
 
@@ -42,19 +38,29 @@ public:
     UPROPERTY(EditAnywhere, Config, Category="ComponentDefaults", meta=(ToolTip="默认声道数，用于分帧与播放兜底"))
     int32 DefaultChannels = 1;
 
-    // ========== 子系统节奏与同步 ==========
-    UPROPERTY(EditAnywhere, Config, Category="Sync", meta=(AdvancedDisplay, ToolTip="服务器分配客户端预热目标（ms）；当前主要用于日志/参数打印"))
-    int32 TargetPreRollMs = 180; // 服务器分配客户端预热
-
-    UPROPERTY(EditAnywhere, Config, Category="Sync", meta=(AdvancedDisplay, ToolTip="客户端目标抖动缓冲（ms）；当前主要用于日志/参数打印"))
-    int32 TargetJitterMs = 180; // 客户端目标缓冲
-
-    // 单帧PCM时长（毫秒），用于分帧组包（已使用）
-    UPROPERTY(EditAnywhere, Config, Category="Sync", meta=(ToolTip="单帧PCM时长（毫秒），影响分帧组包"))
+    // 单帧PCM时长（毫秒），用于分帧组包（已使用于 SendPacket 分帧逻辑）
+    UPROPERTY(EditAnywhere, Config, Category="Sync", meta=(ToolTip="单帧PCM时长（毫秒），影响分帧与编码（Opus）"))
     int32 FrameDurationMs = 20;
-    
+
+    // ========== Opus 编码（可选）：若启用则分帧后进行压缩编码 ==========
+    // 注意：需要在工程中正确集成 libopus，并定义宏 CUSTOMINPUT_USE_OPUS 或相应编译标志。
+    UPROPERTY(EditAnywhere, Config, Category="Opus", meta=(ToolTip="启用 Opus 编码（未集成库时会自动回退到PCM）"))
+    bool bEnableOpus = true;
+
+    UPROPERTY(EditAnywhere, Config, Category="Opus", meta=(EditCondition="bEnableOpus", ToolTip="Opus 目标比特率（bps），例如 16000~64000"))
+    int32 OpusBitrate = 24000;
+
+    UPROPERTY(EditAnywhere, Config, Category="Opus", meta=(EditCondition="bEnableOpus", ToolTip="Opus 复杂度（0-10），越高质量越好但更耗 CPU"))
+    int32 OpusComplexity = 5;
+
+    UPROPERTY(EditAnywhere, Config, Category="Opus", meta=(EditCondition="bEnableOpus", ToolTip="启用前向纠错（FEC），在丢包场景下更稳"))
+    bool bOpusUseFEC = false;
+
+    UPROPERTY(EditAnywhere, Config, Category="Opus", meta=(EditCondition="bEnableOpus", ToolTip="预估丢包率百分比（0-100），用于编码器丢包优化"))
+    int32 OpusPacketLossPct = 0;
+
+
     // ========== 调试与日志 ==========
-    // 日志
     UPROPERTY(EditAnywhere, Config, Category="Debug", meta=(ToolTip="子系统统计日志默认开关（已使用）"))
     bool bStatsLiveLogDefault = false;
 

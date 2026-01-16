@@ -48,6 +48,12 @@ UCoreLogListItemObject* UCoreLogListView::AddLogEntry(const FCoreLogEntry& Entry
     if (ItemObj)
     {
         ItemObj->Entry = Entry;
+        // 赋值游戏时间（毫秒级）
+        if (UWorld* World = GetWorld())
+        {
+            const double Seconds = World->GetTimeSeconds();
+            ItemObj->GameTimeMs = (int64)FMath::RoundToInt64(Seconds * 1000.0);
+        }
         FullItems.Add(ItemObj);
         RebuildFromFullItems();
     }
@@ -57,6 +63,22 @@ UCoreLogListItemObject* UCoreLogListView::AddLogEntry(const FCoreLogEntry& Entry
 void UCoreLogListView::SetAllItems(const TArray<UObject*>& InAllItems)
 {
     FullItems = InAllItems;
+    // 为外部传入的项补齐时间戳
+    if (UWorld* World = GetWorld())
+    {
+        const double Seconds = World->GetTimeSeconds();
+        const int64 NowMs = (int64)FMath::RoundToInt64(Seconds * 1000.0);
+        for (UObject* Item : FullItems)
+        {
+            if (UCoreLogListItemObject* LogItem = Cast<UCoreLogListItemObject>(Item))
+            {
+                if (LogItem->GameTimeMs < 0)
+                {
+                    LogItem->GameTimeMs = NowMs;
+                }
+            }
+        }
+    }
     RebuildFromFullItems();
 }
 
@@ -75,6 +97,18 @@ void UCoreLogListView::OnItemsChanged(const TArray<UObject*>& AddedItems, const 
     {
         if (Item)
         {
+            // 若是日志项，补齐时间戳
+            if (UCoreLogListItemObject* LogItem = Cast<UCoreLogListItemObject>(Item))
+            {
+                if (LogItem->GameTimeMs < 0)
+                {
+                    if (UWorld* World = GetWorld())
+                    {
+                        const double Seconds = World->GetTimeSeconds();
+                        LogItem->GameTimeMs = (int64)FMath::RoundToInt64(Seconds * 1000.0);
+                    }
+                }
+            }
             FullItems.AddUnique(Item);
         }
     }

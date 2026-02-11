@@ -41,6 +41,7 @@ public class CustomInputController : ModuleRules
 				"UMG",
 				"CoreManager",
 				"libOpus",
+				"HTTPServer",
 				// ... add other public dependencies that you statically link with here ...
 			}
 			);

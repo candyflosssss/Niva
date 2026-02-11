@@ -1,4 +1,4 @@
-﻿# CustomInputController 插件说明
+﻿﻿# CustomInputController 插件说明
 
 - 功能分类：输入与设备 / 数据采集、音频采集与流式传输
 - 主要功能：
@@ -12,6 +12,7 @@
     - UAudioStreamHttpWsSubsystem（UGameInstanceSubsystem）：音频 HTTP/WS 会话中枢；路由注册、推流/拉流、统计与调度；内置媒体 UDP 组播/单播分发、客户端对时与抖动缓冲。
     - UAudioStreamHttpWsComponent（UActorComponent）：为 Actor 提供推流/控制入口，管理缓冲、viseme 队列与与子系统的注册绑定。
     - UNetMicWsSubsystem（UGameInstanceSubsystem）：最小“网络麦克风”子系统，经 HTTP POST 获取 wsUrl 后建立 WS，接收二进制音频并做环形暂存（蓝图事件 OnAudioBinary）。
+    - UNetMicWsComponent（UActorComponent）：连接网络麦克风服务（文档协议），自动重连，暴露 <start>/<end>/<list_devices>/<set_device:N> 控制；接收的 PCM 帧自动转发到 FunASR 子系统。
     - UUDPHandler（UObject）：轻量 UDP 接收器，封装 FUdpSocketReceiver；事件：OnBinaryReceived（C++）、OnDataReceived/OnDataReceivedDynamic（文本）。
     - UStreamProcSoundWave（USoundWaveProcedural）：过程音频波形，支持多生产者/单消费者入队、欠载淡入与内存压缩；用于拉流端播放。
   
@@ -38,8 +39,12 @@
 - 典型交互关系：
   - 采集推流：UMicAudioCaptureComponent -> UAudioStreamHttpWsSubsystem / UNetMicWsSubsystem ->（HTTP/WS/UDP）服务端。
   - 拉流播放：UAudioStreamHttpWsSubsystem/UNetMicWsSubsystem -> UStreamProcSoundWave（本地播放）-> 统计/viseme。
+  - 网络麦克风 + 识别：UNetMicWsComponent -> WebSocket 服务 -> 二进制 PCM -> UFunASRSubsystem（自动 Start / SendAudioFrame）。
   - 手部数据：UInputPlusSubsystem（UDP 解析） -> UHandDataListenerComponent（平滑/过滤/输出旋转）。
 
-- 参考与定位：
-  - 插件清单：CustomInputController.uplugin（依赖 NetworkCorePlugin）。
-  - 源码：Plugins/CustomInputController/Source/CustomInputController（Public/Private）。
+- 使用示例（蓝图）：
+  1. 在角色或控制器上添加 UNetMicWsComponent 组件。
+  2. BeginPlay 调用 Connect("ws://localhost:8765")。
+  3. 可选调用 RequestDeviceList() 获取设备列表（OnServerMessage 事件返回 JSON 字符串）。
+  4. SetDeviceIndex(0) 选择设备；StartRecording() 开始录音；StopRecording() 停止。
+  5. 识别结果从 UFunASRSubsystem 的 OnResultReceived 事件获取。

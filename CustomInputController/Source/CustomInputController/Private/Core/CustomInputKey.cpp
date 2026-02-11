@@ -150,8 +150,8 @@ FUDPInputDevice::FUDPInputDevice(const TSharedRef<FGenericApplicationMessageHand
     Mapper.RemapControllerIdToPlatformUserAndDevice(0, TempUser, DeviceId);
 
     // 创建UDP处理器
-    UDPHandler = NewObject<UUDPHandler>();
-    if (UDPHandler)
+    UDPHandler.Reset(NewObject<UUDPHandler>());
+    if (UDPHandler.IsValid())
     {
         // 绑定普通委托（不是动态委托）
         UDPHandler->OnDataReceived.AddLambda([this](const FString& ReceivedData)
@@ -172,14 +172,12 @@ FUDPInputDevice::FUDPInputDevice(const TSharedRef<FGenericApplicationMessageHand
     }
 }
 
-// 其他方法保持不变...
-
 FUDPInputDevice::~FUDPInputDevice()
 {
-    if (UDPHandler)
+    if (UDPHandler.IsValid())
     {
         UDPHandler->StopUDPReceiver();
-        UDPHandler = nullptr;
+        UDPHandler.Reset();
     }
 }
 

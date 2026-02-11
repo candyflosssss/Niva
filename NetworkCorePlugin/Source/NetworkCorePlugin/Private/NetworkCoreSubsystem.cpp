@@ -77,7 +77,7 @@ void UNetworkCoreSubsystem::BindRoute(FString path, ENivaHttpRequestVerbs HttpVe
 			TUniquePtr<FHttpServerResponse> response = FHttpServerResponse::Error(EHttpServerResponseCodes::NotFound);
 			OnComplete(MoveTemp(response));
 			return true;
-				})
+			})
 	);
 
 	CreatedRouteHandlers.Add(RouterHandle);

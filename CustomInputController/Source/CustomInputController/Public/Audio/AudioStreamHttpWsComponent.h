@@ -11,6 +11,9 @@
 
 class UAudioStreamHttpWsSubsystem;
 
+// Add a dynamic delegate for Viseme array update to be UHT-friendly
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnVisemeArrayUpdated);
+
 struct FAudioPacketBuffer
 {
     uint32 Seq;
@@ -87,9 +90,37 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AudioStream|Playback")
     float TargetBufferedTime = 0.1f;
 
-    // 抖动缓冲阈值（包数量）
-    // UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AudioStream|Playback")
-    // int32 JitterBufferThreshold = 3;  // Duplicate removed
+    // 起播所需的最小缓冲时长（秒），避免小包导致永远不满足；默认更小以保证尽快起播
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AudioStream|Playback")
+    float MinStartDuration = 0.02f;
+
+    // ===== Viseme 配置 =====
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AudioStream|Viseme")
+    int32 VisemeStepMs = 8; // 每个Viseme步进时长，和上游一致
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AudioStream|Viseme")
+    int32 VisemeKeyframeIntervalMs = 500; // 预留（暂未使用）
+
+    // 消费 Viseme 时触发（BP 可实现）
+    UFUNCTION(BlueprintImplementableEvent, Category="AudioStream|Viseme")
+    void OnViseme(int32 Viseme, float Confidence);
+
+    // 当前口型值数组（长度15），每次消费时根据index填充对应置信度，其他清零；队列耗尽时整体清零
+    UPROPERTY(BlueprintReadOnly, Category="AudioStream|Viseme")
+    TArray<float> CurrentVisemeArray;
+
+    static constexpr int32 VisemeArraySize = 15; // 满足 AnimBP 访问 0..14
+
+    // 获取当前口型数组（保证长度为15）
+    UFUNCTION(BlueprintPure, Category="AudioStream|Viseme")
+    const TArray<float>& GetCurrentVisemeArray();
+
+    // 当口型数组更新时广播（AnimBP可绑定复制到自己的变量）
+    UPROPERTY(BlueprintAssignable, Category="AudioStream|Viseme")
+    FOnVisemeArrayUpdated OnVisemeArrayUpdated;
+
+    // 工具：确保数组长度为指定大小并全部清零
+    void EnsureAndZeroVisemeArray(int32 Size = VisemeArraySize);
 
     virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
@@ -116,6 +147,9 @@ private:
     // 保存当前会话使用的路径（由 StartRunAndConnect 设置），用于重连时重用
     FString ActiveHttpRunPath = TEXT("/run");
     FString ActiveWsPathPrefix = TEXT("/ws/");
+
+    // 在下一次 CloseWebSocket 时保留队列（用于软重连避免丢数据）
+    bool bPreserveQueuesNextClose = false;
 
     // Internal helpers
     void ConnectWebSocket(const FString& Url);
@@ -157,6 +191,10 @@ private:
     double TotalAudioFedDuration = 0.0;
     bool bIsPlaying = false;
     
+    // Viseme 播放头（按实际播放的 DeltaTime 累加，用于对齐口型与音频）
+    double VisemePlayheadSec = 0.0;
+    float LastDeltaTime = 0.0f;
+    
     // 标记是否需要重置音频流（在Tick中处理）
     bool bPendingStreamReset = false;
 
@@ -181,4 +219,12 @@ private:
     void InitOpusDecoder(int32 SampleRate, int32 Channels);
     void DestroyOpusDecoder();
 #endif
+
+    // ===== Viseme 队列与消费进度 =====
+    TArray<int32> VisemeQueue;
+    TArray<float> VisemeConfQueue;
+    int32 VisemeStepsEmitted = 0; // 已消费步数（从TotalAudioFedDuration推导）
+
+    // 标记：本帧 viseme 数组是否更新
+    bool bVisemeArrayDirty = false;
 };

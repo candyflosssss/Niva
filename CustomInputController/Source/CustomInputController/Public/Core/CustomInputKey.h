@@ -7,6 +7,7 @@
 #include "IInputDevice.h"
 #include "GenericPlatform/IInputInterface.h"
 #include "Input/UUDPHandler.h"
+#include "UObject/StrongObjectPtr.h"
 #include "CustomInputKey.h"
 
 /**
@@ -54,10 +55,9 @@ public:
 
 private:
 	/** UDP处理器 */
-	UUDPHandler* UDPHandler;
+	TStrongObjectPtr<UUDPHandler> UDPHandler;
 
 	/** 处理接收到的UDP数据 */
-	UFUNCTION()
 	void OnUDPDataReceived(const FString& ReceivedData);
 
 	/** 解析文本为XYZ坐标 */

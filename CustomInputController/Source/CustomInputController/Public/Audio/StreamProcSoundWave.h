@@ -35,7 +35,7 @@ public:
 	// 非UFUNCTION：指针参数不暴露给UHT/蓝图
 	void EnqueuePcm(const uint8* Data, int32 NumBytes);
 
-	UFUNCTION()
+	UFUNCTION()	
 	void EnqueuePcmArray(const TArray<uint8>& Data) { EnqueuePcm(Data.GetData(), Data.Num()); }
 
 	// 欠载平滑开关与参数

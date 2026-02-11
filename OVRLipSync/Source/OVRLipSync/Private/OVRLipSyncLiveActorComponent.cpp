@@ -28,6 +28,7 @@
 #include "OVRLipSyncContextWrapper.h"
 #include "VoiceModule.h"
 #include "TimerManager.h"
+#include "Components/SkeletalMeshComponent.h"
 
 #include <Core.h>
 #include <algorithm>
@@ -59,10 +60,11 @@ void UOVRLipSyncActorComponent::BeginPlay()
 	Super::BeginPlay();
 
 	LipSyncContext = MakeShared<UOVRLipSyncContextWrapper>(ContextProviderFromProviderKind(ProviderKind), SampleRate,
-														   BufferSize, FString(), EnableHardwareAcceleration);
+															   BufferSize, FString(), EnableHardwareAcceleration);
 	LipSyncContext->SetAsyncCallback([this](const TArray<float> &NewVisemes, float NewLaughterScore) {
 		Visemes = NewVisemes;
 		LaughterScore = NewLaughterScore;
+		// 保留事件通知，供上层进行后续处理
 		OnVisemesReady.Broadcast();
 	});
 }
@@ -148,7 +150,10 @@ void UOVRLipSyncActorComponent::FeedAudio(const TArray<uint8> &VoiceData)
 
 	auto *ShortData = reinterpret_cast<const int16 *>(VoiceData.GetData());
 	auto ShortDataSize = VoiceData.Num() / 2;
-	LipSyncContext->ProcessFrameAsync(ShortData, ShortDataSize);
+	// 使用同步处理，确保每次音频帧都会直接得到结果
+	int32 FrameDelay = 0;
+	LipSyncContext->ProcessFrame(ShortData, ShortDataSize, /*out*/ Visemes, /*out*/ LaughterScore, /*out*/ FrameDelay, /*Stereo*/ false);
+	OnVisemesReady.Broadcast();
 }
 
 void UOVRLipSyncActorComponent::Stop()

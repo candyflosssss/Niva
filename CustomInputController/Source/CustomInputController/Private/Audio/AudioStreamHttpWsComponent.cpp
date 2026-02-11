@@ -20,6 +20,7 @@
 #include "Serialization/JsonReader.h"
 #include "Dom/JsonObject.h"
 #include "Misc/Base64.h"
+#include "Serialization/MemoryReader.h" // Added for Viseme payload parsing
 
 #if defined(CUSTOMINPUT_USE_OPUS)
 #include "opus.h"
@@ -299,12 +300,12 @@ void UAudioStreamHttpWsComponent::ProcessWebSocketMessage(const FString& Message
                 SS->SendPacket(AudioStreamPacket::Viseme, Payload, Guid);
                 SS->UpdateVisemeStats(Vis.Num());
 
-                // // 额外转发给自己一份
-                // AudioStreamPacket::FHeader Header;
-                // Header.Type = AudioStreamPacket::Viseme;
-                // Header.Flags = 0x01; // HasUuid
-                // Header.Uuid = Guid;
-                // ReceiveSocketMessage(Header, Payload);
+                // 额外转发给自己一份：立即入队待消费
+                AudioStreamPacket::FHeader Header;
+                Header.Type = AudioStreamPacket::Viseme;
+                Header.Flags = 0x01; // HasUuid
+                Header.Uuid = Guid;
+                ReceiveSocketMessage(Header, Payload);
             }
         }
     }
@@ -318,12 +319,16 @@ UAudioStreamHttpWsComponent::UAudioStreamHttpWsComponent()
 {
     PrimaryComponentTick.bCanEverTick = true;
     SetIsReplicatedByDefault(true);
+    // 软重连时保留队列的标志位初始化
+    bPreserveQueuesNextClose = false;
 }
 
 void UAudioStreamHttpWsComponent::BeginPlay()
 {
     Super::BeginPlay();
     
+    EnsureAndZeroVisemeArray();
+
     InitAudioComponents();
 
     // 仅在服务器上触发服务器RPC（客户端无需主动调用）
@@ -357,9 +362,8 @@ void UAudioStreamHttpWsComponent::EndPlay(const EEndPlayReason::Type EndPlayReas
     // 尝试优雅结束（这些调用在客户端上会早退，无副作用）
     PostEndStream();
     CloseWebSocket();
-#if defined(CUSTOMINPUT_USE_OPUS)
-    DestroyOpusDecoder();
-#endif
+    // 清零当前口型数组
+    EnsureAndZeroVisemeArray();
     UnregisterFromSubsystem();
     Super::EndPlay(EndPlayReason);
 }
@@ -421,6 +425,8 @@ void UAudioStreamHttpWsComponent::StartRunAndConnect(const FString& ServerHostWi
     if (bCanSoftReconnect)
     {
          FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("播放控制"), TEXT("Soft reconnect: retaining audio stream state for seamless transition"));
+         // 标记下一次关闭时保留队列，避免软重连过程中丢失未消费的数据
+         bPreserveQueuesNextClose = true;
     }
 
     // 记住会话信息
@@ -452,6 +458,12 @@ void UAudioStreamHttpWsComponent::StartRunAndConnect(const FString& ServerHostWi
         {
             AudioPlayer->SetSound(SoundStream);
         }
+
+        // 清理 Viseme 状态
+        VisemeQueue.Empty();
+        VisemeConfQueue.Empty();
+        VisemeStepsEmitted = 0;
+        EnsureAndZeroVisemeArray();
     }
 
     // 保存当前会话的路径，以便重连时复用
@@ -579,7 +591,7 @@ void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPo
             Req->OnProcessRequestComplete().BindLambda([Self, ServerHostWithPort, WsPathPrefix, bUseHttps](FHttpRequestPtr ReqPtr, FHttpResponsePtr Resp, bool bOK)
             {
                 // Must ensure callback logic (especially next steps) happens on GameThread or handles object safety.
-                // FHttpModule callbacks are generally on GameThread, but let's be safe if we touch UObjects or timers.
+                // FHttpModule callbacks are generally onGameThread, but let's be safe if we touch UObjects or timers.
                 
                 // Detailed logging for callback
                 FString RespCodeStr = Resp.IsValid() ? FString::FromInt(Resp->GetResponseCode()) : TEXT("Invalid");
@@ -614,8 +626,8 @@ void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPo
                     P->ActiveTaskId = TaskId;
                     const FString WsScheme = bUseHttps ? TEXT("wss") : TEXT("ws");
                     const FString WsUrl = FString::Printf(TEXT("%s://%s%s%s"), *WsScheme, *ServerHostWithPort, *WsPathPrefix, *TaskId);
-                    
-                    // 重要修复：捕获 Self (WeakPtr) 而不是裸指针 P，避免在 RequestRunTask 结束和 AsyncTask 执行之间组件被销毁导致的野指针崩溃。
+                    // 软重连路径：确保下一次 Close 保留队列
+                    P->bPreserveQueuesNextClose = true;
                     AsyncTask(ENamedThreads::GameThread, [Self, WsUrl]() 
                     { 
                         if (UAudioStreamHttpWsComponent* SafeP = Self.Get())
@@ -821,7 +833,12 @@ void UAudioStreamHttpWsComponent::ConnectWebSocket(const FString& Url)
         return;
     }
 
-    CloseWebSocket();
+    // 根据标志决定是否保留队列
+    const bool bKeepQueue = bPreserveQueuesNextClose;
+    // 关闭旧连接（软重连时保留队列）
+    CloseWebSocket(bKeepQueue);
+    // 重置标志，避免后续误用
+    bPreserveQueuesNextClose = false;
 
     if (!FModuleManager::Get().IsModuleLoaded("WebSockets"))
     {
@@ -928,7 +945,11 @@ void UAudioStreamHttpWsComponent::CloseWebSocket(bool bKeepQueue)
     if (!bKeepQueue)
     {
         AudioPacketQueue.Empty();
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("音频流组件"), TEXT("关闭"), TEXT("WebSocket 已关闭，音频队列已清空"));
+        VisemeQueue.Empty();
+        VisemeConfQueue.Empty();
+        VisemeStepsEmitted = 0;
+        EnsureAndZeroVisemeArray();
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("音频流组件"), TEXT("关闭"), TEXT("WebSocket 已关闭，音频+Viseme 队列已清空"));
     }
     else
     {
@@ -1102,6 +1123,33 @@ void UAudioStreamHttpWsComponent::ReceiveSocketMessage(const AudioStreamPacket::
 
         FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("调试"), TEXT("QueueStatus"), FString::Printf(TEXT("QueueSize=%d AddedSeq=%d"), AudioPacketQueue.Num(), NewPacket.Seq));
     }
+    else if (Header.Type == AudioStreamPacket::Viseme)
+    {
+        // Parse payload: Writer << Vis; Writer << Confidence;
+        TArray<int32> InVis;
+        TArray<float> InConf;
+        FMemoryReader Reader(Payload);
+        Reader << InVis;
+        Reader << InConf;
+
+        // Append to queues
+        if (InVis.Num() > 0)
+        {
+            VisemeQueue.Append(InVis);
+            if (InConf.Num() == InVis.Num())
+            {
+                VisemeConfQueue.Append(InConf);
+            }
+            else
+            {
+                // pad confidences
+                const int32 OldNum = VisemeConfQueue.Num();
+                VisemeConfQueue.SetNum(VisemeQueue.Num());
+                for (int32 i = OldNum; i < VisemeQueue.Num(); ++i) VisemeConfQueue[i] = 1.0f;
+            }
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("Viseme"), TEXT("入队"), FString::Printf(TEXT("+%d -> total=%d"), InVis.Num(), VisemeQueue.Num()));
+        }
+    }
 }
 
 #if defined(CUSTOMINPUT_USE_OPUS)
@@ -1176,6 +1224,13 @@ void UAudioStreamHttpWsComponent::TickComponent(float DeltaTime, ELevelTick Tick
         bIsPlaying = false;
         LastPlayedSeq = 0;
         TotalAudioFedDuration = 0.0;
+        VisemeStepsEmitted = 0;
+        VisemeQueue.Empty();
+        VisemeConfQueue.Empty();
+        VisemeStepsEmitted = 0;
+        EnsureAndZeroVisemeArray();
+        // 重置播放头
+        VisemePlayheadSec = 0.0;
 
         // 安全地重建 SoundStream
         if (AudioPlayer)
@@ -1197,6 +1252,13 @@ void UAudioStreamHttpWsComponent::TickComponent(float DeltaTime, ELevelTick Tick
         }
 
         FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流数据处理"), TEXT("播放控制"), TEXT("Stream reset executed in Tick"));
+    }
+
+    // 当处于播放状态时，按 DeltaTime 推进 viseme 播放头
+    LastDeltaTime = DeltaTime;
+    if (bIsPlaying && AudioPlayer && AudioPlayer->IsPlaying())
+    {
+        VisemePlayheadSec += FMath::Max(0.f, DeltaTime);
     }
 
     FeedAudio();
@@ -1254,9 +1316,9 @@ void UAudioStreamHttpWsComponent::FeedAudio()
         // If packets are large, Duration threshold will trigger first.
         // If packets are small, Packet count threshold might trigger first.
         // We use a small minimum duration to avoid starting with just a tiny blip.
-        const float MinStartDuration = 0.1f;
+        const float MinStartDurationLocal = FMath::Max(0.0f, MinStartDuration);
 
-        bool bCanStart = (AudioPacketQueue.Num() >= JitterBufferThreshold) || (Duration >= TargetBufferedTime) || (Duration >= MinStartDuration && AudioPacketQueue.Num() >= 1);
+        bool bCanStart = (AudioPacketQueue.Num() >= JitterBufferThreshold) || (Duration >= TargetBufferedTime) || (Duration >= MinStartDurationLocal && AudioPacketQueue.Num() >= 1);
 
         // Debug info for buffering (only periodically or on change to avoid spam, but for deep debug print every few frames or use Info)
         // Here we just print if it fails to start but has queue
@@ -1279,11 +1341,7 @@ void UAudioStreamHttpWsComponent::FeedAudio()
             PlaybackStartTime = FPlatformTime::Seconds();
             TotalAudioFedDuration = 0.0;
 
-            // Delayed Play() until after feeding data to avoid assertion failure (NumTotalFrames > 0)
-            // if (!AudioPlayer->IsPlaying())
-            // {
-            //    AudioPlayer->Play();
-            // }
+            // Delayed Play() after feeding data to avoid assertion failure (NumTotalFrames > 0)
             FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("播放控制"), FString::Printf(TEXT("Buffering complete: buffered %d pkts, %.2fs. Will Play after feed."), AudioPacketQueue.Num(), Duration));
         }
         else
@@ -1295,10 +1353,10 @@ void UAudioStreamHttpWsComponent::FeedAudio()
 
     // 2. Feed data
     bool bDataFed = false;
+    int32 FedBytes = 0; // move out for viseme timing
     if (bIsPlaying && AudioPacketQueue.Num() > 0)
     {
         // Feed all available packets
-        int32 FedBytes = 0;
         int32 FedPackets = 0;
         int32 LastFeedSeq = -1;
 
@@ -1308,8 +1366,7 @@ void UAudioStreamHttpWsComponent::FeedAudio()
 
             if (Pkt.Data.Num() > 0)
             {
-                // 动态淡入逻辑：如果缓冲区为空（说明是起始或断流后恢复），或者强制淡入（新句子/流开始），则对新数据块执行淡入，避免爆音
-                // Dynamic Fade-In: If buffer is empty (start or resume after gap) OR forced, fade in next packet
+                // 动态淡入逻辑
                 const int32 BufferedBytes = SoundStream->GetAvailableAudioByteCount();
                 if (BufferedBytes <= 0 || bForceNextFadeIn) 
                 {
@@ -1319,13 +1376,11 @@ void UAudioStreamHttpWsComponent::FeedAudio()
 
                     int16* Samples = reinterpret_cast<int16*>(Pkt.Data.GetData());
                     const int32 SampleCount = Pkt.Data.Num() / sizeof(int16);
-                    // 100ms fade to smooth out start of sentences
                     const int32 FadeSamples = FMath::Min(SampleCount, (int32)(ActiveWsSampleRate * 0.1f)); 
                     
                     for (int32 i = 0; i < FadeSamples; ++i)
                     {
                         float FadeAlpha = (float)i / (float)FadeSamples;
-                        // Cubic smoothstep
                         FadeAlpha = FadeAlpha * FadeAlpha * (3.0f - 2.0f * FadeAlpha); 
                         Samples[i] = (int16)(Samples[i] * FadeAlpha);
                     }
@@ -1345,24 +1400,99 @@ void UAudioStreamHttpWsComponent::FeedAudio()
         {
              const int32 BytesPerSample = sizeof(int16);
              const int32 NumSamples = FedBytes / (ActiveWsChannels * BytesPerSample);
-             const float Duration = (float)NumSamples / (float)ActiveWsSampleRate;
-             TotalAudioFedDuration += Duration;
+             const float AddedDuration = (float)NumSamples / (float)ActiveWsSampleRate;
+             TotalAudioFedDuration += AddedDuration;
              bDataFed = true;
 
              FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("调试"), TEXT("FedAudio"),
-                FString::Printf(TEXT("Fed %d bytes (%d pkts) to SoundStream. LastSeq=%d AddedDuration=%.3f"), FedBytes, FedPackets, LastFeedSeq, Duration));
+                FString::Printf(TEXT("Fed %d bytes (%d pkts) to SoundStream. LastSeq=%d AddedDuration=%.3f"), FedBytes, FedPackets, LastFeedSeq, AddedDuration));
+        }
+    }
+
+    // 2.5 Consume Visemes according to TotalAudioFedDuration and VisemeStepMs
+    if (bIsPlaying && (VisemeQueue.Num() > 0))
+    {
+        const float StepSec = FMath::Max(1, VisemeStepMs) / 1000.f;
+        // 使用播放头时间作为更稳定的对齐基准
+        const float PlayedSec = (float)VisemePlayheadSec;
+
+        const int32 ExpectedSteps = (int32)FMath::FloorToFloat(PlayedSec / StepSec);
+        const int32 Remaining = FMath::Max(0, VisemeQueue.Num() - VisemeStepsEmitted);
+        const int32 ToEmit = FMath::Clamp(ExpectedSteps - VisemeStepsEmitted, 0, Remaining);
+        if (ToEmit > 0)
+        {
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("Viseme"), TEXT("Emit"), FString::Printf(TEXT("PlayedSec=%.3f StepSec=%.3f Expect=%d Emitting=%d Queue=%d Remaining=%d Emitted=%d"), PlayedSec, StepSec, ExpectedSteps, ToEmit, VisemeQueue.Num(), Remaining, VisemeStepsEmitted));
+        }
+        for (int32 i = 0; i < ToEmit; ++i)
+        {
+            const int32 Index = VisemeStepsEmitted + i;
+            const int32 V = VisemeQueue[Index];
+            const float C = (Index < VisemeConfQueue.Num()) ? VisemeConfQueue[Index] : 1.f;
+            EnsureAndZeroVisemeArray();
+            const int32 ClampedIndex = FMath::Clamp(V, 0, VisemeArraySize - 1);
+            CurrentVisemeArray[ClampedIndex] = C;
+            bVisemeArrayDirty = true;
+            OnViseme(V, C);
+        }
+        if (bVisemeArrayDirty)
+        {
+            bVisemeArrayDirty = false;
+            OnVisemeArrayUpdated.Broadcast();
+        }
+        VisemeStepsEmitted += ToEmit;
+        if (VisemeStepsEmitted >= VisemeQueue.Num())
+        {
+            VisemeQueue.Empty();
+            VisemeConfQueue.Empty();
+            VisemeStepsEmitted = 0;
+            EnsureAndZeroVisemeArray();
+            OnVisemeArrayUpdated.Broadcast();
+            // 口型队列消费完后重置播放头，避免下次从旧时间继续累加
+            VisemePlayheadSec = 0.0;
+        }
+        else if (VisemeStepsEmitted > 0 && VisemeStepsEmitted <= VisemeQueue.Num())
+        {
+            const int32 CleanupThreshold = 256; // arbitrary chunk cleanup
+            if (VisemeStepsEmitted >= CleanupThreshold)
+            {
+                VisemeQueue.RemoveAt(0, VisemeStepsEmitted);
+                if (VisemeConfQueue.Num() >= VisemeStepsEmitted)
+                {
+                    VisemeConfQueue.RemoveAt(0, VisemeStepsEmitted);
+                }
+                VisemeStepsEmitted = 0; // reset counter after compaction
+                // 压缩后从0重新计时，避免累计误差
+                VisemePlayheadSec = 0.0;
+            }
         }
     }
 
     // 3. Start Playback if needed
     if (bIsPlaying && !AudioPlayer->IsPlaying())
     {
-        // Only start playing if we have successfully fed data to the SoundWaveProcedural this frame
-        // or if we know it has data (but here we rely on bDataFed for safety on first start)
         if (bDataFed)
         {
             AudioPlayer->Play();
             FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("播放控制"), TEXT("AudioPlayer::Play() called after feeding data"));
         }
     }
+}
+
+const TArray<float>& UAudioStreamHttpWsComponent::GetCurrentVisemeArray()
+{
+    if (CurrentVisemeArray.Num() != VisemeArraySize)
+    {
+        CurrentVisemeArray.SetNum(VisemeArraySize);
+        for (int32 i=0;i<VisemeArraySize;++i) CurrentVisemeArray[i] = 0.f;
+    }
+    return CurrentVisemeArray;
+}
+
+void UAudioStreamHttpWsComponent::EnsureAndZeroVisemeArray(int32 Size)
+{
+    if (CurrentVisemeArray.Num() != Size)
+    {
+        CurrentVisemeArray.SetNum(Size);
+    }
+    for (int32 i=0;i<CurrentVisemeArray.Num();++i) CurrentVisemeArray[i] = 0.f;
 }

@@ -64,6 +64,11 @@ public:
     UPROPERTY(EditAnywhere, Config, Category="Debug", meta=(ToolTip="子系统统计日志默认开关（已使用）"))
     bool bStatsLiveLogDefault = false;
 
+    // ========== NetMic 默认连接配置（供 UNetMicWsComponent 自动连接使用） ==========
+    UPROPERTY(EditAnywhere, Config, Category="NetMic", meta=(ToolTip="网麦 WebSocket 服务器地址（例如 ws://127.0.0.1:8780）"))
+    FString DefaultNetMicWsUrl = TEXT("");
+
+
     // 静态访问器，方便统一读取设置
     static const UAudioStreamSettings* Get();
 

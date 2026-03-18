@@ -1,15 +1,18 @@
 ﻿#pragma once
 
 #include "CoreMinimal.h"
+#include "HAL/CriticalSection.h"
 #include "Components/ActorComponent.h"
 // HTTP request typedef (FHttpRequestPtr)
 #include "Interfaces/IHttpRequest.h"
 #include "Audio/AudioStreamHttpWsSubsystem.h" // Include for AudioStreamPacket::FHeader
+#include "Audio/AudioStreamSettings.h"
 #include "Sound/SoundWaveProcedural.h"
 #include "Components/AudioComponent.h"
 #include "AudioStreamHttpWsComponent.generated.h"
 
 class UAudioStreamHttpWsSubsystem;
+class FJsonObject;
 
 // Add a dynamic delegate for Viseme array update to be UHT-friendly
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnVisemeArrayUpdated);
@@ -71,6 +74,37 @@ public:
     void PostStreamText(const FString& Text);
     UFUNCTION(BlueprintCallable, Category="AudioStream")
     void PostEndStream();
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AudioStream|Network")
+    EAudioStreamProtocolMode ProtocolMode = EAudioStreamProtocolMode::PureWebSocket;
+
+    // Minimum interval between queued HTTP stream requests (/stream and /end-stream).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AudioStream|Network", meta=(ClampMin="0.0", UIMin="0.0"))
+    float MinStreamRequestIntervalSeconds = 0.05f;
+
+    // Coalesce adjacent text chunks inside this window to reduce high-frequency /stream requests.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AudioStream|Network", meta=(ClampMin="0.0", UIMin="0.0"))
+    float StreamTextCoalesceWindowSeconds = 0.12f;
+
+    // Soft cap for pending text items; excess items are merged into the latest text request.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AudioStream|Network", meta=(ClampMin="1", UIMin="1"))
+    int32 MaxPendingStreamTextItems = 8;
+
+    // Coalesced text is flushed into the HTTP queue at this interval.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AudioStream|Network", meta=(ClampMin="0.02", UIMin="0.02"))
+    float StreamTextFlushIntervalSeconds = 0.25f;
+
+    // Flush pending text immediately when this character count is reached.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AudioStream|Network", meta=(ClampMin="1", UIMin="1"))
+    int32 StreamTextMaxBatchChars = 48;
+
+    // Base cooldown applied after a failed /stream or /end-stream request.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AudioStream|Network", meta=(ClampMin="0.0", UIMin="0.0"))
+    float StreamFailureCooldownBaseSeconds = 0.2f;
+
+    // Max cooldown cap for exponential backoff after consecutive failures.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AudioStream|Network", meta=(ClampMin="0.0", UIMin="0.0"))
+    float StreamFailureCooldownMaxSeconds = 3.0f;
 
     // 强制关闭 WebSocket
     UFUNCTION(BlueprintCallable, Category="AudioStream")
@@ -147,12 +181,27 @@ private:
     // 保存当前会话使用的路径（由 StartRunAndConnect 设置），用于重连时重用
     FString ActiveHttpRunPath = TEXT("/run");
     FString ActiveWsPathPrefix = TEXT("/ws/");
+    bool bPureWsTaskStarted = false;
+    bool bPureWsAwaitingTaskStart = false;
 
     // 在下一次 CloseWebSocket 时保留队列（用于软重连避免丢数据）
     bool bPreserveQueuesNextClose = false;
 
     // Internal helpers
     void ConnectWebSocket(const FString& Url);
+    FString BuildActiveWebSocketUrl() const;
+    void BeginPureWsTask(bool bGenerateNewTaskId);
+    bool SendPureWsMessage(const FString& Action, const TSharedPtr<FJsonObject>& Payload, const FString& TaskIdOverride = FString());
+    void HandleIncomingAudioChunk(const FString& Base64Audio, int32 SampleRate, int32 Channels);
+    void HandleIncomingVisemeChunk(const TArray<int32>& Visemes, const TArray<float>& Confidence);
+    void HandleIncomingTextChunk(const FString& Text);
+    void ApplySettingsDefaultsFromProject();
+    void EnqueuePendingWebSocketMessage(const FString& Message);
+    void ProcessPendingWebSocketMessages(int32 MaxMessagesToProcess);
+    void ResetPendingWebSocketMessages();
+    void ResetAudioPacketQueue();
+    float GetBufferedAudioDurationSeconds() const;
+    void TrimAudioPacketQueueIfNeeded();
     // 发起 /run POST 并解析 task_id（从 StartRunAndConnect 中抽取的实现）
     void RequestRunTask(const FString& ServerHostWithPort, const FString& CallbackUrl, const FString& TargetUuid, int32 SampleRate, int32 Channels, bool bUseHttps, const FString& HttpRunPath, const FString& WsPathPrefix);
 
@@ -162,10 +211,29 @@ private:
         enum class EType : uint8 { Text, EndStream };
         EType Type;
         FString TextContent;
+        double EnqueueTimeSeconds = 0.0;
     };
     TArray<FStreamQueueItem> StreamQueue;
     bool bIsProcessingStreamQueue = false;
     void ProcessNextStreamQueueItem();
+    void ScheduleProcessNextStreamQueueItem(float DelaySeconds = 0.0f);
+    bool TryCoalesceQueuedText(const FString& Text, double NowSeconds);
+    void FlushPendingStreamText(bool bForce);
+    void SchedulePendingStreamTextFlush(float DelaySeconds = 0.0f);
+    void CancelActiveStreamRequest(const TCHAR* Reason);
+
+    FTimerHandle StreamQueueProcessTimerHandle;
+    FTimerHandle PendingStreamTextFlushTimerHandle;
+    double LastStreamRequestDispatchTime = 0.0;
+    double NextStreamRequestAllowedTime = 0.0;
+
+    FString PendingStreamTextBuffer;
+    int32 ConsecutiveStreamFailures = 0;
+
+    // Keep one in-flight /stream or /end-stream request owned by this component.
+    TSharedPtr<IHttpRequest, ESPMode::ThreadSafe> ActiveStreamRequest;
+    uint32 ActiveStreamRequestId = 0;
+    uint32 StreamRequestIdCounter = 0;
 
     // Reconnect logic
     FTimerHandle ReconnectTimerHandle;
@@ -184,7 +252,18 @@ private:
 
     // 音频缓冲队列
     TArray<FAudioPacketBuffer> AudioPacketQueue;
+    int32 QueuedAudioBytes = 0;
     uint32 LastPlayedSeq = 0;
+
+    FCriticalSection PendingWebSocketMessagesCS;
+    TArray<FString> PendingWebSocketMessages;
+    double LastAudioQueuePressureLogTime = 0.0;
+
+    static constexpr uint8 LocalDecodedPcmFlag = 0x02;
+    static constexpr int32 MaxPendingWebSocketMessagesPerTick = 4;
+    static constexpr int32 MaxAudioPacketsToFeedPerTick = 6;
+    static constexpr int32 MaxAudioBytesToFeedPerTick = 256 * 1024;
+    static constexpr float MaxBufferedAudioSeconds = 1.5f;
     
     // 播放时间追踪
     double PlaybackStartTime = 0.0;

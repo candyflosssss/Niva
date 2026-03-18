@@ -218,12 +218,11 @@ bool UAudioStreamHttpWsSubsystem::RegisterComponent(UAudioStreamHttpWsComponent*
     if (bFirst)
     {
         const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
-        const FString Host = S ? S->DefaultWsHost : TEXT("127.0.0.1:8001");
-        const bool bHttps = (S && S->DefaultWsScheme.Equals(TEXT("wss"), ESearchCase::IgnoreCase));
+        const EAudioStreamProtocolMode ProtocolMode = S ? S->DefaultProtocolMode : EAudioStreamProtocolMode::LegacyHttpWs;
+        const FString Host = S ? S->GetEffectiveWsHost(ProtocolMode) : TEXT("127.0.0.1:8001");
+        const bool bHttps = (S && S->GetEffectiveWsScheme(ProtocolMode).Equals(TEXT("wss"), ESearchCase::IgnoreCase));
         const int32 SR = S ? S->DefaultSampleRate : 16000;
         const int32 CH = S ? S->DefaultChannels : 1;
-        const FString RunPath = TEXT("/run");
-        const FString WsPrefix = S ? S->DefaultWsPathPrefix : TEXT("/ws/");
         UE_LOG(LogTemp, Log, TEXT("[AudioStream] First component added -> networking should be started by the component (host=%s, scheme=%s, sr=%d, ch=%d, uuid=%s)"), *Host, bHttps?TEXT("wss"):TEXT("ws"), SR, CH, *Uuid);
     }
 

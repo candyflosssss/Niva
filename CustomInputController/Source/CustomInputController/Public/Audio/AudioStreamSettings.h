@@ -3,31 +3,61 @@
 #include "Engine/DeveloperSettings.h"
 #include "AudioStreamSettings.generated.h"
 
+UENUM(BlueprintType)
+enum class EAudioStreamProtocolMode : uint8
+{
+    LegacyHttpWs UMETA(DisplayName="Legacy HTTP + WS"),
+    PureWebSocket UMETA(DisplayName="Pure WebSocket")
+};
+
 UCLASS(Config=Game, DefaultConfig, meta=(DisplayName="Audio Stream Settings"))
 class CUSTOMINPUTCONTROLLER_API UAudioStreamSettings : public UDeveloperSettings
 {
     GENERATED_BODY()
 public:
+    UPROPERTY(EditAnywhere, Config, Category="Protocol", meta=(DisplayName="默认服务模型", ToolTip="音频流组件默认协议模式；切换后仅显示当前协议对应的服务配置"))
+    EAudioStreamProtocolMode DefaultProtocolMode = EAudioStreamProtocolMode::PureWebSocket;
+
+    UPROPERTY(EditAnywhere, Config, Category="LegacyService|WebSocket", meta=(ToolTip="旧版 HTTP+WS 协议的 WebSocket 协议：ws/wss", EditCondition="DefaultProtocolMode == EAudioStreamProtocolMode::LegacyHttpWs", EditConditionHides))
+    FString LegacyWsScheme = TEXT("ws");
+
+    UPROPERTY(EditAnywhere, Config, Category="LegacyService|WebSocket", meta=(ToolTip="旧版 HTTP+WS 协议的主机:端口", EditCondition="DefaultProtocolMode == EAudioStreamProtocolMode::LegacyHttpWs", EditConditionHides))
+    FString LegacyWsHost = TEXT("127.0.0.1:8000");
+
+    UPROPERTY(EditAnywhere, Config, Category="LegacyService|WebSocket", meta=(ToolTip="旧版 HTTP+WS 协议的 WebSocket 路径前缀，通常为 /ws/", EditCondition="DefaultProtocolMode == EAudioStreamProtocolMode::LegacyHttpWs", EditConditionHides))
+    FString LegacyWsPathPrefix = TEXT("/ws/");
+
     // 网络（HTTP 路径仅由 UAudioStreamHttpWsComponent 使用）
-    UPROPERTY(EditAnywhere, Config, Category="HttpPaths", meta=(ToolTip="组件HTTP启动任务路径 /run"))
+    UPROPERTY(EditAnywhere, Config, Category="LegacyService|Http", meta=(ToolTip="组件HTTP启动任务路径 /run", EditCondition="DefaultProtocolMode == EAudioStreamProtocolMode::LegacyHttpWs", EditConditionHides))
     FString DefaultHttpRunPath = TEXT("/run");
 
-    UPROPERTY(EditAnywhere, Config, Category="HttpPaths", meta=(ToolTip="组件HTTP推流路径 /stream"))
+    UPROPERTY(EditAnywhere, Config, Category="LegacyService|Http", meta=(ToolTip="组件HTTP推流路径 /stream", EditCondition="DefaultProtocolMode == EAudioStreamProtocolMode::LegacyHttpWs", EditConditionHides))
     FString DefaultHttpStreamPath = TEXT("/stream");
 
-    UPROPERTY(EditAnywhere, Config, Category="HttpPaths", meta=(ToolTip="组件HTTP结束推流路径 /end-stream"))
+    UPROPERTY(EditAnywhere, Config, Category="LegacyService|Http", meta=(ToolTip="组件HTTP结束推流路径 /end-stream", EditCondition="DefaultProtocolMode == EAudioStreamProtocolMode::LegacyHttpWs", EditConditionHides))
     FString DefaultHttpEndStreamPath = TEXT("/end-stream");
 
+    UPROPERTY(EditAnywhere, Config, Category="PureWebSocketService|WebSocket", meta=(ToolTip="新协议 Pure WebSocket 的协议：ws/wss", EditCondition="DefaultProtocolMode == EAudioStreamProtocolMode::PureWebSocket", EditConditionHides))
+    FString PureWebSocketScheme = TEXT("ws");
 
-    // ========== WebSocket 连接默认配置（组件使用） ==========
-    // 下列三个字段仅被 UAudioStreamHttpWsComponent 在主动建立 WS 连接时使用
-    UPROPERTY(EditAnywhere, Config, Category="WebSocket", meta=(ToolTip="WebSocket 协议：ws/wss（组件连接使用）"))
+    UPROPERTY(EditAnywhere, Config, Category="PureWebSocketService|WebSocket", meta=(ToolTip="新协议 Pure WebSocket 的主机:端口，例如 localhost:8023", EditCondition="DefaultProtocolMode == EAudioStreamProtocolMode::PureWebSocket", EditConditionHides))
+    FString PureWebSocketHost = TEXT("127.0.0.1:8023");
+
+    UPROPERTY(EditAnywhere, Config, Category="PureWebSocketService|WebSocket", meta=(ToolTip="新协议 Pure WebSocket 的路径，通常为 /ws", EditCondition="DefaultProtocolMode == EAudioStreamProtocolMode::PureWebSocket", EditConditionHides))
+    FString PureWebSocketPath = TEXT("/ws");
+
+
+    // ========== 兼容旧配置（建议迁移到 LegacyService / PureWebSocketService） ==========
+    UPROPERTY(EditAnywhere, Config, Category="Compatibility", meta=(DisplayName="显示兼容旧配置回退项", ToolTip="默认隐藏旧版兼容回退项，只有迁移旧配置时才需要打开"))
+    bool bShowCompatibilityFallbackSettings = false;
+
+    UPROPERTY(EditAnywhere, Config, Category="Compatibility", meta=(ToolTip="兼容旧配置：未设置分离配置时作为回退 WebSocket 协议", EditCondition="bShowCompatibilityFallbackSettings", EditConditionHides, AdvancedDisplay))
     FString DefaultWsScheme = TEXT("ws"); // 或 "wss"
 
-    UPROPERTY(EditAnywhere, Config, Category="WebSocket", meta=(ToolTip="WebSocket 主机:端口（组件连接使用）"))
+    UPROPERTY(EditAnywhere, Config, Category="Compatibility", meta=(ToolTip="兼容旧配置：未设置分离配置时作为回退 WebSocket 主机:端口", EditCondition="bShowCompatibilityFallbackSettings", EditConditionHides, AdvancedDisplay))
     FString DefaultWsHost = TEXT("127.0.0.1:8000"); // host:port
 
-    UPROPERTY(EditAnywhere, Config, Category="WebSocket", meta=(ToolTip="WebSocket 路径前缀（组件连接使用）"))
+    UPROPERTY(EditAnywhere, Config, Category="Compatibility", meta=(ToolTip="兼容旧配置：未设置分离配置时作为回退 WebSocket 路径", EditCondition="bShowCompatibilityFallbackSettings", EditConditionHides, AdvancedDisplay))
     FString DefaultWsPathPrefix = TEXT("/ws/"); // 以/开头，以/结尾
 
     // ========== 组件默认参数（用于 UAudioStreamHttpWsComponent 构造 & 分帧） ==========
@@ -37,6 +67,42 @@ public:
 
     UPROPERTY(EditAnywhere, Config, Category="ComponentDefaults", meta=(ToolTip="默认声道数，用于分帧与播放兜底"))
     int32 DefaultChannels = 1;
+
+    UPROPERTY(EditAnywhere, Config, Category="ComponentDefaults", meta=(ToolTip="组件默认抖动缓冲包数量"))
+    int32 DefaultJitterBufferThreshold = 3;
+
+    UPROPERTY(EditAnywhere, Config, Category="ComponentDefaults", meta=(ToolTip="组件默认目标缓冲时长（秒）"))
+    float DefaultTargetBufferedTime = 0.1f;
+
+    UPROPERTY(EditAnywhere, Config, Category="ComponentDefaults", meta=(ToolTip="组件默认起播最小缓冲时长（秒）"))
+    float DefaultMinStartDuration = 0.02f;
+
+    UPROPERTY(EditAnywhere, Config, Category="ComponentDefaults", meta=(ToolTip="最小流请求间隔（秒）"))
+    float DefaultMinStreamRequestIntervalSeconds = 0.05f;
+
+    UPROPERTY(EditAnywhere, Config, Category="ComponentDefaults", meta=(ToolTip="文本合并窗口（秒）"))
+    float DefaultStreamTextCoalesceWindowSeconds = 0.12f;
+
+    UPROPERTY(EditAnywhere, Config, Category="ComponentDefaults", meta=(ToolTip="最大待发送文本项数"))
+    int32 DefaultMaxPendingStreamTextItems = 8;
+
+    UPROPERTY(EditAnywhere, Config, Category="ComponentDefaults", meta=(ToolTip="文本缓冲刷新间隔（秒）"))
+    float DefaultStreamTextFlushIntervalSeconds = 0.25f;
+
+    UPROPERTY(EditAnywhere, Config, Category="ComponentDefaults", meta=(ToolTip="文本达到该字符数后立即刷新"))
+    int32 DefaultStreamTextMaxBatchChars = 48;
+
+    UPROPERTY(EditAnywhere, Config, Category="ComponentDefaults", meta=(ToolTip="流请求失败退避基础时间（秒）"))
+    float DefaultStreamFailureCooldownBaseSeconds = 0.2f;
+
+    UPROPERTY(EditAnywhere, Config, Category="ComponentDefaults", meta=(ToolTip="流请求失败退避最大时间（秒）"))
+    float DefaultStreamFailureCooldownMaxSeconds = 3.0f;
+
+    UPROPERTY(EditAnywhere, Config, Category="ComponentDefaults", meta=(ToolTip="默认 Viseme 步进时长（毫秒）"))
+    int32 DefaultVisemeStepMs = 8;
+
+    UPROPERTY(EditAnywhere, Config, Category="ComponentDefaults", meta=(ToolTip="默认 Viseme 关键帧间隔（毫秒）"))
+    int32 DefaultVisemeKeyframeIntervalMs = 500;
 
     // 单帧PCM时长（毫秒），用于分帧组包（已使用于 SendPacket 分帧逻辑）
     UPROPERTY(EditAnywhere, Config, Category="Sync", meta=(ToolTip="单帧PCM时长（毫秒），影响分帧与编码（Opus）"))
@@ -71,7 +137,14 @@ public:
 
     // 静态访问器，方便统一读取设置
     static const UAudioStreamSettings* Get();
+    FString GetEffectiveWsScheme(EAudioStreamProtocolMode ProtocolMode) const;
+    FString GetEffectiveWsHost(EAudioStreamProtocolMode ProtocolMode) const;
+    FString GetEffectiveWsPath(EAudioStreamProtocolMode ProtocolMode) const;
 
     // 确保在对象初始化时加载 Config（便于在早期读取）
     virtual void PostInitProperties() override;
+
+#if WITH_EDITOR
+    virtual bool CanEditChange(const FProperty* InProperty) const override;
+#endif
 };

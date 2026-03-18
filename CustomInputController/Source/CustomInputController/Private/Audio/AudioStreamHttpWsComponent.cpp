@@ -61,6 +61,27 @@ static const TCHAR* GetRoleLabel(const UObject* Obj)
     }
 }
 
+static FString NormalizeWsPath(const FString& InPath, bool bAppendTrailingSlash)
+{
+    FString Path = InPath.IsEmpty() ? TEXT("/ws") : InPath;
+    if (!Path.StartsWith(TEXT("/")))
+    {
+        Path = TEXT("/") + Path;
+    }
+
+    while (Path.Len() > 1 && Path.EndsWith(TEXT("/")) && !bAppendTrailingSlash)
+    {
+        Path.LeftChopInline(1, false);
+    }
+
+    if (bAppendTrailingSlash && !Path.EndsWith(TEXT("/")))
+    {
+        Path += TEXT("/");
+    }
+
+    return Path;
+}
+
 // Minimal WAV extractor: if data is RIFF/WAVE, extract PCM16 or convert float32->PCM16
 static bool ExtractPcmFromMaybeWav_Local(const TArray<uint8>& InBytes, TArray<uint8>& OutPcm, int32& InOutSR, int32& InOutCH)
 {
@@ -123,9 +144,342 @@ static bool ExtractPcmFromMaybeWav_Local(const TArray<uint8>& InBytes, TArray<ui
 }
 
 // TTS生成后的首次WebSocket消息处理
+FString UAudioStreamHttpWsComponent::BuildActiveWebSocketUrl() const
+{
+    const FString WsScheme = bActiveUseHttps ? TEXT("wss") : TEXT("ws");
+    if (ProtocolMode == EAudioStreamProtocolMode::PureWebSocket)
+    {
+        const FString Path = NormalizeWsPath(ActiveWsPathPrefix, false);
+        return FString::Printf(TEXT("%s://%s%s"), *WsScheme, *ActiveHttpHost, *Path);
+    }
+
+    const FString Path = NormalizeWsPath(ActiveWsPathPrefix, true);
+    return FString::Printf(TEXT("%s://%s%s%s"), *WsScheme, *ActiveHttpHost, *Path, *ActiveTaskId);
+}
+
+bool UAudioStreamHttpWsComponent::SendPureWsMessage(const FString& Action, const TSharedPtr<FJsonObject>& Payload, const FString& TaskIdOverride)
+{
+    if (!WebSocket.IsValid() || !WebSocket->IsConnected())
+    {
+        return false;
+    }
+
+    const FString TaskId = TaskIdOverride.IsEmpty() ? ActiveTaskId : TaskIdOverride;
+    if (TaskId.IsEmpty())
+    {
+        return false;
+    }
+
+    TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+    TSharedRef<FJsonObject> Header = MakeShared<FJsonObject>();
+    Header->SetStringField(TEXT("action"), Action);
+    Header->SetStringField(TEXT("task_id"), TaskId);
+    Root->SetObjectField(TEXT("header"), Header);
+    Root->SetObjectField(TEXT("payload"), Payload.IsValid() ? Payload.ToSharedRef() : MakeShared<FJsonObject>());
+
+    FString Message;
+    const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Message);
+    if (!FJsonSerializer::Serialize(Root, Writer))
+    {
+        return false;
+    }
+
+    WebSocket->Send(Message);
+    return true;
+}
+
+void UAudioStreamHttpWsComponent::BeginPureWsTask(bool bGenerateNewTaskId)
+{
+    if (ProtocolMode != EAudioStreamProtocolMode::PureWebSocket)
+    {
+        return;
+    }
+
+    if (!WebSocket.IsValid() || !WebSocket->IsConnected())
+    {
+        return;
+    }
+
+    if (bGenerateNewTaskId || ActiveTaskId.IsEmpty())
+    {
+        ActiveTaskId = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens);
+    }
+
+    TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+    Payload->SetObjectField(TEXT("parameters"), MakeShared<FJsonObject>());
+
+    bPureWsTaskStarted = false;
+    bPureWsAwaitingTaskStart = SendPureWsMessage(TEXT("run-task"), Payload, ActiveTaskId);
+}
+
+void UAudioStreamHttpWsComponent::HandleIncomingAudioChunk(const FString& Base64Audio, int32 SampleRate, int32 Channels)
+{
+    if (Base64Audio.IsEmpty())
+    {
+        return;
+    }
+
+    TArray<uint8> Decoded;
+    if (!FBase64::Decode(Base64Audio, Decoded))
+    {
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), TEXT("WS audio base64 decode failed (component)"));
+        return;
+    }
+
+    TArray<uint8> Pcm;
+    int32 UseSR = SampleRate;
+    int32 UseCH = Channels;
+    const bool bWav = ExtractPcmFromMaybeWav_Local(Decoded, Pcm, UseSR, UseCH);
+    const TArray<uint8>& FinalPayload = bWav ? Pcm : Decoded;
+
+    FGuid Guid;
+    FGuid::Parse(RegisteredUuid, Guid);
+
+    if (UGameInstance* GI = GetWorld() ? GetWorld()->GetGameInstance() : nullptr)
+    {
+        if (UAudioStreamHttpWsSubsystem* SS = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>())
+        {
+            SS->SendPacket(AudioStreamPacket::Audio, FinalPayload, Guid);
+            SS->UpdateStats(bWav ? Pcm.Num() : Decoded.Num(), UseSR, UseCH);
+
+            AudioStreamPacket::FHeader Header;
+            Header.Type = AudioStreamPacket::Audio;
+            Header.Flags = 0x01 | LocalDecodedPcmFlag;
+            Header.Uuid = Guid;
+            Header.Seq = ++LocalAudioSeq;
+            ReceiveSocketMessage(Header, FinalPayload);
+        }
+    }
+}
+
+void UAudioStreamHttpWsComponent::HandleIncomingVisemeChunk(const TArray<int32>& Visemes, const TArray<float>& Confidence)
+{
+    FGuid Guid;
+    FGuid::Parse(RegisteredUuid, Guid);
+
+    if (UGameInstance* GI = GetWorld() ? GetWorld()->GetGameInstance() : nullptr)
+    {
+        if (UAudioStreamHttpWsSubsystem* SS = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>())
+        {
+            TArray<uint8> Payload;
+            FMemoryWriter Writer(Payload);
+            TArray<int32> VisCopy = Visemes;
+            TArray<float> ConfCopy = Confidence;
+            Writer << VisCopy;
+            Writer << ConfCopy;
+
+            SS->SendPacket(AudioStreamPacket::Viseme, Payload, Guid);
+            SS->UpdateVisemeStats(Visemes.Num());
+
+            AudioStreamPacket::FHeader Header;
+            Header.Type = AudioStreamPacket::Viseme;
+            Header.Flags = 0x01;
+            Header.Uuid = Guid;
+            ReceiveSocketMessage(Header, Payload);
+        }
+    }
+}
+
+void UAudioStreamHttpWsComponent::HandleIncomingTextChunk(const FString& Text)
+{
+    FGuid Guid;
+    FGuid::Parse(RegisteredUuid, Guid);
+
+    if (UGameInstance* GI = GetWorld() ? GetWorld()->GetGameInstance() : nullptr)
+    {
+        if (UAudioStreamHttpWsSubsystem* SS = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>())
+        {
+            FTCHARToUTF8 Utf8(*Text);
+            TArray<uint8> Payload;
+            Payload.Append((const uint8*)Utf8.Get(), Utf8.Length());
+
+            SS->SendPacket(AudioStreamPacket::Text, Payload, Guid);
+
+            AudioStreamPacket::FHeader Header;
+            Header.Type = AudioStreamPacket::Text;
+            Header.Flags = 0x01;
+            Header.Uuid = Guid;
+            ReceiveSocketMessage(Header, Payload);
+        }
+    }
+}
+
+void UAudioStreamHttpWsComponent::ApplySettingsDefaultsFromProject()
+{
+    if (HasAnyFlags(RF_ClassDefaultObject))
+    {
+        return;
+    }
+
+    const UAudioStreamSettings* Settings = UAudioStreamSettings::Get();
+    const UAudioStreamHttpWsComponent* NativeDefaults = UAudioStreamHttpWsComponent::StaticClass()->GetDefaultObject<UAudioStreamHttpWsComponent>();
+    if (!Settings || !NativeDefaults)
+    {
+        return;
+    }
+
+    if (ProtocolMode == NativeDefaults->ProtocolMode)
+    {
+        ProtocolMode = Settings->DefaultProtocolMode;
+    }
+
+    if (JitterBufferThreshold == NativeDefaults->JitterBufferThreshold)
+    {
+        JitterBufferThreshold = Settings->DefaultJitterBufferThreshold;
+    }
+
+    if (FMath::IsNearlyEqual(TargetBufferedTime, NativeDefaults->TargetBufferedTime))
+    {
+        TargetBufferedTime = Settings->DefaultTargetBufferedTime;
+    }
+
+    if (FMath::IsNearlyEqual(MinStartDuration, NativeDefaults->MinStartDuration))
+    {
+        MinStartDuration = Settings->DefaultMinStartDuration;
+    }
+
+    if (FMath::IsNearlyEqual(MinStreamRequestIntervalSeconds, NativeDefaults->MinStreamRequestIntervalSeconds))
+    {
+        MinStreamRequestIntervalSeconds = Settings->DefaultMinStreamRequestIntervalSeconds;
+    }
+
+    if (FMath::IsNearlyEqual(StreamTextCoalesceWindowSeconds, NativeDefaults->StreamTextCoalesceWindowSeconds))
+    {
+        StreamTextCoalesceWindowSeconds = Settings->DefaultStreamTextCoalesceWindowSeconds;
+    }
+
+    if (MaxPendingStreamTextItems == NativeDefaults->MaxPendingStreamTextItems)
+    {
+        MaxPendingStreamTextItems = Settings->DefaultMaxPendingStreamTextItems;
+    }
+
+    if (FMath::IsNearlyEqual(StreamTextFlushIntervalSeconds, NativeDefaults->StreamTextFlushIntervalSeconds))
+    {
+        StreamTextFlushIntervalSeconds = Settings->DefaultStreamTextFlushIntervalSeconds;
+    }
+
+    if (StreamTextMaxBatchChars == NativeDefaults->StreamTextMaxBatchChars)
+    {
+        StreamTextMaxBatchChars = Settings->DefaultStreamTextMaxBatchChars;
+    }
+
+    if (FMath::IsNearlyEqual(StreamFailureCooldownBaseSeconds, NativeDefaults->StreamFailureCooldownBaseSeconds))
+    {
+        StreamFailureCooldownBaseSeconds = Settings->DefaultStreamFailureCooldownBaseSeconds;
+    }
+
+    if (FMath::IsNearlyEqual(StreamFailureCooldownMaxSeconds, NativeDefaults->StreamFailureCooldownMaxSeconds))
+    {
+        StreamFailureCooldownMaxSeconds = Settings->DefaultStreamFailureCooldownMaxSeconds;
+    }
+
+    if (VisemeStepMs == NativeDefaults->VisemeStepMs)
+    {
+        VisemeStepMs = Settings->DefaultVisemeStepMs;
+    }
+
+    if (VisemeKeyframeIntervalMs == NativeDefaults->VisemeKeyframeIntervalMs)
+    {
+        VisemeKeyframeIntervalMs = Settings->DefaultVisemeKeyframeIntervalMs;
+    }
+}
+
+void UAudioStreamHttpWsComponent::EnqueuePendingWebSocketMessage(const FString& Message)
+{
+    FScopeLock Lock(&PendingWebSocketMessagesCS);
+    PendingWebSocketMessages.Add(Message);
+}
+
+void UAudioStreamHttpWsComponent::ProcessPendingWebSocketMessages(int32 MaxMessagesToProcess)
+{
+    if (MaxMessagesToProcess <= 0)
+    {
+        return;
+    }
+
+    TArray<FString> MessagesToProcess;
+    {
+        FScopeLock Lock(&PendingWebSocketMessagesCS);
+        const int32 NumToProcess = FMath::Min(MaxMessagesToProcess, PendingWebSocketMessages.Num());
+        if (NumToProcess <= 0)
+        {
+            return;
+        }
+
+        MessagesToProcess.Reserve(NumToProcess);
+        for (int32 Index = 0; Index < NumToProcess; ++Index)
+        {
+            MessagesToProcess.Add(MoveTemp(PendingWebSocketMessages[Index]));
+        }
+        PendingWebSocketMessages.RemoveAt(0, NumToProcess, EAllowShrinking::No);
+    }
+
+    for (const FString& PendingMessage : MessagesToProcess)
+    {
+        ProcessWebSocketMessage(PendingMessage);
+    }
+}
+
+void UAudioStreamHttpWsComponent::ResetPendingWebSocketMessages()
+{
+    FScopeLock Lock(&PendingWebSocketMessagesCS);
+    PendingWebSocketMessages.Reset();
+}
+
+void UAudioStreamHttpWsComponent::ResetAudioPacketQueue()
+{
+    AudioPacketQueue.Reset();
+    QueuedAudioBytes = 0;
+}
+
+float UAudioStreamHttpWsComponent::GetBufferedAudioDurationSeconds() const
+{
+    if (ActiveWsSampleRate <= 0 || ActiveWsChannels <= 0)
+    {
+        return 0.0f;
+    }
+
+    const int32 BytesPerSecond = ActiveWsSampleRate * ActiveWsChannels * static_cast<int32>(sizeof(int16));
+    if (BytesPerSecond <= 0)
+    {
+        return 0.0f;
+    }
+
+    return static_cast<float>(QueuedAudioBytes) / static_cast<float>(BytesPerSecond);
+}
+
+void UAudioStreamHttpWsComponent::TrimAudioPacketQueueIfNeeded()
+{
+    if (AudioPacketQueue.Num() <= 1)
+    {
+        return;
+    }
+
+    int32 DroppedPackets = 0;
+    int32 DroppedBytes = 0;
+    while (AudioPacketQueue.Num() > 1 && GetBufferedAudioDurationSeconds() > MaxBufferedAudioSeconds)
+    {
+        const int32 OldestPacketBytes = AudioPacketQueue[0].Data.Num();
+        AudioPacketQueue.RemoveAt(0, 1, EAllowShrinking::No);
+        QueuedAudioBytes = FMath::Max(0, QueuedAudioBytes - OldestPacketBytes);
+        DroppedBytes += OldestPacketBytes;
+        ++DroppedPackets;
+    }
+
+    if (DroppedPackets > 0)
+    {
+        const double Now = FPlatformTime::Seconds();
+        if (Now - LastAudioQueuePressureLogTime > 1.0)
+        {
+            LastAudioQueuePressureLogTime = Now;
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("音频流组件"), TEXT("性能保护"),
+                FString::Printf(TEXT("Audio backlog trimmed: dropped %d packets (%d bytes), buffered=%.3fs"), DroppedPackets, DroppedBytes, GetBufferedAudioDurationSeconds()));
+        }
+    }
+}
+
 void UAudioStreamHttpWsComponent::ProcessWebSocketMessage(const FString& Message)
 {
-  
     TSharedPtr<FJsonObject> RootObj;
     const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Message);
     if (!FJsonSerializer::Deserialize(Reader, RootObj) || !RootObj.IsValid())
@@ -133,181 +487,197 @@ void UAudioStreamHttpWsComponent::ProcessWebSocketMessage(const FString& Message
         FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("首次接收处理"), TEXT("WS parse failed (component)"));
         return;
     }
-    else
-    {
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("流数据处理"), TEXT("首次接收处理"), TEXT("WS parsed (component)"));
-    }
 
-    FString StatusStr;
-    if (RootObj->TryGetStringField(TEXT("status"), StatusStr))
+    const TSharedPtr<FJsonObject>* HeaderObj = nullptr;
+    const TSharedPtr<FJsonObject>* PayloadObj = nullptr;
+    if (RootObj->TryGetObjectField(TEXT("header"), HeaderObj) && HeaderObj && HeaderObj->IsValid())
     {
-        if (StatusStr.Equals(TEXT("completed"), ESearchCase::IgnoreCase))
+        const TSharedPtr<FJsonObject> Header = *HeaderObj;
+        const TSharedPtr<FJsonObject> Payload = (RootObj->TryGetObjectField(TEXT("payload"), PayloadObj) && PayloadObj && PayloadObj->IsValid()) ? *PayloadObj : MakeShared<FJsonObject>();
+
+        FString Event;
+        FString TaskId;
+        Header->TryGetStringField(TEXT("event"), Event);
+        Header->TryGetStringField(TEXT("task_id"), TaskId);
+
+        auto ParseIntArray = [](const TSharedPtr<FJsonObject>& Obj, const FString& FieldName, TArray<int32>& Out)
         {
-            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流数据处理"), TEXT("流程更新"), TEXT("WS status=completed (component)"));
-            // 当服务端报告本次任务已完成：
-            // 1) 先关闭当前 WebSocket，避免旧会话继续推送
-            //   传参 true 表示保留当前音频队列，避免"Cut-off"（截断），实现平滑过渡
-            CloseWebSocket(true);
-            
-            // 2) 立即新建一次 /run，获取新的 task_id 并重连，保持持续可用
-            if (!ActiveHttpHost.IsEmpty() && !ActiveHttpRunPath.IsEmpty() && !ActiveWsPathPrefix.IsEmpty())
+            const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+            if (!Obj.IsValid() || !Obj->TryGetArrayField(FieldName, Arr) || !Arr)
             {
-                // 启用 SoftReconnect=true，保留 AudioPlayer 和 SoundStream 不被销毁或重置
-                StartRunAndConnect(ActiveHttpHost,
-                                   FString() /* CallbackUrl: 继续复用默认/空 */,
-                                   RegisteredUuid,
-                                   ActiveWsSampleRate,
-                                   ActiveWsChannels,
-                                   bActiveUseHttps,
-                                   ActiveHttpRunPath,
-                                   ActiveWsPathPrefix,
-                                   true);
+                return;
             }
+
+            Out.Reserve(Arr->Num());
+            for (const TSharedPtr<FJsonValue>& Value : *Arr)
+            {
+                int32 Parsed = 0;
+                if (Value.IsValid() && Value->TryGetNumber(Parsed))
+                {
+                    Out.Add(Parsed);
+                }
+            }
+        };
+
+        auto ParseFloatArray = [](const TSharedPtr<FJsonObject>& Obj, const FString& FieldName, TArray<float>& Out)
+        {
+            const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+            if (!Obj.IsValid() || !Obj->TryGetArrayField(FieldName, Arr) || !Arr)
+            {
+                return;
+            }
+
+            Out.Reserve(Arr->Num());
+            for (const TSharedPtr<FJsonValue>& Value : *Arr)
+            {
+                double Parsed = 0.0;
+                if (Value.IsValid() && Value->TryGetNumber(Parsed))
+                {
+                    Out.Add((float)Parsed);
+                }
+            }
+        };
+
+        if (Event.Equals(TEXT("task-started"), ESearchCase::IgnoreCase))
+        {
+            if (!TaskId.IsEmpty())
+            {
+                ActiveTaskId = TaskId;
+            }
+            bPureWsAwaitingTaskStart = false;
+            bPureWsTaskStarted = true;
+            ScheduleProcessNextStreamQueueItem();
+            return;
+        }
+
+        if (Event.Equals(TEXT("audio-viseme-data"), ESearchCase::IgnoreCase))
+        {
+            FString AudioBase64;
+            Payload->TryGetStringField(TEXT("audio"), AudioBase64);
+            if (!AudioBase64.IsEmpty())
+            {
+                HandleIncomingAudioChunk(AudioBase64, ActiveWsSampleRate, ActiveWsChannels);
+            }
+
+            TArray<int32> Visemes;
+            TArray<float> Confidence;
+            ParseIntArray(Payload, TEXT("visemes"), Visemes);
+            ParseFloatArray(Payload, TEXT("confidence"), Confidence);
+            if (Visemes.Num() > 0 || Confidence.Num() > 0)
+            {
+                HandleIncomingVisemeChunk(Visemes, Confidence);
+            }
+            return;
+        }
+
+        if (Event.Equals(TEXT("task-finished"), ESearchCase::IgnoreCase))
+        {
+            bPureWsTaskStarted = false;
+            bPureWsAwaitingTaskStart = false;
+            if (ProtocolMode == EAudioStreamProtocolMode::PureWebSocket && WebSocket.IsValid() && WebSocket->IsConnected() && !bManualClose)
+            {
+                BeginPureWsTask(true);
+            }
+            return;
+        }
+
+        if (Event.Equals(TEXT("task-failed"), ESearchCase::IgnoreCase))
+        {
+            FString ErrorCode;
+            FString ErrorMessage;
+            Header->TryGetStringField(TEXT("error_code"), ErrorCode);
+            Header->TryGetStringField(TEXT("error_message"), ErrorMessage);
+            bPureWsTaskStarted = false;
+            bPureWsAwaitingTaskStart = false;
+
+            TMap<FString, FString> Data;
+            Data.Add(TEXT("task_id"), TaskId);
+            Data.Add(TEXT("error_code"), ErrorCode);
+            Data.Add(TEXT("error_message"), ErrorMessage);
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("流程更新"), TEXT("Pure WS task failed"), Data);
+
+            ScheduleProcessNextStreamQueueItem(0.1f);
             return;
         }
     }
 
-    // 获取 type 字段
-    FString Type; RootObj->TryGetStringField(TEXT("type"), Type);
-    // 尝试从 key 或 role_id 字段获取 UUID,如果都没有则使用 RegisteredUuid
-    // FString MsgUuid; RootObj->TryGetStringField(TEXT("key"), MsgUuid); if (MsgUuid.IsEmpty()) RootObj->TryGetStringField(TEXT("role_id"), MsgUuid);
-    // const FString Uuid = !MsgUuid.IsEmpty() ? MsgUuid : RegisteredUuid;
+    FString StatusStr;
+    if (RootObj->TryGetStringField(TEXT("status"), StatusStr) && StatusStr.Equals(TEXT("completed"), ESearchCase::IgnoreCase))
+    {
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流数据处理"), TEXT("流程更新"), TEXT("WS status=completed (component)"));
+        CloseWebSocket(true);
 
-    // 暂时只用 RegisteredUuid
-    const FString Uuid = RegisteredUuid;
-    
-    // 准备 UUID (用于转发)
-    FGuid Guid;
-    FGuid::Parse(RegisteredUuid, Guid);
+        if (!ActiveHttpHost.IsEmpty() && !ActiveHttpRunPath.IsEmpty() && !ActiveWsPathPrefix.IsEmpty())
+        {
+            StartRunAndConnect(ActiveHttpHost,
+                               FString(),
+                               RegisteredUuid,
+                               ActiveWsSampleRate,
+                               ActiveWsChannels,
+                               bActiveUseHttps,
+                               ActiveHttpRunPath,
+                               ActiveWsPathPrefix,
+                               true);
+        }
+        return;
+    }
 
+    FString Type;
+    RootObj->TryGetStringField(TEXT("type"), Type);
     if (Type.Equals(TEXT("audio"), ESearchCase::IgnoreCase))
     {
         int32 SR = ActiveWsSampleRate;
         int32 CH = ActiveWsChannels;
-        int32 Tmp;
+        int32 Tmp = 0;
         if (RootObj->TryGetNumberField(TEXT("sample_rate"), Tmp)) SR = Tmp;
         if (RootObj->TryGetNumberField(TEXT("channels"), Tmp)) CH = FMath::Clamp(Tmp, 1, 8);
 
-        FString Base64; RootObj->TryGetStringField(TEXT("data"), Base64);
-        // Base64 数据为空
-        if (Base64.IsEmpty())
-        {
-            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), TEXT("WS audio dropped: empty base64 (component)"));
-            return;
-        }
-        // 解码 Base64 失败
-        TArray<uint8> Decoded;
-        if (!FBase64::Decode(Base64, Decoded))
-        {
-            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("接收处理"), TEXT("WS audio base64 decode failed (component)"));
-            return;
-        }
-        TArray<uint8> Pcm;
-        int32 UseSR = SR, UseCH = CH;
-        // 先尝试从 WAV 中提取 PCM
-        const bool bWav = ExtractPcmFromMaybeWav_Local(Decoded, Pcm, UseSR, UseCH);
-        const int32 Bytes = bWav ? Pcm.Num() : Decoded.Num();
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("WS audio parsed -> kind=%s uuid=%s bytes=%d sr=%d ch=%d"), bWav?TEXT("WAV"):TEXT("RAW"), *Uuid, Bytes, UseSR, UseCH));
-
-        const TArray<uint8>& FinalPayload = bWav ? Pcm : Decoded;
-
-        // 转发到 Socket
-        if (UGameInstance* GI = GetWorld() ? GetWorld()->GetGameInstance() : nullptr)
-        {
-            if (UAudioStreamHttpWsSubsystem* SS = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>())
-            {
-                // 发送解码后的 PCM 数据
-                SS->SendPacket(AudioStreamPacket::Audio, FinalPayload, Guid);
-                SS->UpdateStats(Bytes, UseSR, UseCH);
-
-                
-                // 额外转发给自己一份
-                FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("Forward audio to self uuid=%s bytes=%d"), *Uuid, FinalPayload.Num()));
-                AudioStreamPacket::FHeader Header;
-                Header.Type = AudioStreamPacket::Audio;
-                Header.Flags = 0x01; // HasUuid
-                Header.Uuid = Guid;
-                Header.Seq = ++LocalAudioSeq;
-                ReceiveSocketMessage(Header, FinalPayload);
-            }
-        }
+        FString Base64;
+        RootObj->TryGetStringField(TEXT("data"), Base64);
+        HandleIncomingAudioChunk(Base64, SR, CH);
     }
     else if (Type.Equals(TEXT("text"), ESearchCase::IgnoreCase))
     {
-        FString Text; RootObj->TryGetStringField(TEXT("data"), Text);
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流数据处理"), TEXT("接收处理"), FString::Printf(TEXT("WS text for uuid=%s: %s"), *Uuid, *Text));
-        
-        // 转发到 Socket
-        if (UGameInstance* GI = GetWorld() ? GetWorld()->GetGameInstance() : nullptr)
-        {
-            if (UAudioStreamHttpWsSubsystem* SS = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>())
-            {
-                FTCHARToUTF8 Utf8(*Text);
-                TArray<uint8> Payload;
-                Payload.Append((const uint8*)Utf8.Get(), Utf8.Length());
-                
-                SS->SendPacket(AudioStreamPacket::Text, Payload, Guid);
-
-                // 额外转发给自己一份
-                AudioStreamPacket::FHeader Header;
-                Header.Type = AudioStreamPacket::Text;
-                Header.Flags = 0x01; // HasUuid
-                Header.Uuid = Guid;
-                ReceiveSocketMessage(Header, Payload);
-            }
-        }
+        FString Text;
+        RootObj->TryGetStringField(TEXT("data"), Text);
+        HandleIncomingTextChunk(Text);
     }
     else if (Type.Equals(TEXT("viseme"), ESearchCase::IgnoreCase))
     {
-        // 第一步：解析 viseme 数组
-        TArray<int32> Vis; 
+        TArray<int32> Vis;
+        TArray<float> Confidence;
         const TArray<TSharedPtr<FJsonValue>>* ArrPtr = nullptr;
         if (!RootObj->TryGetArrayField(TEXT("data"), ArrPtr) || !ArrPtr)
         {
             FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("流数据处理"), TEXT("Audio处理"), TEXT("WS viseme dropped: no array"));
             return;
         }
-        // 从 JSON 数组中提取整数 viseme 数据
+
         Vis.Reserve(ArrPtr->Num());
-        for (const auto& V : *ArrPtr) { int32 Val=0; if (V->TryGetNumber(Val)) Vis.Add(Val); }
-        
-        // 第二步：解析 confidence 数组
-        TArray<float> Confidence;
+        for (const auto& V : *ArrPtr)
+        {
+            int32 Val = 0;
+            if (V.IsValid() && V->TryGetNumber(Val))
+            {
+                Vis.Add(Val);
+            }
+        }
+
         const TArray<TSharedPtr<FJsonValue>>* ConfPtr = nullptr;
         if (RootObj->TryGetArrayField(TEXT("confidence"), ConfPtr) && ConfPtr)
         {
             Confidence.Reserve(ConfPtr->Num());
             for (const auto& C : *ConfPtr)
             {
-                double D=0.0;
-                if (C->TryGetNumber(D)) Confidence.Add((float)D);
+                double D = 0.0;
+                if (C.IsValid() && C->TryGetNumber(D))
+                {
+                    Confidence.Add((float)D);
+                }
             }
         }
-        //控制uuid输出为前8位
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("流数据处理"), TEXT("Viseme处理"), FString::Printf(TEXT("WS viseme -> n=%d confN=%d uuid=%s "), Vis.Num(), Confidence.Num(),/*取前八位*/ *Uuid.Left(8)));
-        // 转发到 Socket
-        if (UGameInstance* GI = GetWorld() ? GetWorld()->GetGameInstance() : nullptr)
-        {
-            if (UAudioStreamHttpWsSubsystem* SS = GI->GetSubsystem<UAudioStreamHttpWsSubsystem>())
-            {
-                // TODO:感觉这个viseme的序列化有点问题,后续需要重新设计viseme的标准格式
-                // 序列化 Viseme 数据: [NumVis:4][VisData...][NumConf:4][ConfData...]
-                TArray<uint8> Payload;
-                FMemoryWriter Writer(Payload);
-                Writer << Vis;
-                Writer << Confidence;
-                
-                SS->SendPacket(AudioStreamPacket::Viseme, Payload, Guid);
-                SS->UpdateVisemeStats(Vis.Num());
 
-                // 额外转发给自己一份：立即入队待消费
-                AudioStreamPacket::FHeader Header;
-                Header.Type = AudioStreamPacket::Viseme;
-                Header.Flags = 0x01; // HasUuid
-                Header.Uuid = Guid;
-                ReceiveSocketMessage(Header, Payload);
-            }
-        }
+        HandleIncomingVisemeChunk(Vis, Confidence);
     }
     else
     {
@@ -326,6 +696,8 @@ UAudioStreamHttpWsComponent::UAudioStreamHttpWsComponent()
 void UAudioStreamHttpWsComponent::BeginPlay()
 {
     Super::BeginPlay();
+
+    ApplySettingsDefaultsFromProject();
     
     EnsureAndZeroVisemeArray();
 
@@ -344,14 +716,16 @@ void UAudioStreamHttpWsComponent::BeginPlay()
         return;
     }
 
-    // 使用设置中的默认值（如果存在），优先使用 settings 的 DefaultWsHost / DefaultWsScheme / DefaultWsPathPrefix
+    // 按协议模式选择对应的服务配置
     const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
-    FString Host = S ? S->DefaultWsHost : TEXT("127.0.0.1:8001");
-    const bool bHttps = S ? S->DefaultWsScheme.Equals(TEXT("wss"), ESearchCase::IgnoreCase) : false;
+    const EAudioStreamProtocolMode EffectiveProtocolMode = ProtocolMode;
+    FString Host = S ? S->GetEffectiveWsHost(EffectiveProtocolMode) : TEXT("127.0.0.1:8001");
+    const FString WsScheme = S ? S->GetEffectiveWsScheme(EffectiveProtocolMode) : TEXT("ws");
+    const bool bHttps = WsScheme.Equals(TEXT("wss"), ESearchCase::IgnoreCase);
     const int32 SR = S ? S->DefaultSampleRate : ActiveWsSampleRate;
     const int32 CH = S ? S->DefaultChannels : ActiveWsChannels;
     const FString RunPath = S ? S->DefaultHttpRunPath : TEXT("/run");
-    const FString WsPrefix = S ? S->DefaultWsPathPrefix : TEXT("/ws/");
+    const FString WsPrefix = S ? S->GetEffectiveWsPath(EffectiveProtocolMode) : TEXT("/ws/");
 
     // 自动在 BeginPlay 尝试发起 /run 并连接 WebSocket（使用 PreferredKey 作为 key，如果为空则让子系统分配）
     StartRunAndConnect(Host, FString(), PreferredKey, SR, CH, bHttps, RunPath, WsPrefix);
@@ -464,11 +838,14 @@ void UAudioStreamHttpWsComponent::StartRunAndConnect(const FString& ServerHostWi
         VisemeConfQueue.Empty();
         VisemeStepsEmitted = 0;
         EnsureAndZeroVisemeArray();
+        ResetPendingWebSocketMessages();
     }
 
     // 保存当前会话的路径，以便重连时复用
     ActiveHttpRunPath = HttpRunPath;
     ActiveWsPathPrefix = WsPathPrefix;
+    bPureWsTaskStarted = false;
+    bPureWsAwaitingTaskStart = false;
 
     bForceNextFadeIn = true; // Force fade-in for the new run/stream
 
@@ -483,16 +860,23 @@ void UAudioStreamHttpWsComponent::StartRunAndConnect(const FString& ServerHostWi
         bIsPlaying = false;
         LastPlayedSeq = 0;
         LocalAudioSeq = 0;
-        AudioPacketQueue.Empty();
+        ResetAudioPacketQueue();
         TotalAudioFedDuration = 0.0;
     }
     // else: Keep audio state (packet queue, sequences, playing status) intact.
 
-    // 把 /run 请求逻辑分离为 RequestRunTask
-    // RequestRunTask(ServerHostWithPort, CallbackUrl, TargetUuid, SampleRate, Channels, bUseHttps, HttpRunPath, WsPathPrefix);
-
-    // Initialization Delay applied on StartRunAndConnect
-    RequestRunTask(ServerHostWithPort, CallbackUrl, TargetUuid, SampleRate, Channels, bUseHttps, HttpRunPath, WsPathPrefix);
+    if (ProtocolMode == EAudioStreamProtocolMode::PureWebSocket)
+    {
+        if (ActiveTaskId.IsEmpty() || !bCanSoftReconnect)
+        {
+            ActiveTaskId = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens);
+        }
+        ConnectWebSocket(BuildActiveWebSocketUrl());
+    }
+    else
+    {
+        RequestRunTask(ServerHostWithPort, CallbackUrl, TargetUuid, SampleRate, Channels, bUseHttps, HttpRunPath, WsPathPrefix);
+    }
     
     // 确保播放被正确触发
     if (AudioPlayer)
@@ -518,6 +902,12 @@ void UAudioStreamHttpWsComponent::StartRunAndConnect(const FString& ServerHostWi
 // 新方法：执行 /run POST 并解析 task_id，成功后发起 WebSocket 连接
 void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPort, const FString& CallbackUrl, const FString& TargetUuid, int32 SampleRate, int32 Channels, bool bUseHttps, const FString& HttpRunPath, const FString& WsPathPrefix)
 {
+    if (ProtocolMode == EAudioStreamProtocolMode::PureWebSocket)
+    {
+        ConnectWebSocket(BuildActiveWebSocketUrl());
+        return;
+    }
+
     // Ensure GameThread execution
     if (!IsInGameThread())
     {
@@ -656,8 +1046,223 @@ void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPo
     }
 }
 
+void UAudioStreamHttpWsComponent::CancelActiveStreamRequest(const TCHAR* Reason)
+{
+    if (!IsInGameThread())
+    {
+        TWeakObjectPtr<UAudioStreamHttpWsComponent> Self = this;
+        const FString ReasonCopy = Reason ? Reason : TEXT("Unknown");
+        AsyncTask(ENamedThreads::GameThread, [Self, ReasonCopy]()
+        {
+            if (UAudioStreamHttpWsComponent* P = Self.Get())
+            {
+                P->CancelActiveStreamRequest(*ReasonCopy);
+            }
+        });
+        return;
+    }
+
+    if (ActiveStreamRequest.IsValid())
+    {
+        ActiveStreamRequest->OnProcessRequestComplete().Unbind();
+        ActiveStreamRequest->CancelRequest();
+        ActiveStreamRequest.Reset();
+        ActiveStreamRequestId = 0;
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("信息流"), FString::Printf(TEXT("Canceled active stream request (%s)"), Reason ? Reason : TEXT("Unknown")));
+    }
+}
+
+void UAudioStreamHttpWsComponent::ScheduleProcessNextStreamQueueItem(float DelaySeconds)
+{
+    if (!IsInGameThread())
+    {
+        TWeakObjectPtr<UAudioStreamHttpWsComponent> Self = this;
+        const float DelayCopy = DelaySeconds;
+        AsyncTask(ENamedThreads::GameThread, [Self, DelayCopy]()
+        {
+            if (UAudioStreamHttpWsComponent* P = Self.Get())
+            {
+                P->ScheduleProcessNextStreamQueueItem(DelayCopy);
+            }
+        });
+        return;
+    }
+
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(StreamQueueProcessTimerHandle);
+
+        TWeakObjectPtr<UAudioStreamHttpWsComponent> Self = this;
+        const float SafeDelay = FMath::Max(0.0f, DelaySeconds);
+        if (SafeDelay <= KINDA_SMALL_NUMBER)
+        {
+            World->GetTimerManager().SetTimerForNextTick([Self]()
+            {
+                if (UAudioStreamHttpWsComponent* P = Self.Get())
+                {
+                    P->ProcessNextStreamQueueItem();
+                }
+            });
+            return;
+        }
+
+        World->GetTimerManager().SetTimer(StreamQueueProcessTimerHandle, [Self]()
+        {
+            if (UAudioStreamHttpWsComponent* P = Self.Get())
+            {
+                P->ProcessNextStreamQueueItem();
+            }
+        }, SafeDelay, false);
+    }
+}
+
+void UAudioStreamHttpWsComponent::SchedulePendingStreamTextFlush(float DelaySeconds)
+{
+    if (!IsInGameThread())
+    {
+        TWeakObjectPtr<UAudioStreamHttpWsComponent> Self = this;
+        const float DelayCopy = DelaySeconds;
+        AsyncTask(ENamedThreads::GameThread, [Self, DelayCopy]()
+        {
+            if (UAudioStreamHttpWsComponent* P = Self.Get())
+            {
+                P->SchedulePendingStreamTextFlush(DelayCopy);
+            }
+        });
+        return;
+    }
+
+    if (UWorld* World = GetWorld())
+    {
+        const float SafeDelay = FMath::Max(0.0f, DelaySeconds);
+        TWeakObjectPtr<UAudioStreamHttpWsComponent> Self = this;
+        World->GetTimerManager().ClearTimer(PendingStreamTextFlushTimerHandle);
+        World->GetTimerManager().SetTimer(PendingStreamTextFlushTimerHandle, [Self]()
+        {
+            if (UAudioStreamHttpWsComponent* P = Self.Get())
+            {
+                P->FlushPendingStreamText(false);
+            }
+        }, SafeDelay, false);
+    }
+}
+
+void UAudioStreamHttpWsComponent::FlushPendingStreamText(bool bForce)
+{
+    if (!IsInGameThread())
+    {
+        TWeakObjectPtr<UAudioStreamHttpWsComponent> Self = this;
+        AsyncTask(ENamedThreads::GameThread, [Self, bForce]()
+        {
+            if (UAudioStreamHttpWsComponent* P = Self.Get())
+            {
+                P->FlushPendingStreamText(bForce);
+            }
+        });
+        return;
+    }
+
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(PendingStreamTextFlushTimerHandle);
+    }
+
+    if (PendingStreamTextBuffer.IsEmpty())
+    {
+        return;
+    }
+
+    // Non-forced flushes are timer driven; they should still emit whatever has accumulated
+    if (!bForce && PendingStreamTextBuffer.Len() < FMath::Max(1, StreamTextMaxBatchChars))
+    {
+        SchedulePendingStreamTextFlush(StreamTextFlushIntervalSeconds);
+        return;
+    }
+
+    const FString TextToQueue = PendingStreamTextBuffer.TrimStartAndEnd();
+    PendingStreamTextBuffer.Empty();
+    if (TextToQueue.IsEmpty())
+    {
+        return;
+    }
+
+    const double NowSeconds = FPlatformTime::Seconds();
+    if (!TryCoalesceQueuedText(TextToQueue, NowSeconds))
+    {
+        FStreamQueueItem Item;
+        Item.Type = FStreamQueueItem::EType::Text;
+        Item.TextContent = TextToQueue;
+        Item.EnqueueTimeSeconds = NowSeconds;
+        StreamQueue.Add(Item);
+    }
+
+    TMap<FString, FString> Data;
+    Data.Add(TEXT("len"), FString::FromInt(TextToQueue.Len()));
+    Data.Add(TEXT("queue"), FString::FromInt(StreamQueue.Num()));
+    Data.Add(TEXT("force"), bForce ? TEXT("1") : TEXT("0"));
+    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("音频流组件"), TEXT("节流"), TEXT("FlushPendingStreamText"), Data);
+
+    ScheduleProcessNextStreamQueueItem();
+}
+
+bool UAudioStreamHttpWsComponent::TryCoalesceQueuedText(const FString& Text, double NowSeconds)
+{
+    const int32 QueueNum = StreamQueue.Num();
+    if (QueueNum <= 0)
+    {
+        return false;
+    }
+
+    const float CoalesceWindow = FMath::Max(0.0f, StreamTextCoalesceWindowSeconds);
+    const bool bForceMerge = QueueNum >= FMath::Max(1, MaxPendingStreamTextItems);
+
+    for (int32 Index = QueueNum - 1; Index >= 0; --Index)
+    {
+        FStreamQueueItem& Candidate = StreamQueue[Index];
+        if (Candidate.Type == FStreamQueueItem::EType::EndStream)
+        {
+            break;
+        }
+
+        if (Candidate.Type != FStreamQueueItem::EType::Text)
+        {
+            continue;
+        }
+
+        const double Age = NowSeconds - Candidate.EnqueueTimeSeconds;
+        if (!bForceMerge && (CoalesceWindow <= KINDA_SMALL_NUMBER || Age > CoalesceWindow))
+        {
+            return false;
+        }
+
+        if (!Candidate.TextContent.IsEmpty() && !Candidate.TextContent.EndsWith(TEXT(" ")))
+        {
+            Candidate.TextContent.Append(TEXT(" "));
+        }
+        Candidate.TextContent.Append(Text);
+        Candidate.EnqueueTimeSeconds = NowSeconds;
+        return true;
+    }
+
+    return false;
+}
+
 void UAudioStreamHttpWsComponent::PostStreamText(const FString& Text)
 {
+    if (!IsInGameThread())
+    {
+        TWeakObjectPtr<UAudioStreamHttpWsComponent> Self = this;
+        const FString TextCopy = Text;
+        AsyncTask(ENamedThreads::GameThread, [Self, TextCopy]()
+        {
+            if (UAudioStreamHttpWsComponent* P = Self.Get())
+            {
+                P->PostStreamText(TextCopy);
+            }
+        });
+        return;
+    }
+
     // Server-authority gating
     if (!ComponentHasServerAuthority(this))
     {
@@ -665,19 +1270,42 @@ void UAudioStreamHttpWsComponent::PostStreamText(const FString& Text)
         return;
     }
 
-    if (ActiveTaskId.IsEmpty() || ActiveHttpHost.IsEmpty()) return;
+    if (ActiveTaskId.IsEmpty() || ActiveHttpHost.IsEmpty())
+    {
+        return;
+    }
 
-    // Add to queue and try to process
-    FStreamQueueItem Item;
-    Item.Type = FStreamQueueItem::EType::Text;
-    Item.TextContent = Text;
-    StreamQueue.Add(Item);
-    ProcessNextStreamQueueItem();
+    const FString TrimmedText = Text.TrimStartAndEnd();
+    if (TrimmedText.IsEmpty())
+    {
+        return;
+    }
+
+    if (!PendingStreamTextBuffer.IsEmpty() && !PendingStreamTextBuffer.EndsWith(TEXT(" ")))
+    {
+        PendingStreamTextBuffer.Append(TEXT(" "));
+    }
+    PendingStreamTextBuffer.Append(TrimmedText);
+
+    const int32 FlushChars = FMath::Max(1, StreamTextMaxBatchChars);
+    if (PendingStreamTextBuffer.Len() >= FlushChars)
+    {
+        FlushPendingStreamText(true);
+        return;
+    }
+
+    SchedulePendingStreamTextFlush(FMath::Max(0.02f, StreamTextFlushIntervalSeconds));
 }
 
 void UAudioStreamHttpWsComponent::ProcessNextStreamQueueItem()
 {
-    if (bIsProcessingStreamQueue || StreamQueue.Num() == 0)
+    if (!IsInGameThread())
+    {
+        ScheduleProcessNextStreamQueueItem();
+        return;
+    }
+
+    if (bIsProcessingStreamQueue || ActiveStreamRequest.IsValid() || StreamQueue.Num() == 0)
     {
         return;
     }
@@ -689,126 +1317,285 @@ void UAudioStreamHttpWsComponent::ProcessNextStreamQueueItem()
         return;
     }
 
+    const float MinInterval = FMath::Max(0.0f, MinStreamRequestIntervalSeconds);
+    if (MinInterval > KINDA_SMALL_NUMBER && LastStreamRequestDispatchTime > 0.0)
+    {
+        const double Elapsed = FPlatformTime::Seconds() - LastStreamRequestDispatchTime;
+        if (Elapsed < MinInterval)
+        {
+            ScheduleProcessNextStreamQueueItem(static_cast<float>(MinInterval - Elapsed));
+            return;
+        }
+    }
+
+    const double NowSeconds = FPlatformTime::Seconds();
+    if (NextStreamRequestAllowedTime > NowSeconds)
+    {
+        ScheduleProcessNextStreamQueueItem(static_cast<float>(NextStreamRequestAllowedTime - NowSeconds));
+        return;
+    }
+
     bIsProcessingStreamQueue = true;
-    FStreamQueueItem Item = StreamQueue[0];
+    const FStreamQueueItem Item = StreamQueue[0];
     StreamQueue.RemoveAt(0);
 
-    // DEFER EXECUTION: Use TimerForNextTick to avoid modifying HTTP request list during iteration (crash fix)
-    if (UWorld* World = GetWorld())
-    {
-        TWeakObjectPtr<UAudioStreamHttpWsComponent> Self = this;
-        FString TaskId = ActiveTaskId;
-        FString Host = ActiveHttpHost;
-        bool bHttps = bActiveUseHttps;
+    const FString TaskId = ActiveTaskId;
+    const FString Host = ActiveHttpHost;
+    const bool bHttps = bActiveUseHttps;
+    TWeakObjectPtr<UAudioStreamHttpWsComponent> Self = this;
 
-        World->GetTimerManager().SetTimerForNextTick([Self, Item, TaskId, Host, bHttps]()
+    if (ProtocolMode == EAudioStreamProtocolMode::PureWebSocket)
+    {
+        if (!WebSocket.IsValid() || !WebSocket->IsConnected())
         {
-            if (UAudioStreamHttpWsComponent* P = Self.Get())
+            bIsProcessingStreamQueue = false;
+            ScheduleProcessNextStreamQueueItem(0.1f);
+            return;
+        }
+
+        if (!bPureWsTaskStarted)
+        {
+            bIsProcessingStreamQueue = false;
+            if (!bPureWsAwaitingTaskStart)
             {
-                // Dispatch based on item type
-                if (Item.Type == FStreamQueueItem::EType::Text)
-                {
-                    // Re-verify world/self
-                    const FString Scheme = bHttps ? TEXT("https") : TEXT("http");
-                    const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
-                    const FString StreamPath = S ? S->DefaultHttpStreamPath : TEXT("/stream");
-                    FString Url = FString::Printf(TEXT("%s://%s%s/%s"), *Scheme, *Host, *StreamPath, *TaskId);
-
-                    TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = FHttpModule::Get().CreateRequest();
-                    Req->SetURL(Url);
-                    Req->SetVerb(TEXT("POST"));
-                    Req->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-                    TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
-                    Obj->SetStringField(TEXT("text"), Item.TextContent);
-                    FString BodyStr; const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&BodyStr);
-                    FJsonSerializer::Serialize(Obj, Writer);
-                    Req->SetContentAsString(BodyStr);
-
-                    {
-                        TMap<FString, FString> Data;
-                        Data.Add(TEXT("url"), SanitizeNoNewline(Url));
-                        Data.Add(TEXT("body"), SanitizeNoNewline(BodyStr));
-                        FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Trace, TEXT("音频流组件"), TEXT("信息流"), TEXT("Url => ") + SanitizeNoNewline(Url) + TEXT(" Body => ") + SanitizeNoNewline(BodyStr, 8), Data);
-                    }
-
-                    Req->OnProcessRequestComplete().BindLambda([Self](FHttpRequestPtr, FHttpResponsePtr Resp, bool bOK)
-                    {
-                        if (!Self.IsValid()) return;
-                        UAudioStreamHttpWsComponent* P = Self.Get();
-                        
-                        if (!bOK || !Resp.IsValid())
-                        {
-                            TMap<FString,FString> Data; Data.Add(TEXT("action"), TEXT("PostStreamText"));
-                            FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Warn, TEXT("音频流组件"), TEXT("信息流"), TEXT("PostStreamText failed"), Data);
-                        }
-                        else
-                        {
-                            FString Content = Resp->GetContentAsString();
-                            TMap<FString,FString> Data; Data.Add(TEXT("action"), TEXT("PostStreamText")); Data.Add(TEXT("response"), SanitizeNoNewline(Content, 256));
-                            FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("信息流"), TEXT("PostStreamText response"), Data);
-                        }
-
-                        // Process next item in queue
-                        P->bIsProcessingStreamQueue = false;
-                        P->ProcessNextStreamQueueItem();
-                    });
-                    if (!Req->ProcessRequest())
-                    {
-                         P->bIsProcessingStreamQueue = false;
-                         FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Error, TEXT("音频流组件"), TEXT("信息流"), TEXT("PostStreamText ProcessRequest failed immediately"));
-                         // Optionally try next one or just stop
-                         P->ProcessNextStreamQueueItem();
-                    }
-                }
-                else if (Item.Type == FStreamQueueItem::EType::EndStream)
-                {
-                    const FString Scheme = bHttps ? TEXT("https") : TEXT("http");
-                    const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
-                    const FString EndPath = S ? S->DefaultHttpEndStreamPath : TEXT("/end-stream");
-                    const FString Url = FString::Printf(TEXT("%s://%s%s/%s"), *Scheme, *Host, *EndPath, *TaskId);
-
-                    TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = FHttpModule::Get().CreateRequest();
-                    Req->SetURL(Url);
-                    Req->SetVerb(TEXT("POST"));
-
-                    {
-                        TMap<FString, FString> Data;
-                        Data.Add(TEXT("url"), SanitizeNoNewline(Url));
-                        Data.Add(TEXT("body"), TEXT(""));
-                        FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Debug, TEXT("音频流组件"), TEXT("信息流"), TEXT("PostEndStream"), Data);
-                    }
-
-                    Req->OnProcessRequestComplete().BindLambda([Self](FHttpRequestPtr, FHttpResponsePtr, bool)
-                    {
-                        if (!Self.IsValid()) return;
-                        UAudioStreamHttpWsComponent* P = Self.Get();
-                        TMap<FString,FString> Data; Data.Add(TEXT("action"), TEXT("PostEndStream"));
-                        FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("信息流"), TEXT("EndStream posted"), Data);
-
-                        // Process next item in queue (usually redundant for endstream, but good practice)
-                        P->bIsProcessingStreamQueue = false;
-                        P->ProcessNextStreamQueueItem();
-                    });
-                    
-                    if (!Req->ProcessRequest())
-                    {
-                         P->bIsProcessingStreamQueue = false;
-                         FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Error, TEXT("音频流组件"), TEXT("信息流"), TEXT("PostEndStream ProcessRequest failed immediately"));
-                         P->ProcessNextStreamQueueItem();
-                    }
-                }
+                BeginPureWsTask(ActiveTaskId.IsEmpty());
             }
-        });
-    }
-    else
-    {
-        // World is gone, cancel processing
+            ScheduleProcessNextStreamQueueItem(0.05f);
+            return;
+        }
+
+        const uint32 RequestId = ++StreamRequestIdCounter;
+        ActiveStreamRequestId = RequestId;
+        LastStreamRequestDispatchTime = FPlatformTime::Seconds();
+
+        bool bSent = false;
+        if (Item.Type == FStreamQueueItem::EType::Text)
+        {
+            TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+            TSharedRef<FJsonObject> Input = MakeShared<FJsonObject>();
+            Input->SetStringField(TEXT("text"), Item.TextContent);
+            Payload->SetObjectField(TEXT("input"), Input);
+            bSent = SendPureWsMessage(TEXT("continue-task"), Payload);
+        }
+        else
+        {
+            TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+            Payload->SetObjectField(TEXT("input"), MakeShared<FJsonObject>());
+            bSent = SendPureWsMessage(TEXT("finish-task"), Payload);
+            if (bSent)
+            {
+                bPureWsTaskStarted = false;
+                bPureWsAwaitingTaskStart = true;
+            }
+        }
+
+        if (!bSent)
+        {
+            ConsecutiveStreamFailures += 1;
+            const float Base = FMath::Max(0.0f, StreamFailureCooldownBaseSeconds);
+            const float MaxCooldown = FMath::Max(Base, StreamFailureCooldownMaxSeconds);
+            const float Cooldown = (Base <= KINDA_SMALL_NUMBER)
+                ? 0.0f
+                : FMath::Min(MaxCooldown, Base * FMath::Pow(2.0f, FMath::Max(0, ConsecutiveStreamFailures - 1)));
+            NextStreamRequestAllowedTime = FPlatformTime::Seconds() + Cooldown;
+        }
+        else
+        {
+            ConsecutiveStreamFailures = 0;
+            NextStreamRequestAllowedTime = 0.0;
+        }
+
+        ActiveStreamRequestId = 0;
         bIsProcessingStreamQueue = false;
+        ScheduleProcessNextStreamQueueItem();
+        return;
+    }
+
+    if (Item.Type == FStreamQueueItem::EType::Text)
+    {
+        const FString Scheme = bHttps ? TEXT("https") : TEXT("http");
+        const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
+        const FString StreamPath = S ? S->DefaultHttpStreamPath : TEXT("/stream");
+        const FString Url = FString::Printf(TEXT("%s://%s%s/%s"), *Scheme, *Host, *StreamPath, *TaskId);
+
+        TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = FHttpModule::Get().CreateRequest();
+        Req->SetURL(Url);
+        Req->SetVerb(TEXT("POST"));
+        Req->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+        Req->SetTimeout(5.0f);
+
+        TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+        Obj->SetStringField(TEXT("text"), Item.TextContent);
+        FString BodyStr; const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&BodyStr);
+        FJsonSerializer::Serialize(Obj, Writer);
+        Req->SetContentAsString(BodyStr);
+
+        {
+            TMap<FString, FString> Data;
+            Data.Add(TEXT("url"), SanitizeNoNewline(Url));
+            Data.Add(TEXT("body"), SanitizeNoNewline(BodyStr));
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("音频流组件"), TEXT("信息流"), TEXT("Url => ") + SanitizeNoNewline(Url) + TEXT(" Body => ") + SanitizeNoNewline(BodyStr, 8), Data);
+        }
+
+        const uint32 RequestId = ++StreamRequestIdCounter;
+        ActiveStreamRequest = Req;
+        ActiveStreamRequestId = RequestId;
+        LastStreamRequestDispatchTime = FPlatformTime::Seconds();
+
+        Req->OnProcessRequestComplete().BindLambda([Self, RequestId](FHttpRequestPtr, FHttpResponsePtr Resp, bool bOK)
+        {
+            if (!Self.IsValid()) return;
+            UAudioStreamHttpWsComponent* P = Self.Get();
+            if (!IsValid(P)) return;
+
+            if (P->ActiveStreamRequestId != RequestId)
+            {
+                return;
+            }
+
+            P->ActiveStreamRequest.Reset();
+            P->ActiveStreamRequestId = 0;
+
+            if (!bOK || !Resp.IsValid())
+            {
+                TMap<FString,FString> Data; Data.Add(TEXT("action"), TEXT("PostStreamText"));
+                FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Warn, TEXT("音频流组件"), TEXT("信息流"), TEXT("PostStreamText failed"), Data);
+
+                P->ConsecutiveStreamFailures += 1;
+                const float Base = FMath::Max(0.0f, P->StreamFailureCooldownBaseSeconds);
+                const float MaxCooldown = FMath::Max(Base, P->StreamFailureCooldownMaxSeconds);
+                const float Cooldown = (Base <= KINDA_SMALL_NUMBER)
+                    ? 0.0f
+                    : FMath::Min(MaxCooldown, Base * FMath::Pow(2.0f, FMath::Max(0, P->ConsecutiveStreamFailures - 1)));
+                P->NextStreamRequestAllowedTime = FPlatformTime::Seconds() + Cooldown;
+            }
+            else
+            {
+                const FString Content = Resp->GetContentAsString();
+                TMap<FString,FString> Data; Data.Add(TEXT("action"), TEXT("PostStreamText")); Data.Add(TEXT("response"), SanitizeNoNewline(Content, 256));
+                FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("信息流"), TEXT("PostStreamText response"), Data);
+                P->ConsecutiveStreamFailures = 0;
+                P->NextStreamRequestAllowedTime = 0.0;
+            }
+
+            P->bIsProcessingStreamQueue = false;
+            P->ScheduleProcessNextStreamQueueItem();
+        });
+
+        if (!Req->ProcessRequest())
+        {
+            ActiveStreamRequest.Reset();
+            ActiveStreamRequestId = 0;
+            bIsProcessingStreamQueue = false;
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Error, TEXT("音频流组件"), TEXT("信息流"), TEXT("PostStreamText ProcessRequest failed immediately"));
+
+            ConsecutiveStreamFailures += 1;
+            const float Base = FMath::Max(0.0f, StreamFailureCooldownBaseSeconds);
+            const float MaxCooldown = FMath::Max(Base, StreamFailureCooldownMaxSeconds);
+            const float Cooldown = (Base <= KINDA_SMALL_NUMBER)
+                ? 0.0f
+                : FMath::Min(MaxCooldown, Base * FMath::Pow(2.0f, FMath::Max(0, ConsecutiveStreamFailures - 1)));
+            NextStreamRequestAllowedTime = FPlatformTime::Seconds() + Cooldown;
+
+            ScheduleProcessNextStreamQueueItem();
+        }
+    }
+    else if (Item.Type == FStreamQueueItem::EType::EndStream)
+    {
+        const FString Scheme = bHttps ? TEXT("https") : TEXT("http");
+        const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
+        const FString EndPath = S ? S->DefaultHttpEndStreamPath : TEXT("/end-stream");
+        const FString Url = FString::Printf(TEXT("%s://%s%s/%s"), *Scheme, *Host, *EndPath, *TaskId);
+
+        TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = FHttpModule::Get().CreateRequest();
+        Req->SetURL(Url);
+        Req->SetVerb(TEXT("POST"));
+        Req->SetTimeout(5.0f);
+
+        {
+            TMap<FString, FString> Data;
+            Data.Add(TEXT("url"), SanitizeNoNewline(Url));
+            Data.Add(TEXT("body"), TEXT(""));
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("音频流组件"), TEXT("信息流"), TEXT("PostEndStream"), Data);
+        }
+
+        const uint32 RequestId = ++StreamRequestIdCounter;
+        ActiveStreamRequest = Req;
+        ActiveStreamRequestId = RequestId;
+        LastStreamRequestDispatchTime = FPlatformTime::Seconds();
+
+        Req->OnProcessRequestComplete().BindLambda([Self, RequestId](FHttpRequestPtr, FHttpResponsePtr, bool bOK)
+        {
+            if (!Self.IsValid()) return;
+            UAudioStreamHttpWsComponent* P = Self.Get();
+            if (!IsValid(P)) return;
+
+            if (P->ActiveStreamRequestId != RequestId)
+            {
+                return;
+            }
+
+            P->ActiveStreamRequest.Reset();
+            P->ActiveStreamRequestId = 0;
+
+            TMap<FString,FString> Data; Data.Add(TEXT("action"), TEXT("PostEndStream"));
+            FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("信息流"), TEXT("EndStream posted"), Data);
+
+            if (bOK)
+            {
+                P->ConsecutiveStreamFailures = 0;
+                P->NextStreamRequestAllowedTime = 0.0;
+            }
+            else
+            {
+                P->ConsecutiveStreamFailures += 1;
+                const float Base = FMath::Max(0.0f, P->StreamFailureCooldownBaseSeconds);
+                const float MaxCooldown = FMath::Max(Base, P->StreamFailureCooldownMaxSeconds);
+                const float Cooldown = (Base <= KINDA_SMALL_NUMBER)
+                    ? 0.0f
+                    : FMath::Min(MaxCooldown, Base * FMath::Pow(2.0f, FMath::Max(0, P->ConsecutiveStreamFailures - 1)));
+                P->NextStreamRequestAllowedTime = FPlatformTime::Seconds() + Cooldown;
+            }
+
+            P->bIsProcessingStreamQueue = false;
+            P->ScheduleProcessNextStreamQueueItem();
+        });
+
+        if (!Req->ProcessRequest())
+        {
+            ActiveStreamRequest.Reset();
+            ActiveStreamRequestId = 0;
+            bIsProcessingStreamQueue = false;
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Error, TEXT("音频流组件"), TEXT("信息流"), TEXT("PostEndStream ProcessRequest failed immediately"));
+
+            ConsecutiveStreamFailures += 1;
+            const float Base = FMath::Max(0.0f, StreamFailureCooldownBaseSeconds);
+            const float MaxCooldown = FMath::Max(Base, StreamFailureCooldownMaxSeconds);
+            const float Cooldown = (Base <= KINDA_SMALL_NUMBER)
+                ? 0.0f
+                : FMath::Min(MaxCooldown, Base * FMath::Pow(2.0f, FMath::Max(0, ConsecutiveStreamFailures - 1)));
+            NextStreamRequestAllowedTime = FPlatformTime::Seconds() + Cooldown;
+
+            ScheduleProcessNextStreamQueueItem();
+        }
     }
 }
 
 void UAudioStreamHttpWsComponent::PostEndStream()
 {
+    if (!IsInGameThread())
+    {
+        TWeakObjectPtr<UAudioStreamHttpWsComponent> Self = this;
+        AsyncTask(ENamedThreads::GameThread, [Self]()
+        {
+            if (UAudioStreamHttpWsComponent* P = Self.Get())
+            {
+                P->PostEndStream();
+            }
+        });
+        return;
+    }
+
     // Server-authority gating
     if (!ComponentHasServerAuthority(this))
     {
@@ -818,10 +1605,13 @@ void UAudioStreamHttpWsComponent::PostEndStream()
 
     if (ActiveTaskId.IsEmpty() || ActiveHttpHost.IsEmpty()) return;
 
+    FlushPendingStreamText(true);
+
     FStreamQueueItem Item;
     Item.Type = FStreamQueueItem::EType::EndStream;
+    Item.EnqueueTimeSeconds = FPlatformTime::Seconds();
     StreamQueue.Add(Item);
-    ProcessNextStreamQueueItem();
+    ScheduleProcessNextStreamQueueItem();
 }
 
 void UAudioStreamHttpWsComponent::ConnectWebSocket(const FString& Url)
@@ -869,6 +1659,10 @@ void UAudioStreamHttpWsComponent::ConnectWebSocket(const FString& Url)
         P->CancelReconnect();
         TMap<FString,FString> Data; Data.Add(TEXT("host"), P->ActiveHttpHost); Data.Add(TEXT("task"), P->ActiveTaskId);
         FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("连接状态"), FString::Printf(TEXT("WS connected -> host=%s task=%s uuid=%s"), *P->ActiveHttpHost, *P->ActiveTaskId, *P->RegisteredUuid), Data);
+        if (P->ProtocolMode == EAudioStreamProtocolMode::PureWebSocket)
+        {
+            P->BeginPureWsTask(true);
+        }
     });
 
     WebSocket->OnConnectionError().AddLambda([Self](const FString& Error)
@@ -911,15 +1705,10 @@ void UAudioStreamHttpWsComponent::ConnectWebSocket(const FString& Url)
 
     WebSocket->OnMessage().AddLambda([Self](const FString& Message)
     {
-        // Fix: Do not resolve Self to a raw pointer here to pass to AsyncTask. 
-        // Pass the WeakPtr (Self) to AsyncTask instead to ensure thread safety.
-        AsyncTask(ENamedThreads::GameThread, [Self, Message]()
+        if (UAudioStreamHttpWsComponent* P = Self.Get())
         {
-            if (UAudioStreamHttpWsComponent* P = Self.Get())
-            {
-                P->ProcessWebSocketMessage(Message);
-            }
-        });
+            P->EnqueuePendingWebSocketMessage(Message);
+        }
     });
 
     WebSocket->Connect();
@@ -931,6 +1720,15 @@ void UAudioStreamHttpWsComponent::CloseWebSocket(bool bKeepQueue)
     bManualClose = true;
     // 取消任何计划的重连
     CancelReconnect();
+    CancelActiveStreamRequest(TEXT("CloseWebSocket"));
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(StreamQueueProcessTimerHandle);
+        World->GetTimerManager().ClearTimer(PendingStreamTextFlushTimerHandle);
+    }
+    bIsProcessingStreamQueue = false;
+    bPureWsTaskStarted = false;
+    bPureWsAwaitingTaskStart = false;
     if (WebSocket.IsValid())
     {
         WebSocket->OnConnected().Clear();
@@ -941,14 +1739,19 @@ void UAudioStreamHttpWsComponent::CloseWebSocket(bool bKeepQueue)
         WebSocket.Reset();
     }
 
+    ResetPendingWebSocketMessages();
+
     // 清空音频队列，避免旧数据干扰
     if (!bKeepQueue)
     {
-        AudioPacketQueue.Empty();
+        ResetAudioPacketQueue();
         VisemeQueue.Empty();
         VisemeConfQueue.Empty();
         VisemeStepsEmitted = 0;
         EnsureAndZeroVisemeArray();
+        PendingStreamTextBuffer.Empty();
+        ConsecutiveStreamFailures = 0;
+        NextStreamRequestAllowedTime = 0.0;
         FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("音频流组件"), TEXT("关闭"), TEXT("WebSocket 已关闭，音频+Viseme 队列已清空"));
     }
     else
@@ -982,7 +1785,14 @@ void UAudioStreamHttpWsComponent::ScheduleReconnect()
             if (UAudioStreamHttpWsComponent* P = WeakThis.Get())
             {
                 // 使用上次的 host 和注册 uuid 发起 /run 并重连（仅服务器侧会执行 RequestRunTask 自身的权限检查）
-                P->RequestRunTask(P->ActiveHttpHost, FString(), P->RegisteredUuid, P->ActiveWsSampleRate, P->ActiveWsChannels, P->bActiveUseHttps, P->ActiveHttpRunPath, P->ActiveWsPathPrefix);
+                if (P->ProtocolMode == EAudioStreamProtocolMode::PureWebSocket)
+                {
+                    P->ConnectWebSocket(P->BuildActiveWebSocketUrl());
+                }
+                else
+                {
+                    P->RequestRunTask(P->ActiveHttpHost, FString(), P->RegisteredUuid, P->ActiveWsSampleRate, P->ActiveWsChannels, P->bActiveUseHttps, P->ActiveHttpRunPath, P->ActiveWsPathPrefix);
+                }
             }
         }, Delay, false);
     }
@@ -1019,29 +1829,12 @@ void UAudioStreamHttpWsComponent::ReceiveSocketMessage(const AudioStreamPacket::
 {
     if (Header.Type == AudioStreamPacket::Audio)
     {
-        // type用文本写明，而不是数字！
-        auto GetPacketTypeName = [](uint8 InType) -> const TCHAR*
-        {
-            switch (InType)
-            {
-            case AudioStreamPacket::Text:    return TEXT("Text");
-            case AudioStreamPacket::Audio:   return TEXT("Audio");
-            case AudioStreamPacket::Image:   return TEXT("Image");
-            case AudioStreamPacket::Control: return TEXT("Control");
-            case AudioStreamPacket::Viseme:  return TEXT("Viseme");
-            default:                         return TEXT("Unknown");
-            }
-        };
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("流数据处理"), TEXT("Socket接收"), FString::Printf(TEXT("received socket msg type=%s size=%d"), GetPacketTypeName(Header.Type), Payload.Num()));
-
         const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
+        const bool bPayloadAlreadyDecodedPcm = (Header.Flags & LocalDecodedPcmFlag) != 0;
 #if defined(CUSTOMINPUT_USE_OPUS)
-        const bool bDecodeOpus = S && S->bEnableOpus;
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("调试"), TEXT("Opus"), 
-            FString::Printf(TEXT("Opus Enabled=%d PayloadSize=%d"), bDecodeOpus?1:0, Payload.Num()));
+        const bool bDecodeOpus = S && S->bEnableOpus && !bPayloadAlreadyDecodedPcm;
 #else
         const bool bDecodeOpus = false;
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("调试"), TEXT("Opus"), TEXT("Opus NOT COMPILED"));
 #endif
 
         TArray<uint8> DecodedPcm;
@@ -1086,7 +1879,7 @@ void UAudioStreamHttpWsComponent::ReceiveSocketMessage(const AudioStreamPacket::
         if (bIsPlaying && !bPendingStreamReset && bIsRestart)
         {
             bPendingStreamReset = true;
-            AudioPacketQueue.Empty();
+            ResetAudioPacketQueue();
             FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流数据处理"), TEXT("Socket接收"), 
                 FString::Printf(TEXT("Stream reset detected (Seq=%d), scheduled reset. Previous LastSeq=%d"), Header.Seq, LastPlayedSeq));
         }
@@ -1102,11 +1895,16 @@ void UAudioStreamHttpWsComponent::ReceiveSocketMessage(const AudioStreamPacket::
         NewPacket.Data = *DataToQueue;
 
         bool bInserted = false;
-        for (int32 i = 0; i < AudioPacketQueue.Num(); ++i)
+        if (AudioPacketQueue.Num() == 0 || AudioPacketQueue.Last().Seq < NewPacket.Seq)
+        {
+            AudioPacketQueue.Add(NewPacket);
+            bInserted = true;
+        }
+
+        for (int32 i = 0; !bInserted && i < AudioPacketQueue.Num(); ++i)
         {
             if (AudioPacketQueue[i].Seq == NewPacket.Seq)
             {
-                FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("调试"), TEXT("Duplicate"), FString::Printf(TEXT("Ignoring Duplicate Seq=%d"), NewPacket.Seq));
                 return;
             }
             if (AudioPacketQueue[i].Seq > NewPacket.Seq)
@@ -1120,8 +1918,8 @@ void UAudioStreamHttpWsComponent::ReceiveSocketMessage(const AudioStreamPacket::
         {
             AudioPacketQueue.Add(NewPacket);
         }
-
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("调试"), TEXT("QueueStatus"), FString::Printf(TEXT("QueueSize=%d AddedSeq=%d"), AudioPacketQueue.Num(), NewPacket.Seq));
+        QueuedAudioBytes += NewPacket.Data.Num();
+        TrimAudioPacketQueueIfNeeded();
     }
     else if (Header.Type == AudioStreamPacket::Viseme)
     {
@@ -1225,6 +2023,7 @@ void UAudioStreamHttpWsComponent::TickComponent(float DeltaTime, ELevelTick Tick
         LastPlayedSeq = 0;
         TotalAudioFedDuration = 0.0;
         VisemeStepsEmitted = 0;
+        ResetAudioPacketQueue();
         VisemeQueue.Empty();
         VisemeConfQueue.Empty();
         VisemeStepsEmitted = 0;
@@ -1253,6 +2052,8 @@ void UAudioStreamHttpWsComponent::TickComponent(float DeltaTime, ELevelTick Tick
 
         FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流数据处理"), TEXT("播放控制"), TEXT("Stream reset executed in Tick"));
     }
+
+    ProcessPendingWebSocketMessages(MaxPendingWebSocketMessagesPerTick);
 
     // 当处于播放状态时，按 DeltaTime 推进 viseme 播放头
     LastDeltaTime = DeltaTime;
@@ -1301,16 +2102,7 @@ void UAudioStreamHttpWsComponent::FeedAudio()
     {
         if (AudioPacketQueue.Num() == 0) return;
 
-        // Calculate total duration in queue
-        int32 TotalBytes = 0;
-        for (const auto& Pkt : AudioPacketQueue)
-        {
-            TotalBytes += Pkt.Data.Num();
-        }
-
-        const int32 BytesPerSample = sizeof(int16); // Assuming 16-bit
-        const int32 NumSamples = TotalBytes / (ActiveWsChannels * BytesPerSample);
-        const float Duration = (float)NumSamples / (float)ActiveWsSampleRate;
+        const float Duration = GetBufferedAudioDurationSeconds();
 
         // Condition: Packet count threshold OR Duration threshold
         // If packets are large, Duration threshold will trigger first.
@@ -1356,13 +2148,18 @@ void UAudioStreamHttpWsComponent::FeedAudio()
     int32 FedBytes = 0; // move out for viseme timing
     if (bIsPlaying && AudioPacketQueue.Num() > 0)
     {
-        // Feed all available packets
         int32 FedPackets = 0;
         int32 LastFeedSeq = -1;
+        int32 PacketsToRemove = 0;
+        int32 RemovedBytes = 0;
 
-        while (AudioPacketQueue.Num() > 0)
+        while (PacketsToRemove < AudioPacketQueue.Num() && FedPackets < MaxAudioPacketsToFeedPerTick)
         {
-            FAudioPacketBuffer& Pkt = AudioPacketQueue[0];
+            FAudioPacketBuffer& Pkt = AudioPacketQueue[PacketsToRemove];
+            if (FedPackets > 0 && (FedBytes + Pkt.Data.Num()) > MaxAudioBytesToFeedPerTick)
+            {
+                break;
+            }
 
             if (Pkt.Data.Num() > 0)
             {
@@ -1393,7 +2190,14 @@ void UAudioStreamHttpWsComponent::FeedAudio()
                 LastFeedSeq = Pkt.Seq;
             }
 
-            AudioPacketQueue.RemoveAt(0);
+            RemovedBytes += Pkt.Data.Num();
+            ++PacketsToRemove;
+        }
+
+        if (PacketsToRemove > 0)
+        {
+            AudioPacketQueue.RemoveAt(0, PacketsToRemove, EAllowShrinking::No);
+            QueuedAudioBytes = FMath::Max(0, QueuedAudioBytes - RemovedBytes);
         }
 
         if (FedBytes > 0)
@@ -1403,9 +2207,6 @@ void UAudioStreamHttpWsComponent::FeedAudio()
              const float AddedDuration = (float)NumSamples / (float)ActiveWsSampleRate;
              TotalAudioFedDuration += AddedDuration;
              bDataFed = true;
-
-             FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("调试"), TEXT("FedAudio"),
-                FString::Printf(TEXT("Fed %d bytes (%d pkts) to SoundStream. LastSeq=%d AddedDuration=%.3f"), FedBytes, FedPackets, LastFeedSeq, AddedDuration));
         }
     }
 

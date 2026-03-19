@@ -83,7 +83,7 @@ namespace
         FString Msg = FString::Printf(TEXT("LLM Init Summary -> engine=%s chatLen=%d history=%d url=%s valid=%s bodyLen=%d"),
             *NC_LLMToName(Engine).ToString(), ChatLen, HistoryCount, *Url, bRequestValid ? TEXT("true") : TEXT("false"), BodyLen);
 
-        NC_CoreLog(WorldContext, TEXT("LLM.Summary"), ECoreLogSeverity::Info, Msg, Meta);
+		NC_CoreLog(WorldContext, TEXT("LLM.Summary"), ECoreLogSeverity::Debug, Msg, Meta);
     }
 }
 
@@ -174,7 +174,7 @@ void UNivaLLMRequest::OnCompleteDelegate(FHttpRequestPtr Request, FHttpResponseP
          Meta.Add(TEXT("Status"), FString::FromInt(StatusCode));
          Meta.Add(TEXT("URL"), Url);
          Meta.Add(TEXT("RespPreview"), RespPreview);
-        NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Debug, FString::Printf(TEXT("Request completed -> status=%d url=%s"), StatusCode, *Url), Meta);
+		NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Info, FString::Printf(TEXT("Request completed -> status=%d url=%s"), StatusCode, *Url), Meta);
      }
      else {
         // Failure: we will emit structured error below
@@ -190,7 +190,7 @@ void UNivaLLMRequest::OnCompleteDelegate(FHttpRequestPtr Request, FHttpResponseP
          Meta.Add(TEXT("Status"), FString::FromInt(StatusCode));
          Meta.Add(TEXT("Error"), ErrText);
          Meta.Add(TEXT("URL"), Url);
-         NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Error, FString::Printf(TEXT("Request failed -> status=%d err=%s url=%s"), StatusCode, *ErrText.Left(120), *Url), Meta);
+		 NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Warn, FString::Printf(TEXT("Request failed -> status=%d err=%s url=%s"), StatusCode, *ErrText.Left(120), *Url), Meta);
 
         return;
     }
@@ -502,7 +502,7 @@ void UNivaLLMRequest::CancelRequest()
     {
         LLMRequest->CancelRequest();
         LLMRequest->OnProcessRequestComplete().Unbind();
-        NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Warn, TEXT("Request canceled"));
+		NC_CoreLog(this, TEXT("LLM"), ECoreLogSeverity::Debug, TEXT("Request canceled"));
     }
 }
 
@@ -513,7 +513,7 @@ UNivaLLMRequest* UNivaLLMRequest::CreateLLMRequest()
     FString Chat = "hello";
     Chated.Add(TEXT("user"), TEXT("assistant"));
     NivaLLMRequest->init(Chated, Chat);
-    NC_CoreLog(NivaLLMRequest, TEXT("LLM"), ECoreLogSeverity::Info, TEXT("CreateLLMRequest test created"));
+	NC_CoreLog(NivaLLMRequest, TEXT("LLM"), ECoreLogSeverity::Debug, TEXT("CreateLLMRequest test created"));
     return NivaLLMRequest;
 }
 
@@ -900,7 +900,7 @@ void UNivaAgentLLMRequest::OnProgressDelegate(FHttpRequestPtr Request, uint64 By
     if (Resp.Len() <= ParseOffset)
     {
         // 没有新的内容，输出 warn 日志并返回
-        NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Warn, TEXT("OnProgress: no new content"));
+		NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Trace, TEXT("OnProgress: no new content"));
         return;
     }
 
@@ -908,7 +908,7 @@ void UNivaAgentLLMRequest::OnProgressDelegate(FHttpRequestPtr Request, uint64 By
     FString NewChunk = Resp.Mid(ParseOffset);
     if (NewChunk.IsEmpty())
     {
-        NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Warn, TEXT("OnProgress: new chunk is empty"));
+		NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Trace, TEXT("OnProgress: new chunk is empty"));
         return;
     }
 
@@ -981,7 +981,7 @@ void UNivaAgentLLMRequest::OnProgressDelegate(FHttpRequestPtr Request, uint64 By
                 // 如果构建后的消息为空则跳过广播
                 if (OutStr.IsEmpty() || AssistantContent.IsEmpty())
                 {
-                    NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Warn, TEXT("OnProgress: skipped broadcasting empty chunk"));
+					NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Trace, TEXT("OnProgress: skipped broadcasting empty chunk"));
                     continue;
                 }
 
@@ -1031,7 +1031,7 @@ void UNivaAgentLLMRequest::OnCompleteDelegate(FHttpRequestPtr Request, FHttpResp
         TMap<FString,FString> Meta;
         Meta.Add(TEXT("URL"), Url);
         Meta.Add(TEXT("respPreview"), RespPreview);
-        NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Error, TEXT("Agent request failed"), Meta);
+		NC_CoreLog(this, TEXT("LLM.Agent"), ECoreLogSeverity::Warn, TEXT("Agent request failed"), Meta);
     }
 }
 

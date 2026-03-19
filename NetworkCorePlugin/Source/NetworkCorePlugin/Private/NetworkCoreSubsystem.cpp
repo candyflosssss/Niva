@@ -393,13 +393,13 @@ void UMCPTransportSubsystem::RegisterToolProperties(FMCPTool tool, FMCPRouteDele
     }
 
     // message要显示具体的工具名称
-    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Info, tool.Name + TEXT(" registered."), DetailLog);
+    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Off, tool.Name + TEXT(" registered."), DetailLog);
 	}
 }
 
 TSharedPtr<FJsonObject> UMCPTransportSubsystem::GetToolbyTarget(FString ActorName)
 {
-    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Info, FString::Printf(TEXT("Query tools by target: %s"), *ActorName));
+    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Debug, FString::Printf(TEXT("Query tools by target: %s"), *ActorName));
     // 用json来存储结果
     TSharedPtr<FJsonObject> result = MakeShareable(new FJsonObject);
     TArray<TSharedPtr<FJsonValue>> ToolsArray;
@@ -429,7 +429,7 @@ TSharedPtr<FJsonObject> UMCPTransportSubsystem::GetToolbyTarget(FString ActorNam
 
 TSharedPtr<FJsonObject> UMCPTransportSubsystem::GetToolTargets(FString ToolName)
 {
-    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Off, FString::Printf(TEXT("Query targets by tool: %s"), *ToolName));
+    MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Debug, FString::Printf(TEXT("Query targets by tool: %s"), *ToolName));
     // 通过json来存储结果
     // 构建一个JSON对象
     TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
@@ -555,7 +555,7 @@ void UMCPTransportSubsystem::SendSSE(const FString& SessionId, const FString& Ev
         TMap<FString,FString> LogData;
         LogData.Add(TEXT("SessionId"), SessionId);
         LogData.Add(TEXT("Event"), Event);
-        MCPLog(this, TEXT("SSE"), ECoreLogSeverity::Info, TEXT("Queued SSE message"), LogData);
+        MCPLog(this, TEXT("SSE"), ECoreLogSeverity::Trace, TEXT("Queued SSE message"), LogData);
     }
     else
     {
@@ -572,7 +572,7 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
     {
         TMap<FString,FString> LogData;
         LogData.Add(TEXT("SessionId"), SessionId);
-        MCPLog(this, TEXT("Message"), ECoreLogSeverity::Info, TEXT("HandlePostRequest received"), LogData);
+        MCPLog(this, TEXT("Message"), ECoreLogSeverity::Debug, TEXT("HandlePostRequest received"), LogData);
     }
 
 
@@ -593,7 +593,7 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
             FString ToolNameLocal = Params->GetStringField(TEXT("name"));
             LogData.Add(TEXT("ToolName"), ToolNameLocal);
         }
-        MCPLog(this, TEXT("Message"), ECoreLogSeverity::Info, TEXT("Parsed JSON-RPC"), LogData);
+        MCPLog(this, TEXT("Message"), ECoreLogSeverity::Trace, TEXT("Parsed JSON-RPC"), LogData);
     }
 
 
@@ -823,7 +823,7 @@ void UMCPTransportSubsystem::HandlePostRequest(const FMCPRequest& Request, const
             TMap<FString,FString> LogData;
             LogData.Add(TEXT("SessionId"), SessionId);
             LogData.Add(TEXT("ToolName"), ToolName);
-            MCPLog(this, TEXT("Message"), ECoreLogSeverity::Info, FString::Printf(TEXT("tools/call received for %s"), *ToolName), LogData);
+            MCPLog(this, TEXT("Message"), ECoreLogSeverity::Debug, FString::Printf(TEXT("tools/call received for %s"), *ToolName), LogData);
         }
 
         

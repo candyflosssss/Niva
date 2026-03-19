@@ -39,12 +39,12 @@ void UFunASRMicComponent::Start()
 			// If not running, start it
 			if (!ASR->IsTaskRunning())
 			{
-			    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("MicComp"), TEXT("Start调用。触发ASR启动。"));
+			    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("MicComp"), TEXT("Start调用。触发ASR启动。"));
 				ASR->StartASR(); // This connects and sends run-task
 			}
 			else 
 			{
-			    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("MicComp"), TEXT("Start调用。ASR已在运行。"));
+			    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("MicComp"), TEXT("Start调用。ASR已在运行。"));
 			}
 			
 			// We always start capture if component is active, assuming we want to feed the ASR
@@ -59,7 +59,7 @@ void UFunASRMicComponent::Start()
 
 void UFunASRMicComponent::Stop()
 {
-    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("MicComp"), TEXT("手动Stop调用。"));
+	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("MicComp"), TEXT("手动Stop调用。"));
 	
 	// 1. Flush remaining audio buffer
 	{
@@ -71,7 +71,7 @@ void UFunASRMicComponent::Stop()
 				if (UFunASRSubsystem* ASR = GI->GetSubsystem<UFunASRSubsystem>())
 				{
 					ASR->SendAudioFrame(PendingAudioData);
-					FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("MicComp"), 
+					FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("MicComp"), 
 						FString::Printf(TEXT("停止时刷新剩余音频：%d 字节"), PendingAudioData.Num()));
 				}
 			}
@@ -129,7 +129,7 @@ void UFunASRMicComponent::TickComponent(float DeltaTime, ELevelTick TickType, FA
 		double Now = FPlatformTime::Seconds();
 		if (Now - LastSendLogTime > 2.0)
 		{
-			FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("MicComp"), 
+			FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("MicComp"), 
 				FString::Printf(TEXT("发送音频块：%d 字节（优化：>100ms缓冲）"), ChunkToSend.Num()));
 			LastSendLogTime = Now;
 		}
@@ -167,10 +167,10 @@ bool UFunASRMicComponent::StartAudioCapture()
 	// List devices for debugging
 	TArray<Audio::FCaptureDeviceInfo> DeviceInfos;
 	AudioCapture->GetCaptureDevicesAvailable(DeviceInfos);
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("MicComp"), FString::Printf(TEXT("发现 %d 个采集设备"), DeviceInfos.Num()));
+	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("MicComp"), FString::Printf(TEXT("发现 %d 个采集设备"), DeviceInfos.Num()));
 	for (int32 i = 0; i < DeviceInfos.Num(); ++i)
 	{
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("MicComp"), FString::Printf(TEXT("设备 %d: %s (通道: %d, 频率: %d)"), i, *DeviceInfos[i].DeviceName, DeviceInfos[i].InputChannels, DeviceInfos[i].PreferredSampleRate));
+		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("MicComp"), FString::Printf(TEXT("设备 %d: %s (通道: %d, 频率: %d)"), i, *DeviceInfos[i].DeviceName, DeviceInfos[i].InputChannels, DeviceInfos[i].PreferredSampleRate));
 	}
 
 	Audio::FOnAudioCaptureFunction InCallback = [this](const void* InAudioData, int32 InNumFrames, int32 InNumChannels, int32 InSampleRate, double InStreamTime, bool bOverflow)
@@ -334,7 +334,7 @@ void UFunASRMicComponent::OnAudioCaptureData(const void* InAudioData, int32 InNu
 		{
 			double RMS = FMath::Sqrt(AccumEnergy / AccumCount);
 			// RMS for 16bit quiet room is usually < 100, voice > 500-1000. Silence is 0.
-			FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("MicComp"), 
+			FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("MicComp"), 
 				FString::Printf(TEXT("音频信号RMS: %.2f (采集中...)"), RMS));
 
 			AccumEnergy = 0;

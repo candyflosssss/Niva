@@ -26,14 +26,84 @@
 #include "opus.h"
 #endif
 
-// Helper: Sanitize a string so it contains no newline characters (replace with spaces) and optionally truncate.
-static FString SanitizeNoNewline(const FString& In, int32 MaxLen = 1024)
+// Helper: sanitize text for logs while keeping control characters visible instead of silently converting them.
+static FString SanitizeForLogPreview(const FString& In, int32 MaxLen = 1024)
 {
     if (In.IsEmpty()) return FString();
     FString Out = In;
-    Out.ReplaceInline(TEXT("\r"), TEXT(" "));
-    Out.ReplaceInline(TEXT("\n"), TEXT(" "));
+    Out.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+    Out.ReplaceInline(TEXT("\r"), TEXT("\\r"));
+    Out.ReplaceInline(TEXT("\n"), TEXT("\\n"));
+    Out.ReplaceInline(TEXT("\t"), TEXT("\\t"));
     if (MaxLen > 0 && Out.Len() > MaxLen) { Out = Out.Left(MaxLen); }
+    return Out;
+}
+
+static bool IsWhitespaceToNormalize(TCHAR Ch)
+{
+    return Ch == TEXT(' ') || Ch == TEXT('\t') || Ch == TEXT('\r') || Ch == TEXT('\n');
+}
+
+static bool IsCjkIdeograph(TCHAR Ch)
+{
+    return (Ch >= 0x3400 && Ch <= 0x4DBF)
+        || (Ch >= 0x4E00 && Ch <= 0x9FFF)
+        || (Ch >= 0xF900 && Ch <= 0xFAFF);
+}
+
+static bool IsCjkPunctuation(TCHAR Ch)
+{
+    return (Ch >= 0x3000 && Ch <= 0x303F)
+        || (Ch >= 0xFF00 && Ch <= 0xFFEF);
+}
+
+static bool IsCjkContextChar(TCHAR Ch)
+{
+    return IsCjkIdeograph(Ch) || IsCjkPunctuation(Ch);
+}
+
+static FString NormalizeStreamTextForTts(const FString& In)
+{
+    if (In.IsEmpty())
+    {
+        return FString();
+    }
+
+    FString Out;
+    Out.Reserve(In.Len());
+
+    for (int32 Index = 0; Index < In.Len(); ++Index)
+    {
+        const TCHAR Ch = In[Index];
+        if (!IsWhitespaceToNormalize(Ch))
+        {
+            Out.AppendChar(Ch);
+            continue;
+        }
+
+        int32 NextIndex = Index + 1;
+        while (NextIndex < In.Len() && IsWhitespaceToNormalize(In[NextIndex]))
+        {
+            ++NextIndex;
+        }
+
+        if (Out.IsEmpty() || NextIndex >= In.Len())
+        {
+            Index = NextIndex - 1;
+            continue;
+        }
+
+        const TCHAR PrevCh = Out[Out.Len() - 1];
+        const TCHAR NextCh = In[NextIndex];
+        const bool bTouchesCjk = IsCjkContextChar(PrevCh) || IsCjkContextChar(NextCh);
+        if (!bTouchesCjk && PrevCh != TEXT(' '))
+        {
+            Out.AppendChar(TEXT(' '));
+        }
+
+        Index = NextIndex - 1;
+    }
+
     return Out;
 }
 
@@ -71,7 +141,7 @@ static FString NormalizeWsPath(const FString& InPath, bool bAppendTrailingSlash)
 
     while (Path.Len() > 1 && Path.EndsWith(TEXT("/")) && !bAppendTrailingSlash)
     {
-        Path.LeftChopInline(1, false);
+        Path.LeftChopInline(1, EAllowShrinking::No);
     }
 
     if (bAppendTrailingSlash && !Path.EndsWith(TEXT("/")))
@@ -218,6 +288,8 @@ void UAudioStreamHttpWsComponent::HandleIncomingAudioChunk(const FString& Base64
     {
         return;
     }
+
+    LogIncomingAudioReturn(Base64Audio.Len());
 
     TArray<uint8> Decoded;
     if (!FBase64::Decode(Base64Audio, Decoded))
@@ -448,34 +520,36 @@ float UAudioStreamHttpWsComponent::GetBufferedAudioDurationSeconds() const
     return static_cast<float>(QueuedAudioBytes) / static_cast<float>(BytesPerSecond);
 }
 
-void UAudioStreamHttpWsComponent::TrimAudioPacketQueueIfNeeded()
+void UAudioStreamHttpWsComponent::LogStreamPushDispatch(const FString& ProtocolLabel, const FString& Text)
 {
-    if (AudioPacketQueue.Num() <= 1)
-    {
-        return;
-    }
+    LastStreamPushRequestTimeSeconds = FPlatformTime::Seconds();
+    ++StreamPushRequestSequence;
 
-    int32 DroppedPackets = 0;
-    int32 DroppedBytes = 0;
-    while (AudioPacketQueue.Num() > 1 && GetBufferedAudioDurationSeconds() > MaxBufferedAudioSeconds)
-    {
-        const int32 OldestPacketBytes = AudioPacketQueue[0].Data.Num();
-        AudioPacketQueue.RemoveAt(0, 1, EAllowShrinking::No);
-        QueuedAudioBytes = FMath::Max(0, QueuedAudioBytes - OldestPacketBytes);
-        DroppedBytes += OldestPacketBytes;
-        ++DroppedPackets;
-    }
+    TMap<FString, FString> Data;
+    Data.Add(TEXT("protocol"), ProtocolLabel);
+    Data.Add(TEXT("request_seq"), FString::FromInt(static_cast<int32>(StreamPushRequestSequence)));
+    Data.Add(TEXT("task_id"), ActiveTaskId);
+    Data.Add(TEXT("text_len"), FString::FromInt(Text.Len()));
+    Data.Add(TEXT("text_preview"), SanitizeForLogPreview(Text, 64));
+    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Fatal, TEXT("音频流组件"), TEXT("流时序"), TEXT("发送了流音频请求"), Data);
+}
 
-    if (DroppedPackets > 0)
-    {
-        const double Now = FPlatformTime::Seconds();
-        if (Now - LastAudioQueuePressureLogTime > 1.0)
-        {
-            LastAudioQueuePressureLogTime = Now;
-            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("音频流组件"), TEXT("性能保护"),
-                FString::Printf(TEXT("Audio backlog trimmed: dropped %d packets (%d bytes), buffered=%.3fs"), DroppedPackets, DroppedBytes, GetBufferedAudioDurationSeconds()));
-        }
-    }
+void UAudioStreamHttpWsComponent::LogIncomingAudioReturn(int32 Base64AudioLen)
+{
+    ++StreamAudioReturnSequence;
+
+    const double NowSeconds = FPlatformTime::Seconds();
+    const double DeltaMs = LastStreamPushRequestTimeSeconds > 0.0
+        ? (NowSeconds - LastStreamPushRequestTimeSeconds) * 1000.0
+        : -1.0;
+
+    TMap<FString, FString> Data;
+    Data.Add(TEXT("task_id"), ActiveTaskId);
+    Data.Add(TEXT("request_seq"), FString::FromInt(static_cast<int32>(StreamPushRequestSequence)));
+    Data.Add(TEXT("audio_return_seq"), FString::FromInt(static_cast<int32>(StreamAudioReturnSequence)));
+    Data.Add(TEXT("base64_len"), FString::FromInt(Base64AudioLen));
+    Data.Add(TEXT("since_last_request_ms"), DeltaMs >= 0.0 ? FString::Printf(TEXT("%.2f"), DeltaMs) : TEXT("N/A"));
+    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Fatal, TEXT("音频流组件"), TEXT("流时序"), TEXT("接收到返回的流音频数据"), Data);
 }
 
 void UAudioStreamHttpWsComponent::ProcessWebSocketMessage(const FString& Message)
@@ -499,6 +573,10 @@ void UAudioStreamHttpWsComponent::ProcessWebSocketMessage(const FString& Message
         FString TaskId;
         Header->TryGetStringField(TEXT("event"), Event);
         Header->TryGetStringField(TEXT("task_id"), TaskId);
+
+        const bool bHasTaskId = !TaskId.IsEmpty();
+        const bool bHasActiveTaskId = !ActiveTaskId.IsEmpty();
+        const bool bTaskMatchesActive = !bHasTaskId || !bHasActiveTaskId || TaskId == ActiveTaskId;
 
         auto ParseIntArray = [](const TSharedPtr<FJsonObject>& Obj, const FString& FieldName, TArray<int32>& Out)
         {
@@ -540,6 +618,10 @@ void UAudioStreamHttpWsComponent::ProcessWebSocketMessage(const FString& Message
 
         if (Event.Equals(TEXT("task-started"), ESearchCase::IgnoreCase))
         {
+            if (!bTaskMatchesActive)
+            {
+                return;
+            }
             if (!TaskId.IsEmpty())
             {
                 ActiveTaskId = TaskId;
@@ -572,6 +654,10 @@ void UAudioStreamHttpWsComponent::ProcessWebSocketMessage(const FString& Message
 
         if (Event.Equals(TEXT("task-finished"), ESearchCase::IgnoreCase))
         {
+            if (!bTaskMatchesActive)
+            {
+                return;
+            }
             bPureWsTaskStarted = false;
             bPureWsAwaitingTaskStart = false;
             if (ProtocolMode == EAudioStreamProtocolMode::PureWebSocket && WebSocket.IsValid() && WebSocket->IsConnected() && !bManualClose)
@@ -583,6 +669,10 @@ void UAudioStreamHttpWsComponent::ProcessWebSocketMessage(const FString& Message
 
         if (Event.Equals(TEXT("task-failed"), ESearchCase::IgnoreCase))
         {
+            if (!bTaskMatchesActive)
+            {
+                return;
+            }
             FString ErrorCode;
             FString ErrorMessage;
             Header->TryGetStringField(TEXT("error_code"), ErrorCode);
@@ -839,6 +929,9 @@ void UAudioStreamHttpWsComponent::StartRunAndConnect(const FString& ServerHostWi
         VisemeStepsEmitted = 0;
         EnsureAndZeroVisemeArray();
         ResetPendingWebSocketMessages();
+        StreamPushRequestSequence = 0;
+        StreamAudioReturnSequence = 0;
+        LastStreamPushRequestTimeSeconds = 0.0;
     }
 
     // 保存当前会话的路径，以便重连时复用
@@ -927,7 +1020,7 @@ void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPo
     TWeakObjectPtr<UAudioStreamHttpWsComponent> Self = this;
     if (UWorld* World = GetWorld())
     {
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("调试"), TEXT("RequestRunTask"), TEXT("Scheduling RequestRunTask with 2.0s delay"));
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("调试"), TEXT("RequestRunTask"), TEXT("Scheduling RequestRunTask with 2.0s delay"));
         FTimerHandle Handle;
         World->GetTimerManager().SetTimer(Handle, [Self, ServerHostWithPort, CallbackUrl, SampleRate, Channels, bUseHttps, HttpRunPath, WsPathPrefix]()
         {
@@ -936,7 +1029,7 @@ void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPo
 
             // --- ACTUAL REQUEST LOGIC START (Delayed) ---
             
-            FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Info, TEXT("调试"), TEXT("RequestRunTask"), TEXT("Executing RequestRunTask Logic after delay"));
+            FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Debug, TEXT("调试"), TEXT("RequestRunTask"), TEXT("Executing RequestRunTask Logic after delay"));
 
             // Server-authority gating
             if (!ComponentHasServerAuthority(P))
@@ -948,7 +1041,7 @@ void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPo
             const FString Scheme = bUseHttps ? TEXT("https") : TEXT("http");
             const FString RunUrl = FString::Printf(TEXT("%s://%s%s"), *Scheme, *ServerHostWithPort, *HttpRunPath);
 
-            FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Info, TEXT("调试"), TEXT("RequestRunTask"), FString::Printf(TEXT("Creating HTTP Request to %s"), *RunUrl));
+            FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Debug, TEXT("调试"), TEXT("RequestRunTask"), FString::Printf(TEXT("Creating HTTP Request to %s"), *RunUrl));
 
             TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = FHttpModule::Get().CreateRequest();
             Req->SetURL(RunUrl);
@@ -956,7 +1049,7 @@ void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPo
             Req->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
             Req->SetTimeout(10.0f); // 显式设置超时 Explicit timeout
 
-            FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Info, TEXT("调试"), TEXT("RequestRunTask"), TEXT("HTTP Request Object Created"));
+            FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Debug, TEXT("调试"), TEXT("RequestRunTask"), TEXT("HTTP Request Object Created"));
 
             TSharedRef<FJsonObject> Body = MakeShared<FJsonObject>();
             if (!CallbackUrl.IsEmpty()) Body->SetStringField(TEXT("callback"), CallbackUrl);
@@ -967,15 +1060,15 @@ void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPo
             FJsonSerializer::Serialize(Body, Writer);
             Req->SetContentAsString(BodyStr);
 
-            FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Info, TEXT("调试"), TEXT("RequestRunTask"), FString::Printf(TEXT("HTTP Body Set: %s"), *SanitizeNoNewline(BodyStr)));
+                FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Debug, TEXT("调试"), TEXT("RequestRunTask"), FString::Printf(TEXT("HTTP Body Set: %s"), *SanitizeForLogPreview(BodyStr)));
 
             // Log the request URL and sanitized body
             {
                 TMap<FString, FString> Data;
-                Data.Add(TEXT("url"), SanitizeNoNewline(RunUrl));
-                Data.Add(TEXT("body"), SanitizeNoNewline(BodyStr));
+                Data.Add(TEXT("url"), SanitizeForLogPreview(RunUrl));
+                Data.Add(TEXT("body"), SanitizeForLogPreview(BodyStr));
                 // 把data写进日志的message
-                FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Debug, TEXT("音频流组件"), TEXT("连接握手"), TEXT("RequestRunTask /run request, url = ") + SanitizeNoNewline(RunUrl), Data);
+                FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Debug, TEXT("音频流组件"), TEXT("连接握手"), TEXT("RequestRunTask /run request, url = ") + SanitizeForLogPreview(RunUrl), Data);
             }
 
             Req->OnProcessRequestComplete().BindLambda([Self, ServerHostWithPort, WsPathPrefix, bUseHttps](FHttpRequestPtr ReqPtr, FHttpResponsePtr Resp, bool bOK)
@@ -990,7 +1083,7 @@ void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPo
                 if (!Self.IsValid()) return;
                 UAudioStreamHttpWsComponent* P = Self.Get();
                 
-                FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Info, TEXT("调试"), TEXT("RequestRunTask"), 
+                FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Trace, TEXT("调试"), TEXT("RequestRunTask"), 
                     FString::Printf(TEXT("RequestRunTask Completed. Success=%d ResponseValid=%d Code=%s"), bOK, Resp.IsValid(), *RespCodeStr));
 
                 if (!bOK || !Resp.IsValid())
@@ -998,7 +1091,7 @@ void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPo
                     TMap<FString,FString> Data;
                     Data.Add(TEXT("host"), ServerHostWithPort);
                     Data.Add(TEXT("response"), Resp.IsValid() ? Resp->GetContentAsString().Left(256) : TEXT("Invalid Response"));
-                    FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Error, TEXT("音频流组件"), TEXT("连接握手"), TEXT("/run request failed"), Data);
+                    FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Warn, TEXT("音频流组件"), TEXT("连接握手"), TEXT("/run request failed"), Data);
                     return;
                 }
                 FString Content = Resp->GetContentAsString();
@@ -1014,6 +1107,10 @@ void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPo
                 if (!TaskId.IsEmpty())
                 {
                     P->ActiveTaskId = TaskId;
+                    FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("连接握手"), TEXT("/run response received"), {
+                        { TEXT("task_id"), TaskId },
+                        { TEXT("host"), ServerHostWithPort }
+                    });
                     const FString WsScheme = bUseHttps ? TEXT("wss") : TEXT("ws");
                     const FString WsUrl = FString::Printf(TEXT("%s://%s%s%s"), *WsScheme, *ServerHostWithPort, *WsPathPrefix, *TaskId);
                     // 软重连路径：确保下一次 Close 保留队列
@@ -1042,7 +1139,7 @@ void UAudioStreamHttpWsComponent::RequestRunTask(const FString& ServerHostWithPo
     }
     else
     {
-         FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("调试"), TEXT("RequestRunTask"), TEXT("Invalid World, cannot schedule delay."));
+         FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Error, TEXT("调试"), TEXT("RequestRunTask"), TEXT("Invalid World, cannot schedule delay."));
     }
 }
 
@@ -1068,7 +1165,7 @@ void UAudioStreamHttpWsComponent::CancelActiveStreamRequest(const TCHAR* Reason)
         ActiveStreamRequest->CancelRequest();
         ActiveStreamRequest.Reset();
         ActiveStreamRequestId = 0;
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("信息流"), FString::Printf(TEXT("Canceled active stream request (%s)"), Reason ? Reason : TEXT("Unknown")));
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("音频流组件"), TEXT("信息流"), FString::Printf(TEXT("Canceled active stream request (%s)"), Reason ? Reason : TEXT("Unknown")));
     }
 }
 
@@ -1172,14 +1269,10 @@ void UAudioStreamHttpWsComponent::FlushPendingStreamText(bool bForce)
         return;
     }
 
-    // Non-forced flushes are timer driven; they should still emit whatever has accumulated
-    if (!bForce && PendingStreamTextBuffer.Len() < FMath::Max(1, StreamTextMaxBatchChars))
-    {
-        SchedulePendingStreamTextFlush(StreamTextFlushIntervalSeconds);
-        return;
-    }
+    // 非强制 flush 由定时器触发；一旦定时器到了，就应该把当前已积累文本发出去，
+    // 否则短文本会一直达不到字符阈值，导致请求长期不发出。
 
-    const FString TextToQueue = PendingStreamTextBuffer.TrimStartAndEnd();
+    const FString TextToQueue = NormalizeStreamTextForTts(PendingStreamTextBuffer);
     PendingStreamTextBuffer.Empty();
     if (TextToQueue.IsEmpty())
     {
@@ -1200,7 +1293,8 @@ void UAudioStreamHttpWsComponent::FlushPendingStreamText(bool bForce)
     Data.Add(TEXT("len"), FString::FromInt(TextToQueue.Len()));
     Data.Add(TEXT("queue"), FString::FromInt(StreamQueue.Num()));
     Data.Add(TEXT("force"), bForce ? TEXT("1") : TEXT("0"));
-    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("音频流组件"), TEXT("节流"), TEXT("FlushPendingStreamText"), Data);
+    Data.Add(TEXT("preview"), SanitizeForLogPreview(TextToQueue, 64));
+    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Fatal, TEXT("音频流组件"), TEXT("节流"), TEXT("FlushPendingStreamText"), Data);
 
     ScheduleProcessNextStreamQueueItem();
 }
@@ -1235,10 +1329,6 @@ bool UAudioStreamHttpWsComponent::TryCoalesceQueuedText(const FString& Text, dou
             return false;
         }
 
-        if (!Candidate.TextContent.IsEmpty() && !Candidate.TextContent.EndsWith(TEXT(" ")))
-        {
-            Candidate.TextContent.Append(TEXT(" "));
-        }
         Candidate.TextContent.Append(Text);
         Candidate.EnqueueTimeSeconds = NowSeconds;
         return true;
@@ -1275,17 +1365,12 @@ void UAudioStreamHttpWsComponent::PostStreamText(const FString& Text)
         return;
     }
 
-    const FString TrimmedText = Text.TrimStartAndEnd();
-    if (TrimmedText.IsEmpty())
+    if (Text.IsEmpty())
     {
         return;
     }
 
-    if (!PendingStreamTextBuffer.IsEmpty() && !PendingStreamTextBuffer.EndsWith(TEXT(" ")))
-    {
-        PendingStreamTextBuffer.Append(TEXT(" "));
-    }
-    PendingStreamTextBuffer.Append(TrimmedText);
+    PendingStreamTextBuffer.Append(Text);
 
     const int32 FlushChars = FMath::Max(1, StreamTextMaxBatchChars);
     if (PendingStreamTextBuffer.Len() >= FlushChars)
@@ -1336,8 +1421,6 @@ void UAudioStreamHttpWsComponent::ProcessNextStreamQueueItem()
     }
 
     bIsProcessingStreamQueue = true;
-    const FStreamQueueItem Item = StreamQueue[0];
-    StreamQueue.RemoveAt(0);
 
     const FString TaskId = ActiveTaskId;
     const FString Host = ActiveHttpHost;
@@ -1364,6 +1447,9 @@ void UAudioStreamHttpWsComponent::ProcessNextStreamQueueItem()
             return;
         }
 
+        const FStreamQueueItem Item = StreamQueue[0];
+        StreamQueue.RemoveAt(0);
+
         const uint32 RequestId = ++StreamRequestIdCounter;
         ActiveStreamRequestId = RequestId;
         LastStreamRequestDispatchTime = FPlatformTime::Seconds();
@@ -1371,10 +1457,20 @@ void UAudioStreamHttpWsComponent::ProcessNextStreamQueueItem()
         bool bSent = false;
         if (Item.Type == FStreamQueueItem::EType::Text)
         {
+            const FString NormalizedText = NormalizeStreamTextForTts(Item.TextContent);
+            if (NormalizedText.IsEmpty())
+            {
+                ActiveStreamRequestId = 0;
+                bIsProcessingStreamQueue = false;
+                ScheduleProcessNextStreamQueueItem();
+                return;
+            }
+
             TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
             TSharedRef<FJsonObject> Input = MakeShared<FJsonObject>();
-            Input->SetStringField(TEXT("text"), Item.TextContent);
+            Input->SetStringField(TEXT("text"), NormalizedText);
             Payload->SetObjectField(TEXT("input"), Input);
+            LogStreamPushDispatch(TEXT("PureWebSocket"), NormalizedText);
             bSent = SendPureWsMessage(TEXT("continue-task"), Payload);
         }
         else
@@ -1411,8 +1507,20 @@ void UAudioStreamHttpWsComponent::ProcessNextStreamQueueItem()
         return;
     }
 
+    const FStreamQueueItem Item = StreamQueue[0];
+    StreamQueue.RemoveAt(0);
+
     if (Item.Type == FStreamQueueItem::EType::Text)
     {
+        const FString NormalizedText = NormalizeStreamTextForTts(Item.TextContent);
+        if (NormalizedText.IsEmpty())
+        {
+            ActiveStreamRequestId = 0;
+            bIsProcessingStreamQueue = false;
+            ScheduleProcessNextStreamQueueItem();
+            return;
+        }
+
         const FString Scheme = bHttps ? TEXT("https") : TEXT("http");
         const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
         const FString StreamPath = S ? S->DefaultHttpStreamPath : TEXT("/stream");
@@ -1425,17 +1533,12 @@ void UAudioStreamHttpWsComponent::ProcessNextStreamQueueItem()
         Req->SetTimeout(5.0f);
 
         TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
-        Obj->SetStringField(TEXT("text"), Item.TextContent);
+        Obj->SetStringField(TEXT("text"), NormalizedText);
         FString BodyStr; const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&BodyStr);
         FJsonSerializer::Serialize(Obj, Writer);
         Req->SetContentAsString(BodyStr);
 
-        {
-            TMap<FString, FString> Data;
-            Data.Add(TEXT("url"), SanitizeNoNewline(Url));
-            Data.Add(TEXT("body"), SanitizeNoNewline(BodyStr));
-            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("音频流组件"), TEXT("信息流"), TEXT("Url => ") + SanitizeNoNewline(Url) + TEXT(" Body => ") + SanitizeNoNewline(BodyStr, 8), Data);
-        }
+        LogStreamPushDispatch(TEXT("LegacyHttpWs"), NormalizedText);
 
         const uint32 RequestId = ++StreamRequestIdCounter;
         ActiveStreamRequest = Req;
@@ -1471,9 +1574,6 @@ void UAudioStreamHttpWsComponent::ProcessNextStreamQueueItem()
             }
             else
             {
-                const FString Content = Resp->GetContentAsString();
-                TMap<FString,FString> Data; Data.Add(TEXT("action"), TEXT("PostStreamText")); Data.Add(TEXT("response"), SanitizeNoNewline(Content, 256));
-                FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("信息流"), TEXT("PostStreamText response"), Data);
                 P->ConsecutiveStreamFailures = 0;
                 P->NextStreamRequestAllowedTime = 0.0;
             }
@@ -1514,7 +1614,7 @@ void UAudioStreamHttpWsComponent::ProcessNextStreamQueueItem()
 
         {
             TMap<FString, FString> Data;
-            Data.Add(TEXT("url"), SanitizeNoNewline(Url));
+            Data.Add(TEXT("url"), SanitizeForLogPreview(Url));
             Data.Add(TEXT("body"), TEXT(""));
             FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("音频流组件"), TEXT("信息流"), TEXT("PostEndStream"), Data);
         }
@@ -1538,16 +1638,17 @@ void UAudioStreamHttpWsComponent::ProcessNextStreamQueueItem()
             P->ActiveStreamRequest.Reset();
             P->ActiveStreamRequestId = 0;
 
-            TMap<FString,FString> Data; Data.Add(TEXT("action"), TEXT("PostEndStream"));
-            FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("信息流"), TEXT("EndStream posted"), Data);
-
             if (bOK)
             {
+                TMap<FString,FString> Data; Data.Add(TEXT("action"), TEXT("PostEndStream"));
+                FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("信息流"), TEXT("EndStream posted"), Data);
                 P->ConsecutiveStreamFailures = 0;
                 P->NextStreamRequestAllowedTime = 0.0;
             }
             else
             {
+                TMap<FString,FString> Data; Data.Add(TEXT("action"), TEXT("PostEndStream"));
+                FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Warn, TEXT("音频流组件"), TEXT("信息流"), TEXT("EndStream post failed"), Data);
                 P->ConsecutiveStreamFailures += 1;
                 const float Base = FMath::Max(0.0f, P->StreamFailureCooldownBaseSeconds);
                 const float MaxCooldown = FMath::Max(Base, P->StreamFailureCooldownMaxSeconds);
@@ -1670,7 +1771,7 @@ void UAudioStreamHttpWsComponent::ConnectWebSocket(const FString& Url)
         if (!Self.IsValid()) return;
         UAudioStreamHttpWsComponent* P = Self.Get();
         TMap<FString,FString> Data; Data.Add(TEXT("error"), Error);
-        FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Error, TEXT("音频流组件"), TEXT("连接恢复"), FString::Printf(TEXT("WS connection error: %s"), *Error), Data);
+        FCoreLogHelpers::CoreLog(P, ECoreLogSeverity::Warn, TEXT("音频流组件"), TEXT("连接恢复"), FString::Printf(TEXT("WS connection error: %s"), *Error), Data);
         // 仅在之前已经成功过连接且不是手动关闭的情况下才安排重试
         if (P->bHasEverConnected && !P->bManualClose)
         {
@@ -1752,6 +1853,9 @@ void UAudioStreamHttpWsComponent::CloseWebSocket(bool bKeepQueue)
         PendingStreamTextBuffer.Empty();
         ConsecutiveStreamFailures = 0;
         NextStreamRequestAllowedTime = 0.0;
+        StreamPushRequestSequence = 0;
+        StreamAudioReturnSequence = 0;
+        LastStreamPushRequestTimeSeconds = 0.0;
         FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("音频流组件"), TEXT("关闭"), TEXT("WebSocket 已关闭，音频+Viseme 队列已清空"));
     }
     else
@@ -1776,7 +1880,7 @@ void UAudioStreamHttpWsComponent::ScheduleReconnect()
     ReconnectAttempts++;
     const float Delay = FMath::Min(ReconnectMaxDelaySeconds, ReconnectBaseDelaySeconds * FMath::Pow(2.0f, ReconnectAttempts - 1));
 
-    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("音频流组件"), TEXT("连接状态"), FString::Printf(TEXT("Schedule reconnect attempt %d in %.1f sec"), ReconnectAttempts, Delay));
+         FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("音频流组件"), TEXT("连接状态"), FString::Printf(TEXT("Schedule reconnect attempt %d in %.1f sec"), ReconnectAttempts, Delay));
 
     if (UWorld* W2 = GetWorld())
     {
@@ -1863,7 +1967,7 @@ void UAudioStreamHttpWsComponent::ReceiveSocketMessage(const AudioStreamPacket::
                     DecodedPcm.SetNum(OutBytes, EAllowShrinking::Yes);
                     DataToQueue = &DecodedPcm;
                     
-                    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("调试"), TEXT("Opus"), 
+                    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("调试"), TEXT("Opus"), 
                         FString::Printf(TEXT("Opus Decoded: In=%d -> OutBytes=%d (Samples=%d)"), Payload.Num(), OutBytes, OutCount));
                 }
                 else
@@ -1885,7 +1989,7 @@ void UAudioStreamHttpWsComponent::ReceiveSocketMessage(const AudioStreamPacket::
         }
         if (bIsPlaying && !bPendingStreamReset && Header.Seq <= LastPlayedSeq)
         {
-            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("调试"), TEXT("Discard"),
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("调试"), TEXT("Discard"),
                 FString::Printf(TEXT("Discarding Seq=%d because <= LastPlayedSeq=%d"), Header.Seq, LastPlayedSeq));
             return;
         }
@@ -1919,7 +2023,6 @@ void UAudioStreamHttpWsComponent::ReceiveSocketMessage(const AudioStreamPacket::
             AudioPacketQueue.Add(NewPacket);
         }
         QueuedAudioBytes += NewPacket.Data.Num();
-        TrimAudioPacketQueueIfNeeded();
     }
     else if (Header.Type == AudioStreamPacket::Viseme)
     {
@@ -2024,6 +2127,7 @@ void UAudioStreamHttpWsComponent::TickComponent(float DeltaTime, ELevelTick Tick
         TotalAudioFedDuration = 0.0;
         VisemeStepsEmitted = 0;
         ResetAudioPacketQueue();
+        StreamAudioReturnSequence = 0;
         VisemeQueue.Empty();
         VisemeConfQueue.Empty();
         VisemeStepsEmitted = 0;
@@ -2149,7 +2253,6 @@ void UAudioStreamHttpWsComponent::FeedAudio()
     if (bIsPlaying && AudioPacketQueue.Num() > 0)
     {
         int32 FedPackets = 0;
-        int32 LastFeedSeq = -1;
         int32 PacketsToRemove = 0;
         int32 RemovedBytes = 0;
 
@@ -2187,7 +2290,6 @@ void UAudioStreamHttpWsComponent::FeedAudio()
                 FedBytes += Pkt.Data.Num();
                 FedPackets++;
                 LastPlayedSeq = Pkt.Seq;
-                LastFeedSeq = Pkt.Seq;
             }
 
             RemovedBytes += Pkt.Data.Num();

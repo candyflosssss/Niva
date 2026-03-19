@@ -29,7 +29,7 @@ void UNetMicWsComponent::BeginPlay()
 	}
 	if (!Url.IsEmpty())
 	{
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("AutoConnect: %s"), *Url));
+		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("AutoConnect: %s"), *Url));
 		Connect(Url);
 	}
 }
@@ -47,7 +47,7 @@ void UNetMicWsComponent::ConfigureReconnect(bool bEnable, float InBaseDelaySecon
 	bAutoReconnect = bEnable;
 	ReconnectBaseDelaySeconds = FMath::Max(0.1f, InBaseDelaySeconds);
 	ReconnectMaxDelaySeconds = FMath::Max(ReconnectBaseDelaySeconds, InMaxDelaySeconds);
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("ConfigureReconnect: enable=%d base=%.2f max=%.2f"), bAutoReconnect ? 1 : 0, ReconnectBaseDelaySeconds, ReconnectMaxDelaySeconds));
+	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("ConfigureReconnect: enable=%d base=%.2f max=%.2f"), bAutoReconnect ? 1 : 0, ReconnectBaseDelaySeconds, ReconnectMaxDelaySeconds));
 }
 
 void UNetMicWsComponent::Connect(const FString& InWsUrl)
@@ -60,13 +60,13 @@ void UNetMicWsComponent::Connect(const FString& InWsUrl)
 		return;
 	}
 	ReconnectAttempts = 0;
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("Connect: %s"), *LastUrl));
+	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("Connect: %s"), *LastUrl));
 	OpenWebSocket(LastUrl);
 }
 
 void UNetMicWsComponent::Disconnect()
 {
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("NetMic"), TEXT("Disconnect: manual close requested"));
+	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), TEXT("Disconnect: manual close requested"));
 	CancelReconnect();
 	CloseWebSocket(true);
 }
@@ -74,7 +74,7 @@ void UNetMicWsComponent::Disconnect()
 void UNetMicWsComponent::StartRecording()
 {
 	bShouldBeRecording = true;
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("NetMic"), TEXT("StartRecording: sending <start> and requesting ASR task start"));
+	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), TEXT("StartRecording: sending <start> and requesting ASR task start"));
 	SendCtrl(TEXT("<start>"));
 	// 自动触发 ASR 任务开始（由子系统负责连接与协议）
 	if (UWorld* World = GetWorld())
@@ -92,7 +92,7 @@ void UNetMicWsComponent::StartRecording()
 void UNetMicWsComponent::StopRecording()
 {
 	bShouldBeRecording = false;
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("NetMic"), TEXT("StopRecording: sending <end> and requesting ASR task stop"));
+	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), TEXT("StopRecording: sending <end> and requesting ASR task stop"));
 	SendCtrl(TEXT("<end>"));
 	// 自动触发 ASR 任务结束
 	if (UWorld* World = GetWorld())
@@ -109,14 +109,14 @@ void UNetMicWsComponent::StopRecording()
 
 void UNetMicWsComponent::RequestDeviceList()
 {
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("NetMic"), TEXT("RequestDeviceList: sending <list_devices>"));
+	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), TEXT("RequestDeviceList: sending <list_devices>"));
 	SendCtrl(TEXT("<list_devices>"));
 }
 
 void UNetMicWsComponent::SetDeviceIndex(int32 Index)
 {
 	DesiredDeviceIndex = Index;
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("SetDeviceIndex: %d"), Index));
+	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("SetDeviceIndex: %d"), Index));
 	SendCtrl(FString::Printf(TEXT("<set_device:%d>"), Index));
 }
 
@@ -138,7 +138,7 @@ void UNetMicWsComponent::OpenWebSocket(const FString& Url)
 
 	bManualClose = false;
 	bIsConnecting = true;
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("WebSocket connecting: %s"), *Url));
+	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("WebSocket connecting: %s"), *Url));
 	Socket->Connect();
 }
 
@@ -147,7 +147,7 @@ void UNetMicWsComponent::CloseWebSocket(bool bIsManual)
 	if (Socket.IsValid())
 	{
 		bManualClose = bIsManual;
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("NetMic"), TEXT("CloseWebSocket"));
+		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), TEXT("CloseWebSocket"));
 		Socket->Close();
 		Socket.Reset();
 	}
@@ -171,7 +171,7 @@ void UNetMicWsComponent::OnWsConnected()
 
 void UNetMicWsComponent::OnWsConnectionError(const FString& Error)
 {
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Error, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("Connection error: %s"), *Error));
+	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("Connection error: %s"), *Error));
 	OnError.Broadcast(Error);
 	bIsConnected = false;
 	bIsConnecting = false;
@@ -196,7 +196,7 @@ void UNetMicWsComponent::OnWsClosed(int32 StatusCode, const FString& Reason, boo
 
 void UNetMicWsComponent::OnWsMessage(const FString& Message)
 {
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("WS text: %s"), *Message));
+	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("WS text: %s"), *Message));
 	OnServerMessage.Broadcast(Message);
 }
 
@@ -212,7 +212,7 @@ void UNetMicWsComponent::OnWsRawMessage(const void* Data, SIZE_T Size, SIZE_T By
 	if (BytesRemaining == 0)
 	{
 		// 一个完整帧到达
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("WS audio frame: %d bytes"), PendingBinary.Num()));
+		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("WS audio frame: %d bytes"), PendingBinary.Num()));
 		OnAudioFrame.Broadcast(PendingBinary);
 		if (bForwardToASR)
 		{
@@ -226,12 +226,12 @@ void UNetMicWsComponent::TryRestoreDesiredStateAfterConnect()
 {
 	if (DesiredDeviceIndex >= 0)
 	{
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("Restore device index: %d"), DesiredDeviceIndex));
+		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("Restore device index: %d"), DesiredDeviceIndex));
 		SendCtrl(FString::Printf(TEXT("<set_device:%d>"), DesiredDeviceIndex));
 	}
 	if (bShouldBeRecording)
 	{
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("NetMic"), TEXT("Restore: start recording"));
+		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), TEXT("Restore: start recording"));
 		SendCtrl(TEXT("<start>"));
 	}
 }
@@ -247,7 +247,7 @@ void UNetMicWsComponent::ScheduleReconnect()
 	CancelReconnect();
 	ReconnectAttempts++;
 	const float Delay = GetNextBackoffSeconds();
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("Schedule reconnect in %.2fs (attempt %d)"), Delay, ReconnectAttempts));
+	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("Schedule reconnect in %.2fs (attempt %d)"), Delay, ReconnectAttempts));
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().SetTimer(ReconnectTimerHandle, [this]()
@@ -294,7 +294,7 @@ void UNetMicWsComponent::ForwardAudioToASR(const TArray<uint8>& Bytes)
 			if (auto* ASR = GI->GetSubsystem<UFunASRSubsystem>())
 			{
 				ASR->SendAudioFrame(Bytes);
-				FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("Forwarded audio to ASR: %d bytes"), Bytes.Num()));
+				FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("Forwarded audio to ASR: %d bytes"), Bytes.Num()));
 			}
 		}
 	}

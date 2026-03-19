@@ -201,7 +201,8 @@ private:
     void ResetPendingWebSocketMessages();
     void ResetAudioPacketQueue();
     float GetBufferedAudioDurationSeconds() const;
-    void TrimAudioPacketQueueIfNeeded();
+    void LogStreamPushDispatch(const FString& ProtocolLabel, const FString& Text);
+    void LogIncomingAudioReturn(int32 Base64AudioLen);
     // 发起 /run POST 并解析 task_id（从 StartRunAndConnect 中抽取的实现）
     void RequestRunTask(const FString& ServerHostWithPort, const FString& CallbackUrl, const FString& TargetUuid, int32 SampleRate, int32 Channels, bool bUseHttps, const FString& HttpRunPath, const FString& WsPathPrefix);
 
@@ -234,6 +235,9 @@ private:
     TSharedPtr<IHttpRequest, ESPMode::ThreadSafe> ActiveStreamRequest;
     uint32 ActiveStreamRequestId = 0;
     uint32 StreamRequestIdCounter = 0;
+    uint32 StreamPushRequestSequence = 0;
+    uint32 StreamAudioReturnSequence = 0;
+    double LastStreamPushRequestTimeSeconds = 0.0;
 
     // Reconnect logic
     FTimerHandle ReconnectTimerHandle;
@@ -257,13 +261,11 @@ private:
 
     FCriticalSection PendingWebSocketMessagesCS;
     TArray<FString> PendingWebSocketMessages;
-    double LastAudioQueuePressureLogTime = 0.0;
 
     static constexpr uint8 LocalDecodedPcmFlag = 0x02;
     static constexpr int32 MaxPendingWebSocketMessagesPerTick = 4;
     static constexpr int32 MaxAudioPacketsToFeedPerTick = 6;
     static constexpr int32 MaxAudioBytesToFeedPerTick = 256 * 1024;
-    static constexpr float MaxBufferedAudioSeconds = 1.5f;
     
     // 播放时间追踪
     double PlaybackStartTime = 0.0;

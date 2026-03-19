@@ -23,7 +23,6 @@
 #include "SocketSubsystem.h"
 
 // CoreManager logging
-#include "Log/CoreLogSubsystem.h"
 #include "Log/CoreLogTypes.h"
 #include "Log/CoreLogHelpers.h"
 
@@ -160,7 +159,7 @@ void UAudioStreamHttpWsSubsystem::Initialize(FSubsystemCollectionBase& Collectio
 void UAudioStreamHttpWsSubsystem::Deinitialize()
 {
     UE_LOG(LogTemp, Log, TEXT("[AudioStream] Deinitialize begin"));
-    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("音频流子系统"), TEXT("开始销毁"), TEXT("Deinitialize begin"));
+    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("音频流子系统"), TEXT("开始销毁"), TEXT("Deinitialize begin"));
 
     StopSocketServer();
 
@@ -186,7 +185,7 @@ void UAudioStreamHttpWsSubsystem::Deinitialize()
     UuidComponentMap.Empty();
     Super::Deinitialize();
     UE_LOG(LogTemp, Log, TEXT("[AudioStream] Deinitialize end"));
-    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("音频流子系统"), TEXT("销毁成功"), TEXT("Deinitialize end"));
+    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("音频流子系统"), TEXT("销毁成功"), TEXT("Deinitialize end"));
 }
 
 
@@ -198,7 +197,7 @@ bool UAudioStreamHttpWsSubsystem::RegisterComponent(UAudioStreamHttpWsComponent*
     // 生成 UUID（使用 FGuid）
     FGuid G = FGuid::NewGuid();
     FString Uuid = G.ToString(EGuidFormats::DigitsWithHyphens);
-    bool bFirst = false;
+    int32 RegisteredCount = 0;
     {
         FScopeLock Lock(&UuidMapCS);
         // 确保 UUID 唯一（理论上 NewGuid 已足够，但额外检查以防)
@@ -208,14 +207,14 @@ bool UAudioStreamHttpWsSubsystem::RegisterComponent(UAudioStreamHttpWsComponent*
             Uuid = NG.ToString(EGuidFormats::DigitsWithHyphens);
         }
         UuidComponentMap.Add(Uuid, Comp);
-        bFirst = (UuidComponentMap.Num() == 1);
+        RegisteredCount = UuidComponentMap.Num();
     }
 
     OutUuid = Uuid;
     FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流组件注册"), TEXT("组件注册"), FString::Printf(TEXT("Component registered uuid=%s total=%d"), *Uuid, UuidComponentMap.Num()));
 
     // If this is the first component, log auto-start suggestion (networking now handled per-component)
-    if (bFirst)
+    if (RegisteredCount == 1)
     {
         const UAudioStreamSettings* S = GetDefault<UAudioStreamSettings>();
         const EAudioStreamProtocolMode ProtocolMode = S ? S->DefaultProtocolMode : EAudioStreamProtocolMode::LegacyHttpWs;
@@ -671,7 +670,7 @@ void UAudioStreamHttpWsSubsystem::HandleSocketData(const TArray<uint8>& Data, co
         FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("SocketData"), TEXT("解析失败"), FString::Printf(TEXT("Failed to parse packet from %s (len=%d)"), *SenderInfo, Data.Num()));
         return;
     }
-    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SocketData"), TEXT("子系统接收"), FString::Printf(/*type用实际文本*/TEXT("Parsed packet from %s (Type=%s, Seq=%d, Size=%d)"), 
+    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("SocketData"), TEXT("子系统接收"), FString::Printf(/*type用实际文本*/TEXT("Parsed packet from %s (Type=%s, Seq=%d, Size=%d)"), 
         *SenderInfo, Header.GetTypeName(), Header.Seq, Payload.Num()));
     // 标记是否需要转发该消息（仅在作为服务器时有效）
     bool bShouldForward = false;
@@ -687,7 +686,7 @@ void UAudioStreamHttpWsSubsystem::HandleSocketData(const TArray<uint8>& Data, co
         // 记录详细日志和核心日志
         UE_LOG(LogAudioStreamWs, Verbose, TEXT("[Socket] %s received from %s (Type=%d, Seq=%d): %s"), 
             bIsServer ? TEXT("Server") : TEXT("Client"), *SenderInfo, Header.Type, Header.Seq, *ReceivedMsg);
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SocketData"), TEXT("文本消息"), FString::Printf(TEXT("From Subsystem %s: %s"), *SenderInfo, *ReceivedMsg));
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("SocketData"), TEXT("文本消息"), FString::Printf(TEXT("From Subsystem %s: %s"), *SenderInfo, *ReceivedMsg));
 
         // 处理特定的握手消息 "HELLO_SERVER"
         if (ReceivedMsg.StartsWith(TEXT("HELLO_SERVER")))
@@ -696,7 +695,7 @@ void UAudioStreamHttpWsSubsystem::HandleSocketData(const TArray<uint8>& Data, co
             {
                 // 服务器收到 Hello 消息，记录日志。客户端通常已通过 UDP 数据包到达注册。
                 UE_LOG(LogAudioStreamWs, Log, TEXT("[Socket] Server received HELLO from %s. Client is already registered by UDP packet arrival."), *SenderInfo);
-                FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SocketServer"), TEXT("收到HELLO"), FString::Printf(TEXT("Received HELLO from Subsystem %s"), *SenderInfo));
+                FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("SocketServer"), TEXT("收到HELLO"), FString::Printf(TEXT("Received HELLO from Subsystem %s"), *SenderInfo));
                 // Optional: Send Welcome back
                 // SendToClient(SenderInfo, "WELCOME_CLIENT"); 
             }
@@ -707,7 +706,7 @@ void UAudioStreamHttpWsSubsystem::HandleSocketData(const TArray<uint8>& Data, co
             if (ReceivedMsg.StartsWith(TEXT("TEST_PACKET")))
             {
                 UE_LOG(LogAudioStreamWs, Log, TEXT("[Socket] Test packet received: %s"), *ReceivedMsg);
-                FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SocketData"), TEXT("测试包"), FString::Printf(TEXT("Test packet received: %s"), *ReceivedMsg));
+                FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("SocketData"), TEXT("测试包"), FString::Printf(TEXT("Test packet received: %s"), *ReceivedMsg));
             }
             
             // 如果是服务器，标记需要转发此消息給其他客户端
@@ -723,7 +722,7 @@ void UAudioStreamHttpWsSubsystem::HandleSocketData(const TArray<uint8>& Data, co
         // 音频/图像处理占位符，记录日志
         UE_LOG(LogAudioStreamWs, Verbose, TEXT("[Socket] Binary packet received from %s (Seq=%d, Size=%d)"), *SenderInfo, Header.Seq, Payload.Num());
         // 在message里写明收到的类型，和来源uuid
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("SocketData"),TEXT("收到二进制数据"), FString::Printf(TEXT("UUID=%s, Type=%d, Size=%d from %s"), 
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("SocketData"),TEXT("收到二进制数据"), FString::Printf(TEXT("UUID=%s, Type=%d, Size=%d from %s"), 
             Header.HasUuid() ? /*只保留前几位*/ *Header.Uuid.ToString(EGuidFormats::DigitsWithHyphens).Left(8) : TEXT("None"), Header.Type, Payload.Num(), *SenderInfo));
         // 如果是服务器，标记需要转发此二进制数据
         if (bIsServer)
@@ -764,7 +763,7 @@ void UAudioStreamHttpWsSubsystem::SendPacket(uint8 Type, const TArray<uint8>& Pa
         if (!Uuid.IsValid())
         {
             // 没有UUID无法为其建立独立缓冲，直接走单包发送（仍更新统计）
-            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Error, TEXT("SendPacket"), TEXT("无UUID"), TEXT("音频包无UUID，降级为单包发送"));
+            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("SendPacket"), TEXT("无UUID"), TEXT("音频包无UUID，降级为单包发送"));
             UpdateStats(Payload.Num(), SampleRate, Channels);
         }
         else if (FrameBytes > 0)
@@ -777,7 +776,7 @@ void UAudioStreamHttpWsSubsystem::SendPacket(uint8 Type, const TArray<uint8>& Pa
             }
 
             // 循环取整帧
-            while (true)
+            while (false)//TODO
             {
                 int32 Available = 0;
                 bool bHasBuf = false;
@@ -864,7 +863,7 @@ void UAudioStreamHttpWsSubsystem::SendPacket(uint8 Type, const TArray<uint8>& Pa
                             // 为了与解码端区分，这里仍用 Audio 类型，但需要在组件侧知道负载是 Opus
                             // 可选：在 Flags 中扩展标志位；当前先走约定：组件按设置 bEnableOpus 解码
                             AudioStreamPacket::BuildPacket(Type, EncBuf, Packet, UuidPtr);
-                            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SendPacket"), TEXT("发送Opus帧"), FString::Printf(TEXT("UUID=%s EncBytes=%d PCM=%d"), *Uuid.ToString(), EncBytes, FrameBytes));
+                            FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("SendPacket"), TEXT("发送Opus帧"), FString::Printf(TEXT("UUID=%s EncBytes=%d PCM=%d"), *Uuid.ToString(), EncBytes, FrameBytes));
 
                             if (IsServer())
                             {
@@ -889,7 +888,7 @@ void UAudioStreamHttpWsSubsystem::SendPacket(uint8 Type, const TArray<uint8>& Pa
                     // 打包并发送原始 PCM 帧
                     TArray<uint8> Packet;
                     const FGuid* UuidPtr = &Uuid;
-                    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SendPacket"), TEXT("发送整帧音频"), FString::Printf(TEXT("Sending full audio frame (Size=%d bytes) for UUID=%s"), FrameBytes, *Uuid.ToString(EGuidFormats::DigitsWithHyphens)));
+                    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("SendPacket"), TEXT("发送整帧音频"), FString::Printf(TEXT("Sending full audio frame (Size=%d bytes) for UUID=%s"), FrameBytes, *Uuid.ToString(EGuidFormats::DigitsWithHyphens)));
                     AudioStreamPacket::BuildPacket(Type, FramePayload, Packet, UuidPtr);
 
                     if (IsServer())
@@ -1013,17 +1012,14 @@ void UAudioStreamHttpWsSubsystem::BroadcastTestPacket(uint8 PacketType)
     if (IsServer())
     {
         UE_LOG(LogAudioStreamWs, Log, TEXT("[Socket] Server broadcasted test packet (Type=%d, Size=%d, UUID=%s)"), PacketType, Payload.Num(), *UuidStr);
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("SocketServer"), TEXT("广播测试包"), FString::Printf(TEXT("Type: %d, Size: %d, UUID: %s"), PacketType, Payload.Num(), *UuidStr));
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SocketServer"), TEXT("广播测试包"), FString::Printf(TEXT("Type: %d, Size: %d, UUID: %s"), PacketType, Payload.Num(), *UuidStr));
     }
     else
     {
         UE_LOG(LogAudioStreamWs, Log, TEXT("[Socket] Client sent test packet (Type=%d, Size=%d, UUID=%s)"), PacketType, Payload.Num(), *UuidStr);
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("SocketClient"), TEXT("发送测试包"), FString::Printf(TEXT("Type: %d, Size: %d, UUID: %s"), PacketType, Payload.Num(), *UuidStr));
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("SocketClient"), TEXT("发送测试包"), FString::Printf(TEXT("Type: %d, Size: %d, UUID: %s"), PacketType, Payload.Num(), *UuidStr));
     }
 }
-
-
-
 
 
 

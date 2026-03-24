@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Node Source",
+	"Description": "Adds source labels to plugin nodes in Blueprints.",
+	"Category": "Editor",
+	"CreatedBy": "UTwelve",
+	"CreatedByURL": "",
+	"DocsURL": "https://docs.google.com/document/d/1E_lbce2Yjvrok6zXh4sbFRt9w8n2ZlFK0Vj5thk1nEU/edit?usp=sharing",
+	"MarketplaceURL": "",
+	"SupportURL": "mailto:12aikui@email.com",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "NodeSource",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
+		}
+	]
+}

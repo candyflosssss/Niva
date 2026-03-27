@@ -1,55 +1,47 @@
 ﻿# 插件总览（按作用分类）
 
-本项目包含多个自研与第三方插件。以下按“作用/功能大类”进行归类，并给出各插件的主要功能与核心类/对象一览。每个插件目录下亦提供单独的 README 说明更详尽的信息。
+本项目当前在 `Plugins/` 目录下包含 8 个插件。以下按“作用/功能大类”归类，并给出主要功能与入口对象。若某插件目录下提供了单独的 README，可继续进入对应目录查看细节。
 
 - 输入与设备 / 数据采集
-  - CustomInputController
-    - 主要功能：自定义输入设备接入、音频采集与流式传输（HTTP/WebSocket/UDP）、手部数据监听等。
-    - 关键类/对象：UAudioStreamHttpWsSubsystem、UAudioStreamHttpWsComponent、UMicAudioCaptureComponent、UMicAudioCaptureSubsystem、UMicAudioCaptureDebugWidget、UHandDataListenerComponent、UCustomInputKey、UHandRelRotBPLibrary、UUDPHandler（私有）。
-    - 文档：./CustomInputController/README.md
+  - `CustomInputController`
+    - 主要功能：自定义输入设备接入、UDP 手部数据监听、音频采集/推流与 WebSocket 音频链路。
+    - 关键类/对象：`FCustomInputControllerModule`、`FUDPInputDevice`、`UUDPHandler`、`UInputPlusSubsystem`、`UHandDataListenerComponent`、`UAudioStreamHttpWsSubsystem`、`UAudioStreamHttpWsComponent`、`UNetMicWsSubsystem`、`UNetMicWsComponent`、`UFunASRSubsystem`、`UHandKinematicsBPLibrary`。
+    - 文档：`./CustomInputController/README.md`
 
 - 网络通信 / 协议
-  - NetworkCorePlugin
-    - 主要功能：网络核心能力封装（内置 Web/HTTP/可能含 WS 支持）、统一的网络子系统、工具属性模型，便于游戏内与外部系统交互。
-    - 关键类/对象：UNetworkCoreSubsystem、UMCPToolProperty 及其派生（UMCPToolPropertyString 等）、配置 NivaNetworkCoreSettings、内置第三方 civetweb。
-    - 文档：./NetworkCorePlugin/README.md
-  - SocketHelper
-    - 主要功能：TCP/Socket 工具与蓝图函数库，提供客户端连接与常用 Socket 操作的封装。
-    - 关键类/对象：USocketUtility（蓝图函数库）、FTCPClient、FTCPClientHandler、FSocketConnection 等。
-    - 文档：./SocketHelper/README.md
+  - `NetworkCorePlugin`
+    - 主要功能：网络核心能力封装，提供内置 HTTP 路由、MCP/SSE 传输、工具属性模型，以及 LLM/TTS 相关异步能力。
+    - 关键类/对象：`UNetworkCoreSubsystem`、`UMCPTransportSubsystem`、`UMCPToolProperty` 及其派生类、`UNivaNetworkCoreSettings`、`URefreshMCPClientAsyncAction`。
+    - 文档：`./NetworkCorePlugin/README.md`
+  - `CoreManager`
+    - 主要功能：项目级核心管理与日志能力，提供统一日志子系统和调试 UI 支撑。
+    - 关键类/对象：`UCoreLogSubsystem`、`FCoreLogHelpers`、`UCoreLogListView`。
 
-- 音频 / 语音 / 口型同步
-  - OVRLipSync
-    - 主要功能：基于 Oculus OVR LipSync 的口型同步，支持实时/离线（播放）两种组件。
-    - 关键类/对象：UOVRLipSyncActorComponentBase、UOVRLipSyncLiveActorComponent、UOVRLipSyncPlaybackActorComponent、FOVRLipSyncContextWrapper、CookFrameSequenceAsync。
-    - 文档：./OVRLipSync/README.md
-  - SpeakerDialogue
-    - 主要功能：对白/播报相关的辅助逻辑（如说话者/对白控制等）。
-    - 关键类/对象：模块入口类（SpeakerDialogue 模块），以及与对白控制相关的组件/工具（详见插件自述）。
-    - 文档：./SpeakerDialogue/README.md
+- 音频 / 语音 / 对白
+  - `SpeakerDialogue`
+    - 主要功能：对白/播报相关的同步与分发逻辑，提供说话流的开始、分片推送、结束广播等能力。
+    - 关键类/对象：`UDialogueTalkComponent`、`FSpeakerDialogueModule`。
+    - 文档：`./SpeakerDialogue/README.md`
 
 - 任务编排 / AI 行为
-  - TaskWeaver
-    - 主要功能：任务系统与编排，支持延迟、队列、组件化管理任务等。
-    - 关键类/对象：UTaskManagerComponent、UTaskBase、UDelayTask 等。
-    - 文档：./TaskWeaver/README.md
+  - `TaskWeaver`
+    - 主要功能：任务系统与组件化编排，支持延迟任务、示例任务与任务管理组件。
+    - 关键类/对象：`UTaskManagerComponent`、`UTaskBase`、`UDelayTask`、`UHeartbeatTestTask`。
+    - 文档：`./TaskWeaver/README.md`
 
-- 渲染 / 可视化 / 预览
-  - LightFieldPreview
-    - 主要功能：光场/体渲染相关的预览与调试辅助。
-    - 关键类/对象：模块入口类（LightFieldPreview 模块）及相关预览工具（详见插件自述）。
-    - 文档：./LightFieldPreview/README.md
-
-- 物理模拟
-  - KawaiiPhysics
-    - 主要功能：次级物理（抖动/摆动）模拟，常用于角色头发、配饰等的物理效果。
-    - 关键类/对象：KawaiiPhysics 插件提供的物理节点/组件（详见插件自述）。
-    - 文档：./KawaiiPhysics/README.md
+- 渲染 / 可视化 / 编辑器扩展
+  - `LightFieldPreview`
+    - 主要功能：光场/可视化预览相关插件入口，当前以模块与内容资源承载为主。
+    - 关键类/对象：`FLightFieldPreviewModule`。
+    - 文档：`./LightFieldPreview/README.md`
+  - `NodeSource`
+    - 主要功能：Blueprint 节点来源标记的编辑器扩展，用于在图表中显示函数/节点的来源信息。
+    - 关键类/对象：`FNodeSourceModule`、`UNodeSourceSettings`。
 
 - 内容资源
-  - ArtContent
+  - `ArtContent`
     - 主要功能：内容（资源）型插件，集中存放项目通用的美术资源与数据资产。
-    - 关键类/对象：资源与数据资产（无运行时代码）。
-    - 文档：./ArtContent/README.md
+    - 关键对象：资源与数据资产（无运行时代码模块）。
+    - 文档：`./ArtContent/README.md`
 
-提示：若需快速了解具体 API 与使用方式，请进入各插件目录阅读对应 README（列出了主要类/对象与作用、典型使用方式与交互关系）。
+提示：若需快速了解具体 API 与使用方式，请优先阅读各插件目录中的 README；若插件未提供单独 README，则以 `Source/` 下公开头文件与 `.uplugin` 描述文件为准。

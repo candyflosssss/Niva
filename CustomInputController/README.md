@@ -1,50 +1,68 @@
 ﻿﻿# CustomInputController 插件说明
 
-- 功能分类：输入与设备 / 数据采集、音频采集与流式传输
+- 功能分类：输入与设备 / 数据采集 / 音频流处理
 - 主要功能：
-  - 自定义输入设备接入与按键/事件分发。
-  - 麦克风采集、音频缓冲与推流（HTTP / WebSocket / UDP），同时支持从网络拉取音频流做本地播放与统计。
-  - 手部/外设数据监听，提供手部21点解析、平滑/过滤与骨骼驱动辅助。
-  - UDP 监听器用于接收低延迟二进制/文本消息（含 C++/蓝图事件）。
+  - 自定义输入设备接入，将 UDP 数据转换为 UE 输入事件与轴值。
+  - UDP 文本/二进制接收、手部 21 点解析，以及蓝图友好的监听组件。
+  - 音频 HTTP / WebSocket / UDP 推流、拉流、本地播放与基础统计。
+  - FunASR 语音识别接入，以及网络麦克风链路的会话管理。
 
-- 完整类/对象清单（按角色分组）：
-  - 流媒体/网络
-    - UAudioStreamHttpWsSubsystem（UGameInstanceSubsystem）：音频 HTTP/WS 会话中枢；路由注册、推流/拉流、统计与调度；内置媒体 UDP 组播/单播分发、客户端对时与抖动缓冲。
-    - UAudioStreamHttpWsComponent（UActorComponent）：为 Actor 提供推流/控制入口，管理缓冲、viseme 队列与与子系统的注册绑定。
-    - UNetMicWsSubsystem（UGameInstanceSubsystem）：最小“网络麦克风”子系统，经 HTTP POST 获取 wsUrl 后建立 WS，接收二进制音频并做环形暂存（蓝图事件 OnAudioBinary）。
-    - UNetMicWsComponent（UActorComponent）：连接网络麦克风服务（文档协议），自动重连，暴露 <start>/<end>/<list_devices>/<set_device:N> 控制；接收的 PCM 帧自动转发到 FunASR 子系统。
-    - UUDPHandler（UObject）：轻量 UDP 接收器，封装 FUdpSocketReceiver；事件：OnBinaryReceived（C++）、OnDataReceived/OnDataReceivedDynamic（文本）。
-    - UStreamProcSoundWave（USoundWaveProcedural）：过程音频波形，支持多生产者/单消费者入队、欠载淡入与内存压缩；用于拉流端播放。
-  
-  - 音频采集
-    - UMicAudioCaptureComponent（UActorComponent）：采集本地麦克风；设备枚举、音量检测、分包与（可选）WebSocket 推送；动态多播事件（开始/停止/音量等）。
-    - UMicAudioCaptureSubsystem（UGameInstanceSubsystem）：封装组件实例的全局访问与参数管理，向上层提供统一蓝图/代码接口。
-    - Mic 相关设置类：
-      - UAudioStreamSettings（UDeveloperSettings，Config=Game）：媒体 UDP 端口、接收缓冲、默认 WS/组件/viseme/同步/日志等参数。
-      - UMicAudioCaptureSettings（UDeveloperSettings 或等效设置类，若存在）：麦克风采集默认参数（如采样率、声道、缓冲）。
+## 当前源码中的主要类与模块
 
-  - 输入/设备与手部工具
-    - UInputPlusSubsystem（UGameInstanceSubsystem）：
-      - 从 UDP 文本流解析双手 21 点（左右分组）；缓存最新帧；对外广播手部数据（动态/非动态委托）。
-    - UHandDataListenerComponent（UActorComponent）：
-      - 订阅并输出左/右手数据；提供平滑（指数）、离群过滤、自适应阈值、速度限幅与丢帧策略等；可输出相对/世界旋转映射。
-    - UHandKinematicsBPLibrary（UBlueprintFunctionLibrary；文件名 UHandRelRotBPLibrary.h）：
-      - FHandRuntimeState / FHandLimitsConfig / FHandCalibOffsets 辅助结构；
-      - 计算父->子相对旋转、腕部朝向；
-      - Offset 标定/应用；Mannequin 左右手映射生成等。
+- 模块与输入设备
+  - `FCustomInputControllerModule`：插件模块入口，负责注册输入设备模块能力。
+  - `FUDPInputDevice`：自定义输入设备实现，将 UDP 数据转换为键/轴输入。
+  - `FMyCustomInputKeys` / `UCustomInputKey`：自定义按键注册与辅助对象。
 
-- 其他公开头文件与结构：
-  - AudioStreamSettings.h（见上）、StreamProcSoundWave.h、InputPlusSubsystem.h、HandDataListenerComponent.h、UHandRelRotBPLibrary.h、UUDPHandler.h 等。
+- 通用 UDP 与手部数据链路
+  - `UUDPHandler`：通用 UDP 接收器，提供文本与二进制接收委托。
+  - `UInputPlusSubsystem`：解析手部关键点数据、缓存最近一帧，并对外广播。
+  - `UHandDataListenerComponent`：订阅手部数据，执行平滑、过滤与姿态计算。
+  - `UHandKinematicsBPLibrary`（文件名 `UHandRelRotBPLibrary.*`）：提供手部相对旋转、腕部朝向、标定与映射计算。
+  - `UCICGazeTrackingSettings` / `UCICGazeTrackingSubsystem`：注视追踪相关配置与子系统。
 
-- 典型交互关系：
-  - 采集推流：UMicAudioCaptureComponent -> UAudioStreamHttpWsSubsystem / UNetMicWsSubsystem ->（HTTP/WS/UDP）服务端。
-  - 拉流播放：UAudioStreamHttpWsSubsystem/UNetMicWsSubsystem -> UStreamProcSoundWave（本地播放）-> 统计/viseme。
-  - 网络麦克风 + 识别：UNetMicWsComponent -> WebSocket 服务 -> 二进制 PCM -> UFunASRSubsystem（自动 Start / SendAudioFrame）。
-  - 手部数据：UInputPlusSubsystem（UDP 解析） -> UHandDataListenerComponent（平滑/过滤/输出旋转）。
+- 音频流与网络麦克风
+  - `UAudioStreamHttpWsSubsystem`：音频流会话中枢，负责 HTTP/WS/UDP 推拉流、分发与统计。
+  - `UAudioStreamHttpWsComponent`：Actor 侧音频流组件，提供推流、拉流和播放控制入口。
+  - `UNetMicWsSubsystem`：网络麦克风子系统，负责 WebSocket 会话与音频帧分发。
+  - `UNetMicWsComponent`：Actor 侧网络麦克风组件，负责连接、控制与回调。
+  - `UStreamProcSoundWave`：过程音频波形，用于流式音频播放。
+  - `UAudioStreamSettings`：音频流、同步与 Opus 相关设置。
 
-- 使用示例（蓝图）：
-  1. 在角色或控制器上添加 UNetMicWsComponent 组件。
-  2. BeginPlay 调用 Connect("ws://localhost:8765")。
-  3. 可选调用 RequestDeviceList() 获取设备列表（OnServerMessage 事件返回 JSON 字符串）。
-  4. SetDeviceIndex(0) 选择设备；StartRecording() 开始录音；StopRecording() 停止。
-  5. 识别结果从 UFunASRSubsystem 的 OnResultReceived 事件获取。
+- ASR 相关
+  - `UFunASRSettings`：FunASR 配置。
+  - `UFunASRSubsystem`：FunASR WebSocket 会话与结果分发。
+  - `UFunASRMicComponent`：本地音频采集并向 FunASR 子系统送帧。
+
+## 典型交互关系
+
+- 输入注入链：
+  - `FCustomInputControllerModule` → `FUDPInputDevice` → `UUDPHandler` → UE 输入系统
+- 手部数据链：
+  - `UInputPlusSubsystem` → `UHandDataListenerComponent` → 蓝图/角色骨骼驱动
+- 音频流链：
+  - `UAudioStreamHttpWsComponent` ↔ `UAudioStreamHttpWsSubsystem` ↔ HTTP / WebSocket / UDP 服务端
+- 网络麦克风 + 识别链：
+  - `UNetMicWsComponent` / `UFunASRMicComponent` → `UFunASRSubsystem` → 识别结果回调
+
+## 使用提示
+
+- 若要接入 UDP 手部数据：
+  1. 确保 `UInputPlusSubsystem` 已在运行时初始化。
+  2. 在目标 Actor 上挂载 `UHandDataListenerComponent`。
+  3. 在蓝图中绑定组件事件，或轮询最近一帧手部数据。
+
+- 若要接入网络麦克风：
+  1. 在角色或控制器上添加 `UNetMicWsComponent`。
+  2. 在 `BeginPlay` 中调用连接接口。
+  3. 根据服务端协议请求设备列表、选择设备并开始/停止录音。
+
+- 若要接入音频推流/拉流：
+  1. 使用 `UAudioStreamHttpWsComponent` 发起控制。
+  2. 通过 `UAudioStreamSettings` 配置缓冲、同步与 Opus 相关参数。
+
+## 参考
+
+- 源码：`Plugins/CustomInputController/Source/CustomInputController`
+- 补充文档：`Plugins/CustomInputController/Docs/CustomInputController_Reference_And_Flow.md`
+

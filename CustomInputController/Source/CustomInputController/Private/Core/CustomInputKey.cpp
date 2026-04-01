@@ -1,4 +1,5 @@
 ﻿#include "Core/CustomInputKey.h"
+#include "Core/CICRuntimeSettings.h"
 #include "Engine/Engine.h"
 #include "GenericPlatform/GenericPlatformInputDeviceMapper.h"
 
@@ -153,6 +154,10 @@ FUDPInputDevice::FUDPInputDevice(const TSharedRef<FGenericApplicationMessageHand
     UDPHandler.Reset(NewObject<UUDPHandler>());
     if (UDPHandler.IsValid())
     {
+        const UCICRuntimeSettings* RuntimeSettings = UCICRuntimeSettings::Get();
+        const int32 UdpPort = RuntimeSettings ? RuntimeSettings->InputDeviceUdpPort : 8091;
+        const bool bAutoStartUdp = RuntimeSettings ? RuntimeSettings->bAutoStartInputDeviceUdp : true;
+
         // 绑定普通委托（不是动态委托）
         UDPHandler->OnDataReceived.AddLambda([this](const FString& ReceivedData)
         {
@@ -160,15 +165,21 @@ FUDPInputDevice::FUDPInputDevice(const TSharedRef<FGenericApplicationMessageHand
             OnUDPDataReceived(ReceivedData);
         });
         
-        // 启动UDP监听，使用端口8091
-        if (UDPHandler->StartUDPReceiver(8091))
-        {
-            UE_LOG(LogTemp, Log, TEXT("FUDPInputDevice: UDP监听器启动成功"));
-        }
-        else
-        {
-            UE_LOG(LogTemp, Error, TEXT("FUDPInputDevice: UDP监听器启动失败"));
-        }
+            if (bAutoStartUdp)
+            {
+              if (UDPHandler->StartUDPReceiver(UdpPort))
+              {
+                UE_LOG(LogTemp, Log, TEXT("FUDPInputDevice: UDP监听器启动成功，端口=%d"), UdpPort);
+              }
+              else
+              {
+                UE_LOG(LogTemp, Error, TEXT("FUDPInputDevice: UDP监听器启动失败，端口=%d"), UdpPort);
+              }
+            }
+            else
+            {
+              UE_LOG(LogTemp, Log, TEXT("FUDPInputDevice: 按配置跳过自动启动 UDP 监听，端口=%d"), UdpPort);
+            }
     }
 }
 

@@ -1,6 +1,7 @@
 ﻿// Fill out your copyright notice in the Description page of Project Settings.
 
 #include "Input/InputPlusSubsystem.h"
+#include "Core/CICRuntimeSettings.h"
 
 void UInputPlusSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
@@ -10,8 +11,18 @@ void UInputPlusSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     UDPHandler = NewObject<UUDPHandler>(this);
     if (UDPHandler)
     {
+        const UCICRuntimeSettings* RuntimeSettings = UCICRuntimeSettings::Get();
+        const int32 UdpPort = RuntimeSettings ? RuntimeSettings->HandTrackingUdpPort : 8092;
+        const bool bAutoStartUdp = RuntimeSettings ? RuntimeSettings->bAutoStartHandTrackingUdp : true;
         UDPHandler->OnDataReceivedDynamic.AddDynamic(this, &UInputPlusSubsystem::OnUDPDataReceivedInternal);
-        UDPHandler->StartUDPReceiver(8092);
+        if (bAutoStartUdp)
+        {
+          UDPHandler->StartUDPReceiver(UdpPort);
+        }
+        else
+        {
+          UE_LOG(LogTemp, Log, TEXT("InputPlusSubsystem: 按配置跳过自动启动手部 UDP 监听，端口=%d"), UdpPort);
+        }
     }
 
     // 初始化缓存数据

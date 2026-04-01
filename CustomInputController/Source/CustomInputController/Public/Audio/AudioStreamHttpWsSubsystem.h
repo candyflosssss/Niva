@@ -126,6 +126,13 @@ public:
 private:
     // 转发原始数据包给其他客户端（Server Only）
     void ForwardPacket(const TArray<uint8>& RawData, const FString& ExcludeClientKey);
+    void SendBuiltPacket(const TArray<uint8>& Packet);
+    void ScheduleAudioDrain(float DelaySeconds = 0.001f);
+    void DrainPendingAudioFrames();
+    bool DequeueAudioFrameForUuid(const FGuid& Uuid, int32 FrameBytes, TArray<uint8>& OutFramePayload);
+    bool HasPendingAudioFrames(int32 FrameBytes) const;
+    bool TryConsumeOpusEncodeBudget(int32 FramesToConsume, double& OutRetryDelaySeconds);
+    void TrimAudioBufferForUuid(const FGuid& Uuid, TArray<uint8>& Buffer, int32 FrameBytes);
 
     // ===== 组件映射 / 路由 =====
     TMap<FString, TWeakObjectPtr<UAudioStreamHttpWsComponent>> UuidComponentMap;
@@ -172,6 +179,15 @@ private:
     // ===== 音频分帧缓存（按UUID） =====
     mutable FCriticalSection AudioBufCS;
     TMap<FGuid, TArray<uint8>> AudioBufferMap;
+    FGuid LastDrainedAudioUuid;
+    int32 MaxDrainFramesPerTick = 8;
+    int32 MaxBufferedFramesPerUuid = 12;
+
+    // ===== Opus 限流（避免同一帧/同一时间窗内编码过量导致卡顿） =====
+    mutable FCriticalSection OpusBudgetCS;
+    double OpusBudgetWindowStartSec = 0.0;
+    int32 OpusFramesEncodedInWindow = 0;
+    int32 MaxOpusFramesPerWindow = 8;
 
     // ===== 可选：Opus 编码器缓存（按UUID） =====
     struct FOpusEncoderState
@@ -195,6 +211,7 @@ private:
     int32 CachedServerPort = 0;
     FTimerHandle SocketServerTimerHandle;
     FTimerHandle SocketClientTimerHandle;
+    FTimerHandle AudioDrainTimerHandle;
 
     void SocketServerTick();
     void SocketClientTick();

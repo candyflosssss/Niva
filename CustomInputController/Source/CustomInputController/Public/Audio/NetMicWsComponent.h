@@ -2,8 +2,10 @@
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
-#include "IWebSocket.h"
 #include "NetMicWsComponent.generated.h"
+
+class FCICWebSocketSession;
+class UNetMicWsSubsystem;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE( FNetMicSimpleEvent );
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam( FNetMicErrorEvent, const FString&, Error );
@@ -101,7 +103,7 @@ private:
 	void OnWsConnectionError(const FString& Error);
 	void OnWsClosed(int32 StatusCode, const FString& Reason, bool bWasClean);
 	void OnWsMessage(const FString& Message);
-	void OnWsRawMessage(const void* Data, SIZE_T Size, SIZE_T BytesRemaining);
+	void OnWsBinaryFrame(const TArray<uint8>& Data);
 
 	void TryRestoreDesiredStateAfterConnect();
 
@@ -117,7 +119,8 @@ private:
 	void ForwardAudioToASR(const TArray<uint8>& Bytes);
 
 private:
-	TSharedPtr<IWebSocket> Socket;
+	TSharedPtr<FCICWebSocketSession> WebSocketSession;
+	TWeakObjectPtr<UNetMicWsSubsystem> CompatibilitySubsystem;
 	FString LastUrl;
 	bool bIsConnected = false;
 	bool bManualClose = false;
@@ -136,6 +139,4 @@ private:
 	float ReconnectMaxDelaySeconds = 30.0f;
 	FTimerHandle ReconnectTimerHandle;
 
-	// WS 二进制分片组装缓存
-	TArray<uint8> PendingBinary;
 };

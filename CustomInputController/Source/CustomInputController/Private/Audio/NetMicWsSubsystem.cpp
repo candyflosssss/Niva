@@ -1,16 +1,17 @@
 ﻿#include "Audio/NetMicWsSubsystem.h"
+#include "Audio/NetMicWsComponent.h"
 #include "HttpModule.h"
 #include "Interfaces/IHttpRequest.h"
 #include "Interfaces/IHttpResponse.h"
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
-#include "Modules/ModuleManager.h"
-#include "WebSocketsModule.h"
+#include "Async/Async.h"
 
 void UNetMicWsSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
+	UE_LOG(LogTemp, Log, TEXT("NetMicWsSubsystem initialized in compatibility mode; live WebSocket ownership belongs to NetMicWsComponent."));
 }
 
 void UNetMicWsSubsystem::Deinitialize()
@@ -21,9 +22,10 @@ void UNetMicWsSubsystem::Deinitialize()
 
 void UNetMicWsSubsystem::StartByPost(const FString& HttpUrl, const FString& JsonBody)
 {
-	// 每次尝试都重置暂存区，并断开旧连接
+	WarnCompatibilityUse(TEXT("StartByPost"));
+	// 每次尝试都重置暂存区，并委托组件重连
 	ResetBuffer();
-	CloseWebSocket();
+	StopMic();
 
 	FHttpModule& Http = FHttpModule::Get();
 	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = Http.CreateRequest();
@@ -69,14 +71,25 @@ void UNetMicWsSubsystem::StartByPost(const FString& HttpUrl, const FString& Json
 
 void UNetMicWsSubsystem::StartDirect(const FString& WsUrl)
 {
+	WarnCompatibilityUse(TEXT("StartDirect"));
 	ResetBuffer();
-	CloseWebSocket();
-	ConnectWebSocket(WsUrl);
+	if (UNetMicWsComponent* Component = GetCompatibilityComponent())
+	{
+		Component->Connect(WsUrl);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("NetMicWsSubsystem::StartDirect has no registered NetMicWsComponent to delegate to."));
+	}
 }
 
 void UNetMicWsSubsystem::StopMic()
 {
-	CloseWebSocket();
+	WarnCompatibilityUse(TEXT("StopMic"));
+	if (UNetMicWsComponent* Component = GetCompatibilityComponent())
+	{
+		Component->Disconnect();
+	}
 	ResetBuffer();
 }
 
@@ -95,61 +108,48 @@ void UNetMicWsSubsystem::ResetBuffer()
 	Ring.Reset();
 }
 
-void UNetMicWsSubsystem::ConnectWebSocket(const FString& Url)
+void UNetMicWsSubsystem::WarnCompatibilityUse(const TCHAR* FunctionName) const
 {
-	if (!FModuleManager::Get().IsModuleLoaded("WebSockets"))
-	{
-		FModuleManager::Get().LoadModuleChecked<IModuleInterface>("WebSockets");
-	}
-
-	TSharedPtr<IWebSocket> NewSocket = FWebSocketsModule::Get().CreateWebSocket(Url);
-	NewSocket->OnConnected().AddUObject(this, &UNetMicWsSubsystem::OnWsConnected);
-	NewSocket->OnConnectionError().AddUObject(this, &UNetMicWsSubsystem::OnWsError);
-	NewSocket->OnClosed().AddUObject(this, &UNetMicWsSubsystem::OnWsClosed);
-	NewSocket->OnMessage().AddUObject(this, &UNetMicWsSubsystem::OnWsText);
-	NewSocket->OnRawMessage().AddUObject(this, &UNetMicWsSubsystem::OnWsBinary);
-
-	Socket = NewSocket;
-	Socket->Connect();
+	UE_LOG(LogTemp, Warning, TEXT("NetMicWsSubsystem::%s is running in compatibility mode. Prefer UNetMicWsComponent for live WebSocket ownership."), FunctionName);
 }
 
-void UNetMicWsSubsystem::CloseWebSocket()
+UNetMicWsComponent* UNetMicWsSubsystem::GetCompatibilityComponent() const
 {
-	if (Socket.IsValid())
+	return CompatibilityComponent.Get();
+}
+
+void UNetMicWsSubsystem::RegisterCompatibilityComponent(UNetMicWsComponent* InComponent)
+{
+	if (!IsValid(InComponent))
 	{
-		Socket->Close();
-		Socket.Reset();
+		return;
+	}
+
+	if (!CompatibilityComponent.IsValid())
+	{
+		CompatibilityComponent = InComponent;
+		UE_LOG(LogTemp, Log, TEXT("NetMicWsSubsystem registered compatibility component: %s"), *InComponent->GetName());
 	}
 }
 
-void UNetMicWsSubsystem::OnWsConnected()
+void UNetMicWsSubsystem::UnregisterCompatibilityComponent(UNetMicWsComponent* InComponent)
 {
-	UE_LOG(LogTemp, Log, TEXT("NetMic WS connected"));
+	if (CompatibilityComponent.Get() == InComponent)
+	{
+		CompatibilityComponent.Reset();
+	}
 }
 
-void UNetMicWsSubsystem::OnWsError(const FString& Error)
+void UNetMicWsSubsystem::MirrorAudioFrame(const TArray<uint8>& Data)
 {
-	UE_LOG(LogTemp, Error, TEXT("NetMic WS error: %s"), *Error);
-}
-
-void UNetMicWsSubsystem::OnWsClosed(int32 StatusCode, const FString& Reason, bool bWasClean)
-{
-	UE_LOG(LogTemp, Warning, TEXT("NetMic WS closed: %d %s"), StatusCode, *Reason);
-}
-
-void UNetMicWsSubsystem::OnWsText(const FString& Message)
-{
-	// 可选：处理控制信令
-}
-
-void UNetMicWsSubsystem::OnWsBinary(const void* Data, SIZE_T Size, SIZE_T /*BytesRemaining*/)
-{
-	if (Size == 0) return;
+	if (Data.Num() == 0)
+	{
+		return;
+	}
 
 	FPacket P;
 	P.TimeSec = FPlatformTime::Seconds();
-	P.Bytes.SetNumUninitialized(Size);
-	FMemory::Memcpy(P.Bytes.GetData(), Data, Size);
+	P.Bytes = Data;
 
 	{
 		FScopeLock Lock(&BufferCS);
@@ -162,9 +162,5 @@ void UNetMicWsSubsystem::OnWsBinary(const void* Data, SIZE_T Size, SIZE_T /*Byte
 		}
 	}
 
-	// 内部分发：仅广播蓝图，网络转发留待后续实现
-	if (bForwardEnabled && OnAudioBinary.IsBound())
-	{
-		OnAudioBinary.Broadcast(Ring.Last().Bytes);
-	}
+	OnAudioBinary.Broadcast(Data);
 }

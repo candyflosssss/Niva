@@ -1,6 +1,4 @@
 ﻿#include "Audio/NetMicWsComponent.h"
-#include "WebSocketsModule.h"
-#include "Modules/ModuleManager.h"
 #include "TimerManager.h"
 #include "Engine/World.h"
 #include "ASR/FunASRSubsystem.h"
@@ -9,6 +7,8 @@
 #include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
 #include "Audio/AudioStreamSettings.h"
+#include "Audio/NetMicWsSubsystem.h"
+#include "Transport/CICWebSocketSession.h"
 
 UNetMicWsComponent::UNetMicWsComponent()
 {
@@ -32,6 +32,18 @@ void UNetMicWsComponent::BeginPlay()
 		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("AutoConnect: %s"), *Url));
 		Connect(Url);
 	}
+
+	if (UWorld* World = GetWorld())
+	{
+		if (UGameInstance* GI = World->GetGameInstance())
+		{
+			if (UNetMicWsSubsystem* NetMicSubsystem = GI->GetSubsystem<UNetMicWsSubsystem>())
+			{
+				CompatibilitySubsystem = NetMicSubsystem;
+				NetMicSubsystem->RegisterCompatibilityComponent(this);
+			}
+		}
+	}
 }
 
 void UNetMicWsComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -39,6 +51,11 @@ void UNetMicWsComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("NetMic"), TEXT("EndPlay: closing WS and canceling reconnect"));
 	CancelReconnect();
 	CloseWebSocket(true);
+	if (CompatibilitySubsystem.IsValid())
+	{
+		CompatibilitySubsystem->UnregisterCompatibilityComponent(this);
+		CompatibilitySubsystem.Reset();
+	}
 	Super::EndPlay(EndPlayReason);
 }
 
@@ -122,36 +139,32 @@ void UNetMicWsComponent::SetDeviceIndex(int32 Index)
 
 void UNetMicWsComponent::OpenWebSocket(const FString& Url)
 {
-	if (!FModuleManager::Get().IsModuleLoaded("WebSockets"))
-	{
-		FModuleManager::Get().LoadModuleChecked<IModuleInterface>("WebSockets");
-	}
-
 	CloseWebSocket(false);
 
-	Socket = FWebSocketsModule::Get().CreateWebSocket(Url);
-	Socket->OnConnected().AddUObject(this, &UNetMicWsComponent::OnWsConnected);
-	Socket->OnConnectionError().AddUObject(this, &UNetMicWsComponent::OnWsConnectionError);
-	Socket->OnClosed().AddUObject(this, &UNetMicWsComponent::OnWsClosed);
-	Socket->OnMessage().AddUObject(this, &UNetMicWsComponent::OnWsMessage);
-	Socket->OnRawMessage().AddUObject(this, &UNetMicWsComponent::OnWsRawMessage);
+	if (!WebSocketSession.IsValid())
+	{
+		WebSocketSession = MakeShared<FCICWebSocketSession>();
+		WebSocketSession->OnConnected.BindUObject(this, &UNetMicWsComponent::OnWsConnected);
+		WebSocketSession->OnConnectionError.BindUObject(this, &UNetMicWsComponent::OnWsConnectionError);
+		WebSocketSession->OnClosed.BindUObject(this, &UNetMicWsComponent::OnWsClosed);
+		WebSocketSession->OnTextMessage.BindUObject(this, &UNetMicWsComponent::OnWsMessage);
+		WebSocketSession->OnBinaryMessage.BindUObject(this, &UNetMicWsComponent::OnWsBinaryFrame);
+	}
 
 	bManualClose = false;
 	bIsConnecting = true;
 	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("WebSocket connecting: %s"), *Url));
-	Socket->Connect();
+	WebSocketSession->Connect(Url);
 }
 
 void UNetMicWsComponent::CloseWebSocket(bool bIsManual)
 {
-	if (Socket.IsValid())
+	if (WebSocketSession.IsValid())
 	{
 		bManualClose = bIsManual;
 		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), TEXT("CloseWebSocket"));
-		Socket->Close();
-		Socket.Reset();
+		WebSocketSession->Close(bIsManual);
 	}
-	PendingBinary.Reset();
 	if (bIsConnected)
 	{
 		bIsConnected = false;
@@ -173,6 +186,10 @@ void UNetMicWsComponent::OnWsConnectionError(const FString& Error)
 {
 	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("Connection error: %s"), *Error));
 	OnError.Broadcast(Error);
+	if (bIsConnected)
+	{
+		OnDisconnected.Broadcast();
+	}
 	bIsConnected = false;
 	bIsConnecting = false;
 	if (!bManualClose && bAutoReconnect && !LastUrl.IsEmpty())
@@ -183,6 +200,10 @@ void UNetMicWsComponent::OnWsConnectionError(const FString& Error)
 
 void UNetMicWsComponent::OnWsClosed(int32 StatusCode, const FString& Reason, bool bWasClean)
 {
+	if (bIsConnected)
+	{
+		OnDisconnected.Broadcast();
+	}
 	bIsConnected = false;
 	bIsConnecting = false;
 	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("WebSocket closed: code=%d reason=%s clean=%d"), StatusCode, *Reason, bWasClean ? 1 : 0));
@@ -200,25 +221,22 @@ void UNetMicWsComponent::OnWsMessage(const FString& Message)
 	OnServerMessage.Broadcast(Message);
 }
 
-void UNetMicWsComponent::OnWsRawMessage(const void* Data, SIZE_T Size, SIZE_T BytesRemaining)
+void UNetMicWsComponent::OnWsBinaryFrame(const TArray<uint8>& Data)
 {
-	if (Size == 0) return;
-
-	// 累积分片
-	int32 Prev = PendingBinary.Num();
-	PendingBinary.AddUninitialized(Size);
-	FMemory::Memcpy(PendingBinary.GetData() + Prev, Data, Size);
-
-	if (BytesRemaining == 0)
+	if (Data.Num() == 0)
 	{
-		// 一个完整帧到达
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("WS audio frame: %d bytes"), PendingBinary.Num()));
-		OnAudioFrame.Broadcast(PendingBinary);
-		if (bForwardToASR)
-		{
-			ForwardAudioToASR(PendingBinary);
-		}
-		PendingBinary.Reset();
+		return;
+	}
+
+	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("NetMic"), FString::Printf(TEXT("WS audio frame: %d bytes"), Data.Num()));
+	OnAudioFrame.Broadcast(Data);
+	if (CompatibilitySubsystem.IsValid())
+	{
+		CompatibilitySubsystem->MirrorAudioFrame(Data);
+	}
+	if (bForwardToASR)
+	{
+		ForwardAudioToASR(Data);
 	}
 }
 
@@ -278,9 +296,9 @@ float UNetMicWsComponent::GetNextBackoffSeconds() const
 
 void UNetMicWsComponent::SendCtrl(const FString& Ctrl)
 {
-	if (Socket.IsValid() && Socket->IsConnected())
+	if (WebSocketSession.IsValid() && WebSocketSession->IsConnected())
 	{
-		Socket->Send(Ctrl);
+		WebSocketSession->SendText(Ctrl);
 	}
 }
 

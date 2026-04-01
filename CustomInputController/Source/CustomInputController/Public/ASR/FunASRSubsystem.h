@@ -2,8 +2,9 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/GameInstanceSubsystem.h"
-#include "IWebSocket.h"
 #include "FunASRSubsystem.generated.h"
+
+class FCICWebSocketSession;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FFunASRVoidDelegate);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FFunASRStringDelegate, const FString&, Message);
@@ -73,6 +74,8 @@ private:
 	// Protocol methods
 	void SendRunTask();
 	void SendFinishTask();
+	void CloseSocketAfterTaskTerminalState();
+	void RestartIfPendingAfterTaskEnd();
 	
 	void ProcessJsonMessage(const FString& Message);
 
@@ -80,7 +83,7 @@ private:
     void CheckRetry();
     void ScheduleReconnect();
 
-	TSharedPtr<IWebSocket> WebSocket;
+	TSharedPtr<FCICWebSocketSession> WebSocketSession;
 	FString CurrentTaskId;
 	
 	// Cache for the full text of the current session
@@ -90,6 +93,8 @@ private:
 	bool bIsWebSocketConnected = false;
 	bool bIsTaskRunning = false;
     bool bStartRequested = false; // Flag to send run-task once connected
+	bool bWaitingForTaskFinish = false;
+	bool bPendingStartAfterFinish = false;
 
     // Retry State
     FTimerHandle TimerHandle_Reconnect;

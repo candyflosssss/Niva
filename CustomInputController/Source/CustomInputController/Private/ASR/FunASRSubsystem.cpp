@@ -1,12 +1,12 @@
 ﻿#include "ASR/FunASRSubsystem.h"
 #include "ASR/FunASRSettings.h"
-#include "WebSocketsModule.h"
 #include "Serialization/JsonSerializer.h"
 #include "Misc/Guid.h"
 #include "Async/Async.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
 #include "Log/CoreLogHelpers.h"
+#include "Transport/CICWebSocketSession.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogFunASR, Log, All);
 
@@ -36,14 +36,10 @@ void UFunASRSubsystem::ForceDisconnect()
 		GetWorld()->GetTimerManager().ClearTimer(TimerHandle_Reconnect);
 	}
 
-	if (WebSocket.IsValid())
+	if (WebSocketSession.IsValid())
 	{
-		WebSocket->OnConnected().Clear();
-		WebSocket->OnConnectionError().Clear();
-		WebSocket->OnClosed().Clear();
-		WebSocket->OnMessage().Clear();
-		WebSocket->Close();
-		WebSocket.Reset();
+		WebSocketSession->Close(true);
+		WebSocketSession.Reset();
 	}
 }
 
@@ -59,7 +55,7 @@ void UFunASRSubsystem::StartASR()
 	CurrentRetryCount = 0; // Reset retry on fresh start
 	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), TEXT("Starting ASR Task (Manual Start)"));
 
-	if (bIsWebSocketConnected && WebSocket.IsValid())
+	if (bIsWebSocketConnected && WebSocketSession.IsValid() && WebSocketSession->IsConnected())
 	{
 		SendRunTask();
 	}
@@ -90,10 +86,10 @@ void UFunASRSubsystem::StopASR()
 
 void UFunASRSubsystem::SendAudioFrame(const TArray<uint8>& AudioData)
 {
-	if (bIsTaskRunning && WebSocket.IsValid() && bIsWebSocketConnected)
+	if (bIsTaskRunning && WebSocketSession.IsValid() && bIsWebSocketConnected)
 	{
 		// Send binary frame
-		WebSocket->Send(AudioData.GetData(), AudioData.Num(), true);
+		WebSocketSession->SendBinary(AudioData);
 		
 		// [Debug] Log periodically to confirm data is hitting the wire
 		static double LastSendLogTime = 0.0;
@@ -114,7 +110,7 @@ void UFunASRSubsystem::SendAudioFrame(const TArray<uint8>& AudioData)
 
 void UFunASRSubsystem::ConnectWebSocket()
 {
-	if (WebSocket.IsValid())
+	if (WebSocketSession.IsValid() && (WebSocketSession->IsConnected() || WebSocketSession->IsConnecting()))
 	{
 		// Already connecting or connected
 		return;
@@ -143,14 +139,16 @@ void UFunASRSubsystem::ConnectWebSocket()
     UE_LOG(LogFunASR, Log, TEXT("Connecting to FunASR: %s (Retry %d)"), *Url, CurrentRetryCount);
 	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Connecting to FunASR: %s (Retry %d)"), *Url, CurrentRetryCount));
 
-	WebSocket = FWebSocketsModule::Get().CreateWebSocket(Url, TEXT(""), Headers);
+	if (!WebSocketSession.IsValid())
+	{
+		WebSocketSession = MakeShared<FCICWebSocketSession>();
+		WebSocketSession->OnConnected.BindUObject(this, &UFunASRSubsystem::OnWsConnected);
+		WebSocketSession->OnConnectionError.BindUObject(this, &UFunASRSubsystem::OnWsConnectionError);
+		WebSocketSession->OnClosed.BindUObject(this, &UFunASRSubsystem::OnWsClosed);
+		WebSocketSession->OnTextMessage.BindUObject(this, &UFunASRSubsystem::OnWsMessage);
+	}
 
-	WebSocket->OnConnected().AddUObject(this, &UFunASRSubsystem::OnWsConnected);
-	WebSocket->OnConnectionError().AddUObject(this, &UFunASRSubsystem::OnWsConnectionError);
-	WebSocket->OnClosed().AddUObject(this, &UFunASRSubsystem::OnWsClosed);
-	WebSocket->OnMessage().AddUObject(this, &UFunASRSubsystem::OnWsMessage);
-	
-	WebSocket->Connect();
+	WebSocketSession->Connect(Url, Headers);
 }
 
 void UFunASRSubsystem::OnWsConnected()
@@ -173,7 +171,7 @@ void UFunASRSubsystem::OnWsConnectionError(const FString& Error)
 	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("FunASR Connection Error: %s"), *Error));
 	bIsWebSocketConnected = false;
 	bIsTaskRunning = false;
-	WebSocket.Reset();
+	WebSocketSession.Reset();
 	
 	OnError.Broadcast(TEXT("Connection Error: ") + Error);
 
@@ -186,7 +184,7 @@ void UFunASRSubsystem::OnWsClosed(int32 StatusCode, const FString& Reason, bool 
 	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("FunASR WebSocket Closed. Code: %d, Reason: %s"), StatusCode, *Reason));
 	bIsWebSocketConnected = false;
 	bIsTaskRunning = false;
-	WebSocket.Reset();
+	WebSocketSession.Reset();
 
 	// If closed unexpectedly while running task
 	if (!bWasClean)
@@ -290,9 +288,9 @@ void UFunASRSubsystem::SendRunTask()
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
 	FJsonSerializer::Serialize(RootObj.ToSharedRef(), Writer);
 
-	if (WebSocket.IsValid() && bIsWebSocketConnected)
+	if (WebSocketSession.IsValid() && bIsWebSocketConnected)
 	{
-		WebSocket->Send(OutputString);
+		WebSocketSession->SendText(OutputString);
 		UE_LOG(LogFunASR, Log, TEXT("Sent run-task: %s"), *CurrentTaskId);
 		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Sent run-task: %s"), *CurrentTaskId));
 	}
@@ -319,9 +317,9 @@ void UFunASRSubsystem::SendFinishTask()
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
 	FJsonSerializer::Serialize(RootObj.ToSharedRef(), Writer);
 
-	if (WebSocket.IsValid() && bIsWebSocketConnected)
+	if (WebSocketSession.IsValid() && bIsWebSocketConnected)
 	{
-		WebSocket->Send(OutputString);
+		WebSocketSession->SendText(OutputString);
 		UE_LOG(LogFunASR, Log, TEXT("Sent finish-task: %s"), *CurrentTaskId);
 		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Sent finish-task: %s"), *CurrentTaskId));
 	}

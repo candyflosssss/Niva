@@ -1,4 +1,5 @@
 ﻿#include "Input/CICGazeTrackingSubsystem.h"
+#include "Core/CICRuntimeSettings.h"
 #include "Input/CICGazeTrackingSettings.h"
 #include "Common/UdpSocketBuilder.h"
 #include "Common/UdpSocketReceiver.h"
@@ -11,13 +12,23 @@ void UCICGazeTrackingSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
 	
-	int32 Port = 8888;
+	const UCICRuntimeSettings* RuntimeSettings = UCICRuntimeSettings::Get();
+	const bool bAutoStartListener = RuntimeSettings ? RuntimeSettings->bAutoStartGazeListener : true;
+	int32 Port = RuntimeSettings ? RuntimeSettings->GazeUdpPort : 8888;
 	const UCICGazeTrackingSettings* Settings = GetDefault<UCICGazeTrackingSettings>();
-	if (Settings)
+	if ((!RuntimeSettings || Port <= 0) && Settings)
 	{
 		Port = Settings->GazeCleanupPort;
 	}
-	StartListener(Port);
+
+	if (bAutoStartListener)
+	{
+		StartListener(Port);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Log, TEXT("CICGazeTrackingSubsystem: 按配置跳过自动启动注视监听，端口=%d"), Port);
+	}
 }
 
 void UCICGazeTrackingSubsystem::Deinitialize()

@@ -1,15 +1,17 @@
 ﻿#pragma once
 #include "CoreMinimal.h"
 #include "Subsystems/GameInstanceSubsystem.h"
-#include "IWebSocket.h"
 #include "NetMicWsSubsystem.generated.h"
+
+class UNetMicWsComponent;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnNetMicAudioBinary, const TArray<uint8>&, Data);
 
-// 一个最小可用的“网络麦克风”子系统：
-// - 通过 HTTP POST 获取目标 WebSocket 地址并连接
-// - 接收 WebSocket 二进制音频帧并按时间长度做环形缓存（默认15秒）
-// - 暂不实现真正的转发，只保留 EnableForward/SetForwardTargets 接口
+// 兼容门面：保留历史 Subsystem API，但实时 WebSocket 连接已收敛到 UNetMicWsComponent。
+// 该子系统仅负责：
+// - 兼容旧蓝图调用（转发到已注册的组件）
+// - HTTP POST 获取 wsUrl 后委托组件连接
+// - 维护一个被动音频环形缓存，供旧查询接口继续使用
 UCLASS()
 class CUSTOMINPUTCONTROLLER_API UNetMicWsSubsystem : public UGameInstanceSubsystem
 {
@@ -18,16 +20,16 @@ public:
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void Deinitialize() override;
 
-	// 连接：通过 HTTP POST 获取 wsUrl 后再连接；每次调用都会重置暂存区
-	UFUNCTION(BlueprintCallable, Category="NetMic")
+	// 连接：通过 HTTP POST 获取 wsUrl 后再委托已注册组件连接；每次调用都会重置暂存区
+	UFUNCTION(BlueprintCallable, Category="NetMic", meta=(DeprecatedFunction, DeprecationMessage="UNetMicWsSubsystem 已降级为兼容层。请优先使用 UNetMicWsComponent 持有实时连接。"))
 	void StartByPost(const FString& HttpUrl, const FString& JsonBody = TEXT("{}"));
 
 	// 直接连接指定 WebSocket（有时外部已拿到 wsUrl）；每次调用都会重置暂存区
-	UFUNCTION(BlueprintCallable, Category="NetMic")
+	UFUNCTION(BlueprintCallable, Category="NetMic", meta=(DeprecatedFunction, DeprecationMessage="UNetMicWsSubsystem 已降级为兼容层。请优先使用 UNetMicWsComponent 持有实时连接。"))
 	void StartDirect(const FString& WsUrl);
 
 	// 关闭麦克风（断开 WebSocket 并清空暂存）
-	UFUNCTION(BlueprintCallable, Category="NetMic")
+	UFUNCTION(BlueprintCallable, Category="NetMic", meta=(DeprecatedFunction, DeprecationMessage="UNetMicWsSubsystem 已降级为兼容层。请优先使用 UNetMicWsComponent 持有实时连接。"))
 	void StopMic();
 
 	// 暂存上限（秒），运行时可调整
@@ -53,17 +55,16 @@ public:
 
 private:
 	void ResetBuffer();
-	void ConnectWebSocket(const FString& Url);
-	void CloseWebSocket();
+	void WarnCompatibilityUse(const TCHAR* FunctionName) const;
+	UNetMicWsComponent* GetCompatibilityComponent() const;
 
-	void OnWsConnected();
-	void OnWsError(const FString& Error);
-	void OnWsClosed(int32 StatusCode, const FString& Reason, bool bWasClean);
-	void OnWsText(const FString& Message);
-	void OnWsBinary(const void* Data, SIZE_T Size, SIZE_T BytesRemaining);
+public:
+	void RegisterCompatibilityComponent(UNetMicWsComponent* InComponent);
+	void UnregisterCompatibilityComponent(UNetMicWsComponent* InComponent);
+	void MirrorAudioFrame(const TArray<uint8>& Data);
 
 private:
-	TSharedPtr<IWebSocket> Socket;
+	TWeakObjectPtr<UNetMicWsComponent> CompatibilityComponent;
 	struct FPacket { double TimeSec = 0.0; TArray<uint8> Bytes; };
 	mutable FCriticalSection BufferCS;
 	TArray<FPacket> Ring;

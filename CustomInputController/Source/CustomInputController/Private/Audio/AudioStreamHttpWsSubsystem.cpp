@@ -1,5 +1,6 @@
 ﻿#include "Audio/AudioStreamHttpWsSubsystem.h"
 #include "Audio/AudioStreamHttpWsComponent.h"
+#include "Core/CICRuntimeSettings.h"
 // #include "Input/UUDPHandler.h" // UDP removed for now
 // #include "Audio/MediaStreamPacket.h"
 
@@ -197,7 +198,7 @@ bool UAudioStreamHttpWsSubsystem::RegisterComponent(UAudioStreamHttpWsComponent*
     // 生成 UUID（使用 FGuid）
     FGuid G = FGuid::NewGuid();
     FString Uuid = G.ToString(EGuidFormats::DigitsWithHyphens);
-    int32 RegisteredCount = 0;
+    const int32 RegisteredCount = [&]() -> int32
     {
         FScopeLock Lock(&UuidMapCS);
         // 确保 UUID 唯一（理论上 NewGuid 已足够，但额外检查以防)
@@ -207,11 +208,11 @@ bool UAudioStreamHttpWsSubsystem::RegisterComponent(UAudioStreamHttpWsComponent*
             Uuid = NG.ToString(EGuidFormats::DigitsWithHyphens);
         }
         UuidComponentMap.Add(Uuid, Comp);
-        RegisteredCount = UuidComponentMap.Num();
-    }
+        return UuidComponentMap.Num();
+    }();
 
     OutUuid = Uuid;
-    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流组件注册"), TEXT("组件注册"), FString::Printf(TEXT("Component registered uuid=%s total=%d"), *Uuid, UuidComponentMap.Num()));
+    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("流组件注册"), TEXT("组件注册"), FString::Printf(TEXT("Component registered uuid=%s total=%d"), *Uuid, RegisteredCount));
 
     // If this is the first component, log auto-start suggestion (networking now handled per-component)
     if (RegisteredCount == 1)
@@ -460,9 +461,17 @@ void UAudioStreamHttpWsSubsystem::StartSocketServer()
     ISocketSubsystem* SocketSubsystem = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
     if (!SocketSubsystem) return;
 
-    // Try ports 19001 to 19010 to find a valid one
+      const UCICRuntimeSettings* RuntimeSettings = UCICRuntimeSettings::Get();
+      int32 PortMin = RuntimeSettings ? RuntimeSettings->AudioSocketServerPortMin : 19001;
+      int32 PortMax = RuntimeSettings ? RuntimeSettings->AudioSocketServerPortMax : 19010;
+      if (PortMin > PortMax)
+      {
+        Swap(PortMin, PortMax);
+      }
+
+      // Try the configured port range to find a valid one
     int32 BoundPort = 0;
-    for (int32 Port = 19001; Port <= 19010; Port++)
+      for (int32 Port = PortMin; Port <= PortMax; Port++)
     {
         // UDP: NAME_DGram
         FSocket* NewSocket = SocketSubsystem->CreateSocket(NAME_DGram, TEXT("AudioStreamServerSocket"), false);
@@ -501,8 +510,8 @@ void UAudioStreamHttpWsSubsystem::StartSocketServer()
     }
     else
     {
-        UE_LOG(LogAudioStreamWs, Error, TEXT("[Socket] Failed to bind UDP to any port 19001-19010"));
-        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Error, TEXT("SocketServer"), TEXT("启动失败"), TEXT("Failed to bind UDP port 19001-19010"));
+        UE_LOG(LogAudioStreamWs, Error, TEXT("[Socket] Failed to bind UDP to any configured port %d-%d"), PortMin, PortMax);
+        FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Error, TEXT("SocketServer"), TEXT("启动失败"), FString::Printf(TEXT("Failed to bind UDP port %d-%d"), PortMin, PortMax));
     }
 }
 
@@ -776,7 +785,7 @@ void UAudioStreamHttpWsSubsystem::SendPacket(uint8 Type, const TArray<uint8>& Pa
             }
 
             // 循环取整帧
-            while (false)//TODO
+            while (true)
             {
                 int32 Available = 0;
                 bool bHasBuf = false;
@@ -816,7 +825,7 @@ void UAudioStreamHttpWsSubsystem::SendPacket(uint8 Type, const TArray<uint8>& Pa
                 if (S && S->bEnableOpus)
                 {
                     // 准备/获取编码器
-                    OpusEncoder* Encoder = nullptr;
+                    OpusEncoder* Encoder = [&]() -> OpusEncoder*
                     {
                         FScopeLock L(&OpusCS);
                         FOpusEncoderState& ES = OpusEncoders.FindOrAdd(Uuid);
@@ -841,8 +850,8 @@ void UAudioStreamHttpWsSubsystem::SendPacket(uint8 Type, const TArray<uint8>& Pa
                                 UE_LOG(LogAudioStreamWs, Warning, TEXT("[Opus] Failed to init encoder (sr=%d ch=%d), fallback to PCM"), SampleRate, Channels);
                             }
                         }
-                        Encoder = (OpusEncoder*)ES.Encoder;
-                    }
+                        return (OpusEncoder*)ES.Encoder;
+                    }();
 
                     if (Encoder)
                     {

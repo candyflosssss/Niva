@@ -23,16 +23,13 @@
 	],
 	"Plugins": [
 		{
-			"Name": "NetworkCorePlugin",
-			"Enabled": true
-		},
-		{
 			"Name": "AudioCapture",
 			"Enabled": true
 		},
 		{
 			"Name": "CoreManager",
-			"Enabled": true
+			"Enabled": true,
+			"Optional": true
 		}
 	]
 }

@@ -2,11 +2,10 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/GameInstanceSubsystem.h"
-#include "NivaNetworkCoreSettings.h"
-#include "NetworkCoreSubsystem.h"
 #include "HAL/CriticalSection.h"
 #include "Interfaces/IPv4/IPv4Endpoint.h"
 #include "AudioStreamSettings.h"
+#include "Engine/TimerHandle.h"
 #include "AudioStreamHttpWsSubsystem.generated.h"
 
 DECLARE_LOG_CATEGORY_EXTERN(LogAudioStreamWs, Log, All);

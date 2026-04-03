@@ -1,11 +1,14 @@
 ﻿#include "ASR/FunASRSubsystem.h"
+#include "Subsystems/SubsystemCollection.h"
+#include "Subsystems/GameInstanceSubsystem.h"
+#include "UObject/Object.h"
 #include "ASR/FunASRSettings.h"
 #include "Serialization/JsonSerializer.h"
 #include "Misc/Guid.h"
 #include "Async/Async.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
-#include "Log/CoreLogHelpers.h"
+#include "CICLogWrapper.h"
 #include "Transport/CICWebSocketSession.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogFunASR, Log, All);
@@ -14,12 +17,12 @@ void UFunASRSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
 	UE_LOG(LogFunASR, Log, TEXT("FunASR Subsystem Initialized"));
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), TEXT("FunASR Subsystem Initialized"));
+	FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), TEXT("FunASR Subsystem Initialized"));
 }
 
 void UFunASRSubsystem::Deinitialize()
 {
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), TEXT("FunASR Subsystem Deinitialize"));
+	FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), TEXT("FunASR Subsystem Deinitialize"));
 	ForceDisconnect();
 	Super::Deinitialize();
 }
@@ -48,12 +51,12 @@ void UFunASRSubsystem::StartASR()
 	if (bIsTaskRunning)
 	{
 		UE_LOG(LogFunASR, Warning, TEXT("ASR Task already running, ignoring StartASR"));
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("ASR"), TEXT("ASR Task already running, ignoring StartASR"));
+		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("ASR"), TEXT("ASR Task already running, ignoring StartASR"));
 		return;
 	}
 
 	CurrentRetryCount = 0; // Reset retry on fresh start
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), TEXT("Starting ASR Task (Manual Start)"));
+	FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), TEXT("Starting ASR Task (Manual Start)"));
 
 	if (bIsWebSocketConnected && WebSocketSession.IsValid() && WebSocketSession->IsConnected())
 	{
@@ -75,7 +78,7 @@ void UFunASRSubsystem::StopASR()
 		GetWorld()->GetTimerManager().ClearTimer(TimerHandle_Reconnect);
 	}
 
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), TEXT("Stopping ASR Task (Manual Stop)"));
+	FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), TEXT("Stopping ASR Task (Manual Stop)"));
 
 	if (bIsTaskRunning)
 	{
@@ -96,7 +99,7 @@ void UFunASRSubsystem::SendAudioFrame(const TArray<uint8>& AudioData)
 		double Now = FPlatformTime::Seconds();
 		if (Now - LastSendLogTime > 2.0)
 		{
-			FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("ASR"), 
+			FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("ASR"), 
 				FString::Printf(TEXT("Payload sent to WebSocket: %d bytes (Stream active)"), AudioData.Num()));
 			LastSendLogTime = Now;
 		}
@@ -137,7 +140,7 @@ void UFunASRSubsystem::ConnectWebSocket()
 	}
 
     UE_LOG(LogFunASR, Log, TEXT("Connecting to FunASR: %s (Retry %d)"), *Url, CurrentRetryCount);
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Connecting to FunASR: %s (Retry %d)"), *Url, CurrentRetryCount));
+	FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Connecting to FunASR: %s (Retry %d)"), *Url, CurrentRetryCount));
 
 	if (!WebSocketSession.IsValid())
 	{
@@ -154,7 +157,7 @@ void UFunASRSubsystem::ConnectWebSocket()
 void UFunASRSubsystem::OnWsConnected()
 {
 	UE_LOG(LogFunASR, Log, TEXT("FunASR WebSocket Connected"));
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), TEXT("FunASR WebSocket Connected"));
+	FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), TEXT("FunASR WebSocket Connected"));
 	bIsWebSocketConnected = true;
 	CurrentRetryCount = 0; // Connected successfully, reset retries
 
@@ -168,7 +171,7 @@ void UFunASRSubsystem::OnWsConnected()
 void UFunASRSubsystem::OnWsConnectionError(const FString& Error)
 {
 	UE_LOG(LogFunASR, Error, TEXT("FunASR Connection Error: %s"), *Error);
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("FunASR Connection Error: %s"), *Error));
+	FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("FunASR Connection Error: %s"), *Error));
 	bIsWebSocketConnected = false;
 	bIsTaskRunning = false;
 	WebSocketSession.Reset();
@@ -181,7 +184,7 @@ void UFunASRSubsystem::OnWsConnectionError(const FString& Error)
 void UFunASRSubsystem::OnWsClosed(int32 StatusCode, const FString& Reason, bool bWasClean)
 {
 	UE_LOG(LogFunASR, Log, TEXT("FunASR WebSocket Closed. Code: %d, Reason: %s"), StatusCode, *Reason);
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("FunASR WebSocket Closed. Code: %d, Reason: %s"), StatusCode, *Reason));
+	FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("FunASR WebSocket Closed. Code: %d, Reason: %s"), StatusCode, *Reason));
 	bIsWebSocketConnected = false;
 	bIsTaskRunning = false;
 	WebSocketSession.Reset();
@@ -191,7 +194,7 @@ void UFunASRSubsystem::OnWsClosed(int32 StatusCode, const FString& Reason, bool 
 	{
 		// Maybe broadcast disconnect
 		OnError.Broadcast(TEXT("Disconnected unexpectedly"));
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("ASR"), TEXT("WebSocket closed unexpectedly, scheduling reconnect"));
+		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("ASR"), TEXT("WebSocket closed unexpectedly, scheduling reconnect"));
 		ScheduleReconnect();
 	}
 }
@@ -217,7 +220,7 @@ void UFunASRSubsystem::ScheduleReconnect()
 void UFunASRSubsystem::CheckRetry()
 {
 	CurrentRetryCount++;
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Retry attempt %d..."), CurrentRetryCount));
+	FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Retry attempt %d..."), CurrentRetryCount));
 	bStartRequested = true;
 	ConnectWebSocket();
 }
@@ -292,7 +295,7 @@ void UFunASRSubsystem::SendRunTask()
 	{
 		WebSocketSession->SendText(OutputString);
 		UE_LOG(LogFunASR, Log, TEXT("Sent run-task: %s"), *CurrentTaskId);
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Sent run-task: %s"), *CurrentTaskId));
+		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Sent run-task: %s"), *CurrentTaskId));
 	}
 }
 
@@ -321,7 +324,7 @@ void UFunASRSubsystem::SendFinishTask()
 	{
 		WebSocketSession->SendText(OutputString);
 		UE_LOG(LogFunASR, Log, TEXT("Sent finish-task: %s"), *CurrentTaskId);
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Sent finish-task: %s"), *CurrentTaskId));
+		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Sent finish-task: %s"), *CurrentTaskId));
 	}
 }
 
@@ -347,12 +350,12 @@ void UFunASRSubsystem::ProcessJsonMessage(const FString& Message)
 		bIsTaskRunning = true;
 		OnTaskStarted.Broadcast();
 		UE_LOG(LogFunASR, Log, TEXT("Task Started"));
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), TEXT("Task Started"));
+		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), TEXT("Task Started"));
 	}
 	else if (Event == TEXT("result-generated"))
 	{
 		// Log raw result for debugging to see full structure
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Raw Result Message: %s"), *Message));
+		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Raw Result Message: %s"), *Message));
 
 		const TSharedPtr<FJsonObject> PayloadObj = RootObj->GetObjectField(TEXT("payload"));
 		if (PayloadObj.IsValid())
@@ -367,7 +370,7 @@ void UFunASRSubsystem::ProcessJsonMessage(const FString& Message)
 					bool bEnd = SentenceObj->GetBoolField(TEXT("sentence_end"));
 					
 					// Log received text with brackets to see whitespace
-					FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Result: [%s] End=%d"), *Text, bEnd));
+					FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Result: [%s] End=%d"), *Text, bEnd));
 
 					OnResultReceived.Broadcast(Text, bEnd);
 
@@ -393,11 +396,11 @@ void UFunASRSubsystem::ProcessJsonMessage(const FString& Message)
 		if (!CurrentTaskFullText.IsEmpty())
 		{
 			OnTaskCompletedWithFullText.Broadcast(CurrentTaskFullText);
-			FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("任务完成，完整文本: %s"), *CurrentTaskFullText));
+			FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("任务完成，完整文本: %s"), *CurrentTaskFullText));
 		}
 
 		UE_LOG(LogFunASR, Log, TEXT("Task Finished"));
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), TEXT("Task Finished"));
+		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), TEXT("Task Finished"));
 	}
 	else if (Event == TEXT("task-failed"))
 	{
@@ -405,9 +408,10 @@ void UFunASRSubsystem::ProcessJsonMessage(const FString& Message)
 		FString ErrorCode = HeaderObj->GetStringField(TEXT("error_code"));
 		FString ErrorMsg = HeaderObj->GetStringField(TEXT("error_message"));
 		UE_LOG(LogFunASR, Error, TEXT("Task Failed: %s - %s"), *ErrorCode, *ErrorMsg);
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("任务失败: %s - %s"), *ErrorCode, *ErrorMsg));
+		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("任务失败: %s - %s"), *ErrorCode, *ErrorMsg));
 		OnError.Broadcast(FString::Printf(TEXT("%s: %s"), *ErrorCode, *ErrorMsg));
 		// ScheduleReconnect();
 	}
 }
+
 

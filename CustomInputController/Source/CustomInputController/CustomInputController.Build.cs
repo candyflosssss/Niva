@@ -19,7 +19,6 @@ public class CustomInputController : ModuleRules
 								"ApplicationCore",
 								"Networking",
 								"Sockets",
-								"NetworkCorePlugin",
 								"AudioCaptureCore",
 								"AudioCapture",
 								"WebSockets",
@@ -29,23 +28,35 @@ public class CustomInputController : ModuleRules
 						}
 				);
 
-				PrivateDependencyModuleNames.AddRange(
-						new[]
-						{
-								"Slate",
-								"SlateCore",
-								"DeveloperSettings",
-								"Json",
-								"JsonUtilities",
-								"Projects",
-								"Settings",
-								"OpenColorIOLib",
-								"HTTP",
-								"AudioExtensions",
-								"AudioMixer",
-								"CoreManager",
-						}
-				);
+                                PrivateDependencyModuleNames.AddRange(
+                                                new[]
+                                                {
+                                                                "Slate",
+                                                                "SlateCore",
+                                                                "DeveloperSettings",
+                                                                "Json",
+                                                                "JsonUtilities",
+                                                                "Projects",
+                                                                "Settings",
+                                                                "OpenColorIOLib",
+                                                                "HTTP",
+                                                                "AudioExtensions",
+                                                                "AudioMixer"
+                                                }
+                                );
+                                
+                                string PluginsDir = System.IO.Path.GetFullPath(System.IO.Path.Combine(ModuleDirectory, "../../.."));
+                                bool bHasCoreManager = System.IO.Directory.Exists(System.IO.Path.Combine(PluginsDir, "CoreManager"));
+                                
+                                if (bHasCoreManager)
+                                {
+                                                PrivateDependencyModuleNames.Add("CoreManager");
+                                                PublicDefinitions.Add("HAS_CORE_MANAGER=1");
+                                }
+                                else
+                                {
+                                                PublicDefinitions.Add("HAS_CORE_MANAGER=0");
+                                }
 
 				if (Target.bBuildEditor)
 				{

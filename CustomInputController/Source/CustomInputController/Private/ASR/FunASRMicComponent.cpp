@@ -3,7 +3,8 @@
 #include "ASR/FunASRSettings.h"
 #include "Kismet/GameplayStatics.h"
 #include "TimerManager.h"
-#include "Log/CoreLogHelpers.h"
+#include "Engine/GameInstance.h"
+#include "CICLogWrapper.h"
 
 // Define static member
 UFunASRMicComponent* UFunASRMicComponent::GlobalActiveMic = nullptr;
@@ -39,19 +40,19 @@ void UFunASRMicComponent::Start()
 			// If not running, start it
 			if (!ASR->IsTaskRunning())
 			{
-			    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("MicComp"), TEXT("Start调用。触发ASR启动。"));
+			    FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("MicComp"), TEXT("Start调用。触发ASR启动。"));
 				ASR->StartASR(); // This connects and sends run-task
 			}
 			else 
 			{
-			    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("MicComp"), TEXT("Start调用。ASR已在运行。"));
+			    FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("MicComp"), TEXT("Start调用。ASR已在运行。"));
 			}
 			
 			// We always start capture if component is active, assuming we want to feed the ASR
 			bool bStarted = StartAudioCapture();
 			if (bStarted)
 			{
-			    FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("MicComp"), TEXT("手动启动：音频采集已开始。"));
+			    FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("MicComp"), TEXT("手动启动：音频采集已开始。"));
 			}
 		}
 	}
@@ -59,7 +60,7 @@ void UFunASRMicComponent::Start()
 
 void UFunASRMicComponent::Stop()
 {
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("MicComp"), TEXT("手动Stop调用。"));
+	FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("MicComp"), TEXT("手动Stop调用。"));
 	
 	// 1. Flush remaining audio buffer
 	{
@@ -71,7 +72,7 @@ void UFunASRMicComponent::Stop()
 				if (UFunASRSubsystem* ASR = GI->GetSubsystem<UFunASRSubsystem>())
 				{
 					ASR->SendAudioFrame(PendingAudioData);
-					FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("MicComp"), 
+					FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("MicComp"), 
 						FString::Printf(TEXT("停止时刷新剩余音频：%d 字节"), PendingAudioData.Num()));
 				}
 			}
@@ -129,7 +130,7 @@ void UFunASRMicComponent::TickComponent(float DeltaTime, ELevelTick TickType, FA
 		double Now = FPlatformTime::Seconds();
 		if (Now - LastSendLogTime > 2.0)
 		{
-			FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("MicComp"), 
+			FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("MicComp"), 
 				FString::Printf(TEXT("发送音频块：%d 字节（优化：>100ms缓冲）"), ChunkToSend.Num()));
 			LastSendLogTime = Now;
 		}
@@ -141,7 +142,7 @@ bool UFunASRMicComponent::StartAudioCapture()
 	if (GlobalActiveMic != nullptr && GlobalActiveMic != this)
 	{
 		UE_LOG(LogTemp, Error, TEXT("UFunASRMicComponent: Another Mic Component is already active (%s). Only one allowed per client."), *GlobalActiveMic->GetName());
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Error, TEXT("CIC"), TEXT("MicComp"), FString::Printf(TEXT("另一个Mic组件已激活 (%s)。每个客户端仅允许一个。"), *GlobalActiveMic->GetName()));
+		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Error, TEXT("CIC"), TEXT("MicComp"), FString::Printf(TEXT("另一个Mic组件已激活 (%s)。每个客户端仅允许一个。"), *GlobalActiveMic->GetName()));
 		return false;
 	}
 
@@ -167,10 +168,10 @@ bool UFunASRMicComponent::StartAudioCapture()
 	// List devices for debugging
 	TArray<Audio::FCaptureDeviceInfo> DeviceInfos;
 	AudioCapture->GetCaptureDevicesAvailable(DeviceInfos);
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("MicComp"), FString::Printf(TEXT("发现 %d 个采集设备"), DeviceInfos.Num()));
+	FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("MicComp"), FString::Printf(TEXT("发现 %d 个采集设备"), DeviceInfos.Num()));
 	for (int32 i = 0; i < DeviceInfos.Num(); ++i)
 	{
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("MicComp"), FString::Printf(TEXT("设备 %d: %s (通道: %d, 频率: %d)"), i, *DeviceInfos[i].DeviceName, DeviceInfos[i].InputChannels, DeviceInfos[i].PreferredSampleRate));
+		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("MicComp"), FString::Printf(TEXT("设备 %d: %s (通道: %d, 频率: %d)"), i, *DeviceInfos[i].DeviceName, DeviceInfos[i].InputChannels, DeviceInfos[i].PreferredSampleRate));
 	}
 
 	Audio::FOnAudioCaptureFunction InCallback = [this](const void* InAudioData, int32 InNumFrames, int32 InNumChannels, int32 InSampleRate, double InStreamTime, bool bOverflow)
@@ -228,13 +229,13 @@ bool UFunASRMicComponent::StartAudioCapture()
 		{
 			AudioCapture->StartStream();
 			GlobalActiveMic = this;
-			FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("MicComp"), 
+			FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("MicComp"), 
 				FString::Printf(TEXT("麦克风采集已启动 [%s]: %dHz %dCh"), *Cfg.Desc, Cfg.Rate, Cfg.Channels));
 			return true;
 		}
 	}
 
-	FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Error, TEXT("CIC"), TEXT("MicComp"), TEXT("打开采集流失败（所有尝试均失败）"));
+	FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Error, TEXT("CIC"), TEXT("MicComp"), TEXT("打开采集流失败（所有尝试均失败）"));
 	return false;
 }
 
@@ -244,7 +245,7 @@ void UFunASRMicComponent::StopAudioCapture()
 	{
 		AudioCapture->StopStream();
 		AudioCapture->CloseStream();
-		FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("MicComp"), TEXT("麦克风采集已停止"));
+		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("MicComp"), TEXT("麦克风采集已停止"));
 	}
 	// Release the capture helper to free resources
 	AudioCapture.Reset();
@@ -334,7 +335,7 @@ void UFunASRMicComponent::OnAudioCaptureData(const void* InAudioData, int32 InNu
 		{
 			double RMS = FMath::Sqrt(AccumEnergy / AccumCount);
 			// RMS for 16bit quiet room is usually < 100, voice > 500-1000. Silence is 0.
-			FCoreLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("MicComp"), 
+			FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Trace, TEXT("CIC"), TEXT("MicComp"), 
 				FString::Printf(TEXT("音频信号RMS: %.2f (采集中...)"), RMS));
 
 			AccumEnergy = 0;
@@ -351,3 +352,4 @@ void UFunASRMicComponent::OnAudioCaptureData(const void* InAudioData, int32 InNu
 		FMemory::Memcpy(PendingAudioData.GetData() + CurrentSize, FinalSamples.GetData(), DataSize);
 	}
 }
+

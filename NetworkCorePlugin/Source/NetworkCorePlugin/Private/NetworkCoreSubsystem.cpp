@@ -10,18 +10,25 @@
 #include "Subsystems/McpComponentRegistrySubsystem.h"
 #include "Components/Base/McpExposableBaseComponent.h"
 // CoreManager Log subsystem
+#if HAS_CORE_MANAGER
 #include "Log/CoreLogSubsystem.h"
+#endif
 
 // Local helper to send logs via CoreManager
 namespace
 {
-    inline void MCPLog(UObject* WorldContext, FName Category2, ECoreLogSeverity Severity, const FString& Message, const TMap<FString, FString>& Data = TMap<FString, FString>())
+#if HAS_CORE_MANAGER
+    inline void MCPLog_Impl(UObject* WorldContext, FName Category2, ECoreLogSeverity Severity, const FString& Message, const TMap<FString, FString>& Data = TMap<FString, FString>())
     {
         if (UCoreLogSubsystem* LogSys = UCoreLogSubsystem::Get(WorldContext))
         {
             LogSys->Log(TEXT("MCP"), Category2, Severity, Message, Data);
         }
     }
+#define MCPLog MCPLog_Impl
+#else
+#define MCPLog(...) do {} while(false)
+#endif
 }
 
 void UNetworkCoreSubsystem::Initialize(FSubsystemCollectionBase& Collection)

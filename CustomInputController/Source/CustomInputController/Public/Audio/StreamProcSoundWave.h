@@ -25,10 +25,10 @@ public:
 	virtual void OnEndGenerate() override;
 
 	// 供游戏线程读取
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="Audio")
 	int64 GetConsumedBytes() const { return ConsumedBytes.load(std::memory_order_relaxed); }
 
-	UFUNCTION(BlueprintCallable)
+	UFUNCTION(BlueprintCallable, Category="Audio")
 	void ResetCounters() { ConsumedBytes.store(0, std::memory_order_relaxed); }
 
 	// 外部入队PCM（任意线程安全）

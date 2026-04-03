@@ -1,15 +1,16 @@
 ﻿#include "AsyncNode/LLMAsyncNode.h"
 // CoreManager Log
+#if HAS_CORE_MANAGER
 #include "Log/CoreLogSubsystem.h"
+#endif
 #include "Engine/Engine.h" // for GEngine and world contexts fallback
 #include "Engine/GameInstance.h"
 
-
-
 namespace
 {
+#if HAS_CORE_MANAGER
     // 统一封装 CoreManager 日志调用，避免重复空指针判断
-    inline void NC_CoreLog(const UObject* WorldContext, FName Category2, ECoreLogSeverity Severity, const FString& Message, const TMap<FString,FString>& Data = TMap<FString,FString>{})
+    inline void NC_CoreLog_Impl(const UObject* WorldContext, FName Category2, ECoreLogSeverity Severity, const FString& Message, const TMap<FString,FString>& Data = TMap<FString,FString>{})
     {
         // 首先尝试常规路径（若传入的 WorldContext 能解析到 World/GameInstance）
         if (const UCoreLogSubsystem* LogSS = UCoreLogSubsystem::Get(WorldContext))
@@ -55,6 +56,10 @@ namespace
             break;
         }
     }
+#define NC_CoreLog NC_CoreLog_Impl
+#else
+#define NC_CoreLog(...) do {} while(false)
+#endif
 
     inline FName NC_LLMToName(ENivaLLM In)
     {

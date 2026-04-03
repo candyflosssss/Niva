@@ -41,11 +41,23 @@ public class NetworkCorePlugin : ModuleRules
                                 "JsonUtilities",
                                 "AudioMixer",
                                 "WebSockets",
-                                "CoreManager",
                                 "OnlineSubsystem",
                                 "OnlineSubsystemUtils",
                                 "OnlineSubsystemEOS"
                         }
                 );
+                
+                string PluginsDir = System.IO.Path.GetFullPath(System.IO.Path.Combine(ModuleDirectory, "../../.."));
+                bool bHasCoreManager = System.IO.Directory.Exists(System.IO.Path.Combine(PluginsDir, "CoreManager"));
+                
+                if (bHasCoreManager)
+                {
+                        PrivateDependencyModuleNames.Add("CoreManager");
+                        PublicDefinitions.Add("HAS_CORE_MANAGER=1");
+                }
+                else
+                {
+                        PublicDefinitions.Add("HAS_CORE_MANAGER=0");
+                }
         }
 }

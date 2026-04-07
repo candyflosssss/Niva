@@ -2,10 +2,12 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/GameInstanceSubsystem.h"
-#include "Networking.h"
+#include "Interfaces/IPv4/IPv4Endpoint.h"
 #include "Sockets.h"
 #include "Templates/SharedPointer.h"
 #include "CICGazeTrackingSubsystem.generated.h"
+
+class FArrayReader;
 
 USTRUCT(BlueprintType)
 struct FCICGazeData
@@ -57,7 +59,7 @@ public:
 	void ClearPreviewTrails();
 
 private:
-	void HandleDataReceived(const FArrayReaderPtr& ArrayReaderPtr, const FIPv4Endpoint& EndPoint);
+	void HandleDataReceived(const TSharedPtr<FArrayReader, ESPMode::ThreadSafe>& ArrayReaderPtr, const FIPv4Endpoint& EndPoint);
 	
 	FSocket* Socket = nullptr;
 	TSharedPtr<class FUdpSocketReceiver> UDPReceiver;

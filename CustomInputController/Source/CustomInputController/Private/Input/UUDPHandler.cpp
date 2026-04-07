@@ -2,6 +2,7 @@
 
 
 #include "Input/UUDPHandler.h"
+#include "Sockets.h"
 #include "SocketSubsystem.h"
 #include "IPAddress.h"
 // #include "Common/UdpSocketReceiver.h" // removed threaded receiver
@@ -150,9 +151,8 @@ bool UUDPHandler::PollSocket(float /*DeltaTime*/)
             if (OnBinaryReceived.IsBound())
             {
                 uint32 OutIp = 0; 
-                int32 OutPort = 0;
                 Sender->GetIp(OutIp);
-                OutPort = Sender->GetPort();
+                const int32 OutPort = Sender->GetPort();
                 const FIPv4Endpoint Remote(FIPv4Address(OutIp), OutPort);
                 OnBinaryReceived.Broadcast(Buffer, Remote);
             }
@@ -186,7 +186,3 @@ bool UUDPHandler::PollSocket(float /*DeltaTime*/)
     return true; // keep ticking
 }
 
-void UUDPHandler::OnUDPMessageReceived(const FArrayReaderPtr& /*ArrayReaderPtr*/, const FIPv4Endpoint& /*EndPt*/)
-{
-    // 已迁移为 PollSocket，不再使用该回调
-}

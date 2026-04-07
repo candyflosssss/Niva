@@ -97,9 +97,14 @@ void UFunASRMicComponent::TickComponent(float DeltaTime, ELevelTick TickType, FA
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
-	// ASR Optimization: Send audio in ~100ms chunks (16000Hz * 2 bytes * 0.1s = 3200 bytes)
-	// Sending too frequently (e.g. 10ms) causes network congestion and high latency.
-	const int32 ChunkThreshold = 3200; 
+	int32 TargetSampleRate = 16000;
+	if (const UFunASRSettings* Settings = UFunASRSettings::Get())
+	{
+		TargetSampleRate = FMath::Max(8000, Settings->SampleRate);
+	}
+
+	// ASR Optimization: send ~100ms chunks based on the configured output sample rate.
+	const int32 ChunkThreshold = FMath::Max(320, (TargetSampleRate / 10) * static_cast<int32>(sizeof(int16)));
 
 	TArray<uint8> ChunkToSend;
 	{
@@ -151,6 +156,11 @@ bool UFunASRMicComponent::StartAudioCapture()
 		AudioCapture = MakeUnique<Audio::FAudioCapture>();
 	}
 
+	{
+		FScopeLock Lock(&AudioBufferMutex);
+		PendingAudioData.Reset();
+	}
+
 	if (AudioCapture->IsStreamOpen())
 	{
 		return true;
@@ -163,8 +173,6 @@ bool UFunASRMicComponent::StartAudioCapture()
 		SampleRate = Settings->SampleRate;
 	}
 	
-	int32 NumChannels = 1; // ASR usually needs Mono
-
 	// List devices for debugging
 	TArray<Audio::FCaptureDeviceInfo> DeviceInfos;
 	AudioCapture->GetCaptureDevicesAvailable(DeviceInfos);
@@ -285,9 +293,12 @@ void UFunASRMicComponent::OnAudioCaptureData(const void* InAudioData, int32 InNu
 		}
 	}
 
-	// Step 2: Resample to Target Rate (16000) if needed
-	const int32 TargetRate = 16000; 
-	// (Should fetch from settings conceptually, but hardcoded to 16k per requirement usually)
+	// Step 2: Resample to configured target rate if needed
+	int32 TargetRate = 16000;
+	if (const UFunASRSettings* Settings = UFunASRSettings::Get())
+	{
+		TargetRate = FMath::Max(8000, Settings->SampleRate);
+	}
 
 	TArray<int16> FinalSamples;
 

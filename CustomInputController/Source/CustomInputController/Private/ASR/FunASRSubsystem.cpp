@@ -29,10 +29,16 @@ void UFunASRSubsystem::Deinitialize()
 
 void UFunASRSubsystem::ForceDisconnect()
 {
+	bShouldRunTask = false;
 	bIsTaskRunning = false;
 	bIsWebSocketConnected = false;
 	bStartRequested = false;
+	bWaitingForTaskFinish = false;
+	bPendingStartAfterFinish = false;
 	CurrentRetryCount = 0; // Reset retry count
+	CurrentTaskId.Reset();
+	CurrentTaskFullText.Reset();
+	BufferedAudioBeforeTaskStart.Reset();
 
 	if (GetWorld())
 	{
@@ -48,6 +54,15 @@ void UFunASRSubsystem::ForceDisconnect()
 
 void UFunASRSubsystem::StartASR()
 {
+	bShouldRunTask = true;
+
+	if (bWaitingForTaskFinish)
+	{
+		bPendingStartAfterFinish = true;
+		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), TEXT("StartASR called while waiting for task-finished; queued restart after finish"));
+		return;
+	}
+
 	if (bIsTaskRunning)
 	{
 		UE_LOG(LogFunASR, Warning, TEXT("ASR Task already running, ignoring StartASR"));
@@ -72,6 +87,11 @@ void UFunASRSubsystem::StartASR()
 
 void UFunASRSubsystem::StopASR()
 {
+	bShouldRunTask = false;
+	bPendingStartAfterFinish = false;
+	bStartRequested = false;
+	BufferedAudioBeforeTaskStart.Reset();
+
 	// Cancel any pending reconnects
 	if (GetWorld())
 	{
@@ -82,17 +102,28 @@ void UFunASRSubsystem::StopASR()
 
 	if (bIsTaskRunning)
 	{
+		bWaitingForTaskFinish = true;
 		SendFinishTask();
 		// We expect 'task-finished' event to clear bIsTaskRunning
+	}
+	else if (WebSocketSession.IsValid() && (WebSocketSession->IsConnecting() || WebSocketSession->IsConnected()))
+	{
+		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), TEXT("StopASR canceled a pending start before task-started"));
+		ForceDisconnect();
 	}
 }
 
 void UFunASRSubsystem::SendAudioFrame(const TArray<uint8>& AudioData)
 {
+	if (AudioData.Num() <= 0)
+	{
+		return;
+	}
+
 	if (bIsTaskRunning && WebSocketSession.IsValid() && bIsWebSocketConnected)
 	{
 		// Send binary frame
-		WebSocketSession->SendBinary(AudioData);
+		(void)WebSocketSession->SendBinary(AudioData);
 		
 		// [Debug] Log periodically to confirm data is hitting the wire
 		static double LastSendLogTime = 0.0;
@@ -104,11 +135,53 @@ void UFunASRSubsystem::SendAudioFrame(const TArray<uint8>& AudioData)
 			LastSendLogTime = Now;
 		}
 	}
-	else if (!bIsTaskRunning)
+	else if (bShouldRunTask && !bWaitingForTaskFinish)
 	{
-		// This might explain why data is dropped if task-started hasn't arrived yet or failed
-		// But usually we sync this.
+		BufferAudioUntilTaskStarts(AudioData);
 	}
+}
+
+void UFunASRSubsystem::FlushBufferedAudio()
+{
+	if (!bIsTaskRunning || !bIsWebSocketConnected || !WebSocketSession.IsValid() || BufferedAudioBeforeTaskStart.Num() <= 0)
+	{
+		return;
+	}
+
+	(void)WebSocketSession->SendBinary(BufferedAudioBeforeTaskStart);
+	FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Flushed buffered audio after task-started: %d bytes"), BufferedAudioBeforeTaskStart.Num()));
+	BufferedAudioBeforeTaskStart.Reset();
+}
+
+void UFunASRSubsystem::BufferAudioUntilTaskStarts(const TArray<uint8>& AudioData)
+{
+	const int32 LimitBytes = GetBufferedAudioLimitBytes();
+	if (LimitBytes <= 0)
+	{
+		return;
+	}
+
+	if (AudioData.Num() >= LimitBytes)
+	{
+		BufferedAudioBeforeTaskStart = AudioData;
+		BufferedAudioBeforeTaskStart.RemoveAt(0, BufferedAudioBeforeTaskStart.Num() - LimitBytes, EAllowShrinking::No);
+		return;
+	}
+
+	const int32 OverflowBytes = (BufferedAudioBeforeTaskStart.Num() + AudioData.Num()) - LimitBytes;
+	if (OverflowBytes > 0)
+	{
+		BufferedAudioBeforeTaskStart.RemoveAt(0, OverflowBytes, EAllowShrinking::No);
+	}
+
+	BufferedAudioBeforeTaskStart.Append(AudioData);
+}
+
+int32 UFunASRSubsystem::GetBufferedAudioLimitBytes() const
+{
+	const UFunASRSettings* Settings = UFunASRSettings::Get();
+	const int32 SampleRate = Settings ? FMath::Max(8000, Settings->SampleRate) : 16000;
+	return SampleRate * static_cast<int32>(sizeof(int16)) * 2;
 }
 
 void UFunASRSubsystem::ConnectWebSocket()
@@ -174,11 +247,15 @@ void UFunASRSubsystem::OnWsConnectionError(const FString& Error)
 	FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("FunASR Connection Error: %s"), *Error));
 	bIsWebSocketConnected = false;
 	bIsTaskRunning = false;
+	bWaitingForTaskFinish = false;
 	WebSocketSession.Reset();
 	
 	OnError.Broadcast(TEXT("Connection Error: ") + Error);
 
-	ScheduleReconnect();
+	if (bShouldRunTask || bStartRequested || bPendingStartAfterFinish)
+	{
+		ScheduleReconnect();
+	}
 }
 
 void UFunASRSubsystem::OnWsClosed(int32 StatusCode, const FString& Reason, bool bWasClean)
@@ -187,6 +264,7 @@ void UFunASRSubsystem::OnWsClosed(int32 StatusCode, const FString& Reason, bool 
 	FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("FunASR WebSocket Closed. Code: %d, Reason: %s"), StatusCode, *Reason));
 	bIsWebSocketConnected = false;
 	bIsTaskRunning = false;
+	bWaitingForTaskFinish = false;
 	WebSocketSession.Reset();
 
 	// If closed unexpectedly while running task
@@ -195,7 +273,10 @@ void UFunASRSubsystem::OnWsClosed(int32 StatusCode, const FString& Reason, bool 
 		// Maybe broadcast disconnect
 		OnError.Broadcast(TEXT("Disconnected unexpectedly"));
 		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("ASR"), TEXT("WebSocket closed unexpectedly, scheduling reconnect"));
-		ScheduleReconnect();
+		if (bShouldRunTask || bStartRequested || bPendingStartAfterFinish)
+		{
+			ScheduleReconnect();
+		}
 	}
 }
 
@@ -221,7 +302,11 @@ void UFunASRSubsystem::CheckRetry()
 {
 	CurrentRetryCount++;
 	FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Retry attempt %d..."), CurrentRetryCount));
-	bStartRequested = true;
+	bStartRequested = bShouldRunTask || bPendingStartAfterFinish;
+	if (!bStartRequested)
+	{
+		return;
+	}
 	ConnectWebSocket();
 }
 
@@ -236,6 +321,8 @@ void UFunASRSubsystem::SendRunTask()
 	if (!Settings) return;
 
 	CurrentTaskId = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens).ToLower();
+	bWaitingForTaskFinish = false;
+	bPendingStartAfterFinish = false;
 
 	TSharedPtr<FJsonObject> RootObj = MakeShareable(new FJsonObject);
 	TSharedPtr<FJsonObject> HeaderObj = MakeShareable(new FJsonObject);
@@ -293,7 +380,7 @@ void UFunASRSubsystem::SendRunTask()
 
 	if (WebSocketSession.IsValid() && bIsWebSocketConnected)
 	{
-		WebSocketSession->SendText(OutputString);
+		(void)WebSocketSession->SendText(OutputString);
 		UE_LOG(LogFunASR, Log, TEXT("Sent run-task: %s"), *CurrentTaskId);
 		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Sent run-task: %s"), *CurrentTaskId));
 	}
@@ -322,7 +409,7 @@ void UFunASRSubsystem::SendFinishTask()
 
 	if (WebSocketSession.IsValid() && bIsWebSocketConnected)
 	{
-		WebSocketSession->SendText(OutputString);
+		(void)WebSocketSession->SendText(OutputString);
 		UE_LOG(LogFunASR, Log, TEXT("Sent finish-task: %s"), *CurrentTaskId);
 		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("Sent finish-task: %s"), *CurrentTaskId));
 	}
@@ -348,9 +435,11 @@ void UFunASRSubsystem::ProcessJsonMessage(const FString& Message)
 	if (Event == TEXT("task-started"))
 	{
 		bIsTaskRunning = true;
+		bWaitingForTaskFinish = false;
 		OnTaskStarted.Broadcast();
 		UE_LOG(LogFunASR, Log, TEXT("Task Started"));
 		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), TEXT("Task Started"));
+		FlushBufferedAudio();
 	}
 	else if (Event == TEXT("result-generated"))
 	{
@@ -391,20 +480,22 @@ void UFunASRSubsystem::ProcessJsonMessage(const FString& Message)
 	else if (Event == TEXT("task-finished"))
 	{
 		bIsTaskRunning = false;
+		bWaitingForTaskFinish = false;
+		CurrentTaskId.Reset();
 		OnTaskFinished.Broadcast();
-		// Broadcast the accumulated full text
-		if (!CurrentTaskFullText.IsEmpty())
-		{
-			OnTaskCompletedWithFullText.Broadcast(CurrentTaskFullText);
-			FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("任务完成，完整文本: %s"), *CurrentTaskFullText));
-		}
+		OnTaskCompletedWithFullText.Broadcast(CurrentTaskFullText);
+		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), FString::Printf(TEXT("任务完成，完整文本: %s"), *CurrentTaskFullText));
 
 		UE_LOG(LogFunASR, Log, TEXT("Task Finished"));
 		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Info, TEXT("CIC"), TEXT("ASR"), TEXT("Task Finished"));
+		RestartIfPendingAfterTaskEnd();
 	}
 	else if (Event == TEXT("task-failed"))
 	{
 		bIsTaskRunning = false;
+		bWaitingForTaskFinish = false;
+		CurrentTaskId.Reset();
+		BufferedAudioBeforeTaskStart.Reset();
 		FString ErrorCode = HeaderObj->GetStringField(TEXT("error_code"));
 		FString ErrorMsg = HeaderObj->GetStringField(TEXT("error_message"));
 		UE_LOG(LogFunASR, Error, TEXT("Task Failed: %s - %s"), *ErrorCode, *ErrorMsg);
@@ -412,6 +503,29 @@ void UFunASRSubsystem::ProcessJsonMessage(const FString& Message)
 		OnError.Broadcast(FString::Printf(TEXT("%s: %s"), *ErrorCode, *ErrorMsg));
 		// ScheduleReconnect();
 	}
+}
+
+void UFunASRSubsystem::CloseSocketAfterTaskTerminalState()
+{
+	if (!bShouldRunTask && !bPendingStartAfterFinish && WebSocketSession.IsValid() && WebSocketSession->IsConnected())
+	{
+		WebSocketSession->Close(true);
+		WebSocketSession.Reset();
+		bIsWebSocketConnected = false;
+	}
+}
+
+void UFunASRSubsystem::RestartIfPendingAfterTaskEnd()
+{
+	if (bPendingStartAfterFinish)
+	{
+		bPendingStartAfterFinish = false;
+		bStartRequested = false;
+		StartASR();
+		return;
+	}
+
+	CloseSocketAfterTaskTerminalState();
 }
 
 

@@ -4,8 +4,6 @@
 #include "ASR/FunASRSubsystem.h"
 #include "Engine/GameInstance.h"
 #include "CICLogWrapper.h"
-#include "GameFramework/PlayerController.h"
-#include "Kismet/GameplayStatics.h"
 #include "Audio/AudioStreamSettings.h"
 #include "Audio/NetMicWsSubsystem.h"
 #include "Transport/CICWebSocketSession.h"
@@ -69,6 +67,13 @@ void UNetMicWsComponent::ConfigureReconnect(bool bEnable, float InBaseDelaySecon
 
 void UNetMicWsComponent::Connect(const FString& InWsUrl)
 {
+	if (InWsUrl.IsEmpty())
+	{
+		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Warn, TEXT("CIC"), TEXT("NetMic"), TEXT("Connect ignored: empty ws url"));
+		OnError.Broadcast(TEXT("WebSocket URL is empty"));
+		return;
+	}
+
 	LastUrl = InWsUrl;
 	// 防止并发连接
 	if (bIsConnecting || bIsConnected)
@@ -84,6 +89,7 @@ void UNetMicWsComponent::Connect(const FString& InWsUrl)
 void UNetMicWsComponent::Disconnect()
 {
 	FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), TEXT("Disconnect: manual close requested"));
+	bShouldBeRecording = false;
 	CancelReconnect();
 	CloseWebSocket(true);
 }
@@ -250,6 +256,16 @@ void UNetMicWsComponent::TryRestoreDesiredStateAfterConnect()
 	if (bShouldBeRecording)
 	{
 		FCICLogHelpers::CoreLog(this, ECoreLogSeverity::Debug, TEXT("CIC"), TEXT("NetMic"), TEXT("Restore: start recording"));
+		if (UWorld* World = GetWorld())
+		{
+			if (UGameInstance* GI = World->GetGameInstance())
+			{
+				if (auto* ASR = GI->GetSubsystem<UFunASRSubsystem>())
+				{
+					ASR->StartASR();
+				}
+			}
+		}
 		SendCtrl(TEXT("<start>"));
 	}
 }
@@ -298,7 +314,7 @@ void UNetMicWsComponent::SendCtrl(const FString& Ctrl)
 {
 	if (WebSocketSession.IsValid() && WebSocketSession->IsConnected())
 	{
-		WebSocketSession->SendText(Ctrl);
+		(void)WebSocketSession->SendText(Ctrl);
 	}
 }
 

@@ -27,8 +27,8 @@ public:
 	UPROPERTY(EditAnywhere, Config, Category="Parameters", meta=(ToolTip="模型名称 (例如: fun-asr-realtime)"))
 	FString Model = TEXT("fun-asr-realtime");
 
-	UPROPERTY(EditAnywhere, Config, Category="Parameters", meta=(ToolTip="音频格式: pcm, wav, opus 等"))
-	FString Format = TEXT("pcm");
+	UPROPERTY(EditAnywhere, Config, Category="Parameters", meta=(ToolTip="音频格式: pcm_s16le, wav, opus 等"))
+	FString Format = TEXT("pcm_s16le");
 
 	UPROPERTY(EditAnywhere, Config, Category="Parameters", meta=(ToolTip="采样率 (Hz), fun-asr-realtime 通常为 16000"))
 	int32 SampleRate = 16000;

@@ -65,6 +65,9 @@ public:
 
 private:
 	void ConnectWebSocket();
+	void FlushBufferedAudio();
+	void BufferAudioUntilTaskStarts(const TArray<uint8>& AudioData);
+	int32 GetBufferedAudioLimitBytes() const;
 	
 	// WebSocket Callbacks
 	void OnWsConnected();
@@ -89,11 +92,13 @@ private:
 	
 	// Cache for the full text of the current session
 	FString CurrentTaskFullText;
+	TArray<uint8> BufferedAudioBeforeTaskStart;
 
 	// State
 	bool bIsWebSocketConnected = false;
 	bool bIsTaskRunning = false;
-    bool bStartRequested = false; // Flag to send run-task once connected
+	bool bShouldRunTask = false;
+	bool bStartRequested = false; // Flag to send run-task once connected
 	bool bWaitingForTaskFinish = false;
 	bool bPendingStartAfterFinish = false;
 

@@ -37,7 +37,6 @@ public class CustomInputController : ModuleRules
                                                                 "Json",
                                                                 "JsonUtilities",
                                                                 "Projects",
-                                                                "Settings",
                                                                 "OpenColorIOLib",
                                                                 "HTTP",
                                                                 "AudioExtensions",

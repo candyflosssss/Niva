@@ -3,11 +3,12 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Networking.h"
-#include "UObject/NoExportTypes.h"
+#include "Interfaces/IPv4/IPv4Endpoint.h"
+#include "Sockets.h"
 #include "UObject/Object.h"
 #include "Containers/Ticker.h"
 #include "UUDPHandler.generated.h"
+
 // 声明普通的多播委托（不是动态委托）
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnUDPDataReceived, const FString&);
 
@@ -56,6 +57,4 @@ private:
 
 	// 轮询接收并广播消息（运行在游戏线程）
 	bool PollSocket(float DeltaTime);
-
-	void OnUDPMessageReceived(const FArrayReaderPtr& ArrayReaderPtr, const FIPv4Endpoint& EndPt);
 };

@@ -104,7 +104,7 @@ float UCICGazeTrackingSubsystem::GetLatestLatencyMs() const
 	return static_cast<float>(NowUnixMs - LatestUnixTimestamp);
 }
 
-void UCICGazeTrackingSubsystem::HandleDataReceived(const FArrayReaderPtr& ArrayReaderPtr, const FIPv4Endpoint& EndPoint)
+void UCICGazeTrackingSubsystem::HandleDataReceived(const TSharedPtr<FArrayReader, ESPMode::ThreadSafe>& ArrayReaderPtr, const FIPv4Endpoint& EndPoint)
 {
 	if (!ArrayReaderPtr.IsValid())
 	{

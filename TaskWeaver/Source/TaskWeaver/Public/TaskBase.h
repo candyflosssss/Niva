@@ -1,10 +1,10 @@
 ﻿#pragma once
 #include "CoreMinimal.h"
 #include "UObject/Object.h"
+#include "MCPFramework/MCPToolCore.h"
 #include "TaskBase.generated.h"
 
 class UTaskManagerComponent;
-struct FMCPTool;
 
 UENUM(BlueprintType)
 enum class ETaskState : uint8 { None, Running, Completed, Canceled, Deferred };

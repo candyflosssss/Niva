@@ -3,12 +3,12 @@
 #include "Engine/World.h"
 #include "Engine/GameInstance.h"
 #include "GameFramework/Actor.h"
-#include "NetworkCoreSubsystem.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Engine/AssetManager.h"
 #include "Engine/StreamableManager.h"
 #include "Misc/DateTime.h"
-#include "MCP/MCPTransportSubsystem.h"
+#include "MCPFramework/MCPToolCore.h"
+#include "MCPFramework/MCPTransportSubsystem.h"
 
 UTaskManagerComponent::UTaskManagerComponent(){ PrimaryComponentTick.bCanEverTick = true; }
 void UTaskManagerComponent::BeginPlay(){ Super::BeginPlay(); RegisterMcpTools(); }

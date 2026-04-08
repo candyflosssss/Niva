@@ -6,12 +6,7 @@
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Subsystems/WorldSubsystem.h"
 #include "Engine/World.h"
-#include "OnlineSubsystem.h"
-#include "Interfaces/OnlineIdentityInterface.h"
 
-// 前置声明，避免在头文件中引入沉重依赖，减少循环包含风险
-class UMCPToolHandle;
-struct FMCPTool;
 #include "NivaOnlineSubsystem.generated.h"
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FNivaOnLoginComplete, bool, bWasSuccessful, const FString&, Error);
@@ -76,13 +71,5 @@ public:
     virtual bool ShouldCreateSubsystem(UObject* Outer) const override;
 
 
-public:
-    /** 注册简单文本处理MCP工具 */
-    UFUNCTION(BlueprintCallable, Category = "MyWorldSubsystem|MCP")
-    void RegisterSimpleTextMCPTool();
 
-    /** MCP工具回调函数 */
-    UFUNCTION()
-    void OnSimpleTextCallback(const FString& JsonRequest, UMCPToolHandle* MCPToolHandle, const FMCPTool& MCPTool);
-    
 };

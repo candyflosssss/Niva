@@ -11,13 +11,6 @@ public class NetworkCorePlugin : ModuleRules
 
                 PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
-                PublicIncludePaths.Add(Path.Combine(CivetWebPath, "include"));
-                PrivateIncludePaths.Add(Path.Combine(CivetWebPath, "include"));
-                PublicIncludePaths.Add(Path.Combine(CivetWebPath, "src"));
-                PrivateIncludePaths.Add(Path.Combine(CivetWebPath, "src"));
-
-                PublicDefinitions.Add("NO_SSL");
-
                 PublicDependencyModuleNames.AddRange(
                         new[]
                         {
@@ -46,6 +39,11 @@ public class NetworkCorePlugin : ModuleRules
                                 "OnlineSubsystemEOS"
                         }
                 );
+
+                PublicIncludePaths.Add(Path.Combine(CivetWebPath, "include"));
+                PrivateIncludePaths.Add(Path.Combine(CivetWebPath, "include"));
+                PublicIncludePaths.Add(Path.Combine(CivetWebPath, "src"));
+                PrivateIncludePaths.Add(Path.Combine(CivetWebPath, "src"));
                 
                 string PluginsDir = System.IO.Path.GetFullPath(System.IO.Path.Combine(ModuleDirectory, "../../.."));
                 bool bHasCoreManager = System.IO.Directory.Exists(System.IO.Path.Combine(PluginsDir, "CoreManager"));

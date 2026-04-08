@@ -9,13 +9,11 @@
 #include "HttpServerResponse.h"
 #include "HttpServerRequest.h"
 #include "NivaNetworkCoreSettings.h"
-#include "Kismet/BlueprintAsyncActionBase.h"
 #include "Interfaces/IHttpRequest.h"
 #include "HttpModule.h"
 #include "Dom/JsonObject.h"
 #include "Templates/SharedPointer.h"
 #include "Interfaces/IHttpResponse.h"
-#include "civetweb.h"
 #include "HAL/Runnable.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -23,12 +21,6 @@
 #include "Policies/CondensedJsonPrintPolicy.h"
 #include "Containers/Queue.h"
 #include "HAL/RunnableThread.h"
-// === MCP split headers ===
-#include "MCP/MCPTypes.h"
-#include "MCP/MCPToolProperty.h"
-#include "MCP/MCPToolCore.h"
-#include "MCP/MCPToolStorage.h"
-#include "MCP/MCPToolHandle.h"
 #include "NetworkCoreSubsystem.generated.h"
 
 
@@ -249,31 +241,3 @@ public:
 
 };
 
-// MCP 相关类型与工具类已拆分到独立头文件，避免在此重复声明。
-
-
-// 注：UMCPTransportSubsystem 类型及其成员已移动至 Public/MCP/MCPTransportSubsystem.h 中，
-// 以功能分类形式进行整理，避免该头文件过于臃肿。
-
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnRefreshMCPComplete, bool, bSuccess, const FString&, Message);
-
-UCLASS()
-class NETWORKCOREPLUGIN_API URefreshMCPClientAsyncAction : public UBlueprintAsyncActionBase
-{
-	GENERATED_BODY()
-
-public:
-	UFUNCTION(BlueprintCallable, Category = "MCP", meta = (BlueprintInternalUseOnly = "true", HidePin = "WorldContextObject"))
-	static URefreshMCPClientAsyncAction* RefreshMCPClient(UObject* WorldContextObject);
-
-	virtual void Activate() override;
-
-	UPROPERTY(BlueprintAssignable)
-	FOnRefreshMCPComplete OnSuccess;
-
-	UPROPERTY(BlueprintAssignable)
-	FOnRefreshMCPComplete OnFailure;
-
-private:
-	void HandleRequestComplete(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bSuccess);
-};

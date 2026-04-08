@@ -15,7 +15,7 @@ public class TaskWeaver : ModuleRules
 								"CoreUObject",
 								"Engine",
 								"AIModule",
-								"NetworkCorePlugin",
+								"MCPFramework",
 								"AssetRegistry"
 						}
 				);

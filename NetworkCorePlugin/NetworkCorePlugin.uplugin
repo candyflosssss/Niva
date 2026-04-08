@@ -3,7 +3,7 @@
 	"Version": 1,
 	"VersionName": "1.0",
 	"FriendlyName": "NetworkCorePlugin",
-	"Description": "网络通信总插件",
+	"Description": "通用网络核心、LLM/TTS 异步节点与 TurnGrid 业务子系统插件。",
 	"Category": "Other",
 	"CreatedBy": "花咲Official",
 	"CreatedByURL": "",

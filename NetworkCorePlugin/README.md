@@ -1,241 +1,627 @@
-﻿# NetworkCorePlugin 使用文档
+﻿# NetworkCorePlugin 当前功能与蓝图使用文档
 
-本插件提供一个统一的“网络核心”能力，用于在 Unreal Engine 5 项目中：
-- 启动轻量内置 HTTP 服务，用于常规http请求。
-- SSE（Server‑Sent Events）通道，用于MCP服务器框架。
+`NetworkCorePlugin`（下文简称 **NWC**）当前已经完成与 `MCPFramework` 的职责拆分。  
+现在它的定位不再是“网络 + MCP 总插件”，而是一个聚焦于以下能力的运行时网络插件：
 
+- UE 内置 HTTP 路由封装
+- LLM 异步请求节点
+- TTS 异步请求节点
+- 轻量在线状态 / Agent 条件子系统
+- TurnGrid 网格/迷宫业务子系统
 
-1. 架构与关键模块
-- UNetworkCoreSubsystem（GameInstanceSubsystem）
-  - 用于注册 UE 内部 `HttpRouter` 路由；
-  - 提供 `BindRoute`、`MakeResponse` 等辅助，管理 `FHttpServerModule` 生命周期；
-  - 通过项目设置中的 `Port` 指定监听端口。
-- UMCPTransportSubsystem（GameInstanceSubsystem）
-  - 基于 civetweb 启动另一个轻量 HTTP 服务，承载 MCP 消息与 SSE 推送；
-  - 提供 JSON‑RPC 包装、会话管理（SessionId -> SSE 消息队列）、工具注册与可视化；
-  - 通过项目设置中的 `MCPPort` 指定监听端口；
-  - 对外暴露端点：`/message`（POST JSON‑RPC）、`/sse`（SSE 通道）、`/tools`（工具清单 JSON）、`/ui/tools`（简易可视化页）、`/tools/version`。
-- UNivaNetworkCoreSettings（UDeveloperSettings）
-  - 集中管理端口、LLM/TTS 等可选能力的配置；
-  - 可在“项目设置 > NetworkCorePlugin”页面可视化配置，或写入 `DefaultNetworkCorePlugin.ini`。
-#### UMCPToolProperty*（工具参数类型工厂与取值）
-##### 用于定义和解析 MCP 工具的参数类型。
-- UMCPToolPropertyString
-  - `CreateStringProperty(Name, Desc)`（BlueprintCallable, Pure）：创建字符串参数定义。
-  - `GetValue(Json)`（BlueprintCallable, Pure）：从 JSON 提取字符串值。
-- UMCPToolPropertyNumber
-  - `CreateNumberProperty(Name, Desc, Min, Max)`（BlueprintCallable, Pure）：创建浮点参数。
-  - `GetValue(Json)`（BlueprintCallable, Pure）：提取浮点值。
-- UMCPToolPropertyInt
-  - `CreateIntProperty(Name, Desc, Min, Max)`（BlueprintCallable, Pure）：创建整型参数。
-  - `GetValue(Json)`（BlueprintCallable, Pure）：提取整型值。
-- UMCPToolPropertyActorPtr
-  - `CreateActorPtrProperty(Name, Desc, ActorClass)`（BlueprintCallable, Pure）：创建 Actor 指针参数。
-  - `GetAvailableTargets()`（BlueprintCallable）：枚举可选目标（Actor 名称）。
-  - `GetValue(Json)`（BlueprintCallable, Pure）：从 JSON 解析到 Actor。
-- UMCPToolPropertyComponentPtr
-  - `CreateComponentPtrProperty(Name, Desc, ComponentClass)`（BlueprintCallable, Pure）：创建组件指针参数。
-  - `GetAvailableTargets()`（BlueprintCallable）：枚举组件候选（标签/标识）。
-  - `GetComponentByLabel(Label)`（BlueprintCallable）：按标签查找组件。
-  - `GetValue(Json)`（BlueprintCallable, Pure）：从 JSON 解析到组件。
-- UMCPToolPropertyArray
-  - `CreateArrayProperty(Name, Desc, Property)`（BlueprintCallable, Pure）：创建“任意元素类型”的数组参数。
-  - `GetJsonObject()`：导出 Schema（用于对外描述）。
+如果你现在在项目里使用 NWC，可以把它理解为：
 
-提示：以上 `Create*Property` 与 `GetValue` 都标注为 BlueprintCallable/BlueprintPure，适合蓝图侧定义工具参数与解析入参。
+> **面向 Unreal 项目的通用网络基础层 + 一组可直接给蓝图使用的 LLM/TTS/TurnGrid 节点。**
 
-- UMCPToolBlueprintLibrary
-  - 提供蓝图侧工具属性 JSON 的解析与辅助追加。
-- URefreshMCPClientAsyncAction
-  - 辅助调用外部 HTTP 刷新工具列表（或进行连通性检查），包含 `OnSuccess`/`OnFailure` 多播。
+---
 
-源码位置
-- Plugins/NetworkCorePlugin/Source/NetworkCorePlugin
+## 1. 插件定位
 
+### 1.1 当前保留职责
 
-2. 安装与启用
-- 将插件放入项目 `Plugins/NetworkCorePlugin` 目录，确保在插件管理器中启用。
-- 运行时会自动创建两个 Subsystem：
-  - `UNetworkCoreSubsystem`：负责 `HttpRouter`；
-  - `UMCPTransportSubsystem`：负责 MCP 服务与 SSE。
-- 若要在游戏启动时立即开启 MCP 服务，可在任意时机调用：
-  - `GetGameInstance()->GetSubsystem<UMCPTransportSubsystem>()->StartMCPServer();`
-  - 默认会在端口 `MCPPort` 上监听并注册内置工具。
+NWC 当前主要负责：
 
+1. **HTTP 路由与响应封装**
+2. **LLM 请求发送与流式结果转发**
+3. **TTS 请求发送与音频字节回传**
+4. **在线状态与世界条件控制**
+5. **TurnGrid 地图生成与寻路辅助**
+---
 
-3. 配置项（UNivaNetworkCoreSettings）
-主要字段（名称以实际代码为准）：
-- 基础网络
-  - `Port`：UNetworkCoreSubsystem 使用的 `HttpRouter` 端口；
-  - `MCPPort`：UMCPTransportSubsystem 使用的 civetweb 端口；
-- 可选 LLM/TTS（如不使用可不配置）
-  - `LLM`, `LLMModel`, `LLMOllamaURL`, `LLMAliyunURL`, `LLMAliyunAPIKey`, ...
-  - `TTSRequestType`, `TTSURL`, `TTSAliyunURL`, `TTSAliyunAccessKey`, `TTSAliyunVoice`, `TTSAliyunFormat`, `TTSAliyunSampleRate`, 以及其他供应商参数。
+## 2. 模块与主要能力概览
 
-配置文件示例（Config/DefaultNetworkCorePlugin.ini）：
-```
+### 2.1 Runtime 模块：`NetworkCorePlugin`
+
+当前源码中的运行时公开入口主要有：
+
+- `UNetworkCoreSubsystem`
+- `UNivaNetworkCoreSettings`
+- `UNivaLLMRequest` / `UNivaAliyunLLMRequest` / `UNivaAgentLLMRequest` / `UNivaRunnerLLMRequest`
+- `UBlueprintAsyncNode`（LLM 蓝图异步节点）
+- `UNivaTTSRequest` / `UAliyunTTSRequest` / `UNivaMelotteTTSRequest`
+- `UTTSNode`（TTS 蓝图异步节点）
+- `UNivaOnlineSubsystem`
+- `UAgentSystemSubsystem`
+- `UTurnGridSubsystem`
+
+### 2.2 Editor 模块：`NetworkCorePluginEditor`
+
+当前编辑器模块仍保留在插件结构中，但**已没有 MCP 相关编辑器可视化功能**。  
+所以目前它不再承担 MCP 编辑器扩展职责。
+
+---
+
+## 3. 当前功能清单
+
+## 3.1 HTTP 路由能力
+
+主要类型：
+
+- `UNetworkCoreSubsystem`
+- `FNivaHttpRequest`
+- `FNivaHttpResponse`
+- `ENivaHttpRequestVerbs`
+
+当前能力：
+
+- 在配置端口上获取 UE 的 `HttpRouter`
+- 绑定 HTTP 路由
+- 把 UE 原生请求包装成蓝图可用结构
+- 快速创建文本/JSON HTTP 响应
+
+适用场景：
+
+- 在 UE 内部快速起一个轻量 HTTP 接口
+- 给外部工具、本地脚本、调试页面、局域网服务提供简单接口
+
+---
+
+## 3.2 LLM 请求能力
+
+主要类型：
+
+- `UNivaLLMRequest`
+- `UNivaAliyunLLMRequest`
+- `UNivaAgentLLMRequest`
+- `UNivaRunnerLLMRequest`
+- `UBlueprintAsyncNode`
+
+当前支持的 LLM 提供方：
+
+- `Ollama`
+- `Aliyun`
+- `NivaAgent`
+- `Runner`
+
+特点：
+
+- 支持蓝图异步节点调用
+- 支持流式进度回调
+- 根据项目设置自动选择底层请求实现
+
+---
+
+## 3.3 TTS 请求能力
+
+主要类型：
+
+- `UNivaTTSRequest`
+- `UAliyunTTSRequest`
+- `UNivaMelotteTTSRequest`
+- `UTTSNode`
+
+当前支持的 TTS 提供方：
+
+- `Fish`
+- `Melotte`
+- `Aliyun`
+
+特点：
+
+- 蓝图中通过异步节点直接发起请求
+- 返回的是**原始音频字节数组**
+- 目前没有把结果自动转换成最终可播放 `SoundWave` 作为默认输出
+
+> 这一点非常重要：如果你在蓝图里使用 TTS 节点，默认拿到的是字节数据和请求对象，而不是直接可播的声音资源。
+
+---
+
+## 3.4 Online / Agent 状态能力
+
+主要类型：
+
+- `UNivaOnlineSubsystem`
+- `UAgentSystemSubsystem`
+
+当前能力偏轻量，主要是：
+
+- 保存 `DesiredPawn`
+- 保存当前平台名 `Platform`
+- 保存 `isServer` 状态
+- 在满足条件时创建 `AgentSystemSubsystem`
+
+其中 `UAgentSystemSubsystem` 当前的创建条件包括：
+
+- 必须是游戏世界
+- 地图名必须是 `Rooms`
+- `UNivaOnlineSubsystem.isServer` 必须为 `true`
+
+这块更适合被理解为：
+
+> **项目内的运行时状态与世界条件过滤层**
+
+而不是完整的在线系统实现。
+
+---
+
+## 3.5 TurnGrid 业务能力
+
+主要类型：
+
+- `UTurnGridSubsystem`
+- `FWayNodes`
+
+当前能力：
+
+- 生成迷宫墙体网格
+- 维护可行走图
+- A* 路径查找
+- 生成路点与邻接关系
+- 计算从任意起点出发可到达的关键路点
+- 在网格坐标上生成 Actor
+
+当前默认只在地图：
+
+- `TurnGridGame`
+
+中创建该子系统。
+
+---
+
+## 4. 配置说明
+
+配置类：
+
+- `UNivaNetworkCoreSettings`
+
+配置段：
+
+```ini
 [/Script/NetworkCorePlugin.NivaNetworkCoreSettings]
-Port=18080
-MCPPort=18081
-; 如使用 TTS/LLM，请按需填写对应 URL 与 Key
+Port=9090
 ```
 
+### 4.1 通用网络配置
 
-4. 运行时服务与接口
-4.1 UE 内置 HttpRouter 路由（UNetworkCoreSubsystem）
-- 绑定路由
-```
-UNetworkCoreSubsystem* NetCore = GetGameInstance()->GetSubsystem<UNetworkCoreSubsystem>();
-NetCore->BindRoute(
-    TEXT("/hello"),
-    ENivaHttpRequestVerbs::GET,
-    FNetworkCoreHttpServerDelegate::CreateLambda([](FNivaHttpRequest Req){
-        FNivaHttpResponse Res;
-        Res.HttpServerResponse = UNetworkCoreSubsystem::MakeResponse(TEXT("Hello"), TEXT("text/plain"), 200);
-        return Res;
-    })
-);
-```
-- 发送响应
-  - 使用 `MakeResponse(Text, ContentType, Code)` 生成 `FHttpServerResponse` 并交给 `OnComplete`。
+| 配置项 | 说明 |
+| --- | --- |
+| `Port` | `UNetworkCoreSubsystem` 使用的 HTTP Router 监听端口 |
 
-4.2 MCP 传输服务（UMCPTransportSubsystem）
-- 启动服务：`StartMCPServer()`
-- 端点一览（监听 `MCPPort`）：
-  - `POST /message?session_id=<id>`：接收 JSON‑RPC 请求包，解析后执行业务；
-    - 服务器若需要向客户端返回数据，统一通过 SSE 推送（下述 `/sse`）。
-  - `GET /sse?session_id=<id>`：建立 Server‑Sent Events 流；
-    - 服务器端通过 `SendSSE(SessionId, Event, Data)` 推送消息；
-    - 插件内部事件名通常为 `message`，`Data` 为 JSON 字符串（已去除换行）。
-  - `GET /tools`：返回所有注册的 MCP 工具的 JSON；
-  - `GET /tools/version`：返回版本号或摘要信息；
-  - `GET /ui/tools`：内置的工具可视化（简易 HTML）。
+### 4.2 TurnGrid 配置
 
-- JSON‑RPC 约定（插件内置示例）：
-  - `initialize`：客户端初始化时发送，服务器通过 SSE 回 `result`；
-  - 其他方法可按需扩展。示例代码位于 `UMCPTransportSubsystem::HandlePostRequest`。
+| 配置项 | 说明 |
+| --- | --- |
+| `LocationDescriptions` | TurnGrid 路点名称池，用于给生成的节点命名 |
 
+### 4.3 LLM 配置
 
-5. MCP 工具系统
-5.1 工具与属性类型
-- 结构体 `FMCPTool`
-  - `Name`：工具名（唯一）；
-  - `Description`：说明；
-  - `Properties`：参数列表（`UMCPToolProperty*` 数组）。
-- 属性基类 `UMCPToolProperty`（字段：`Name`, `Type`, `Description`）
-- 已实现的属性类型（子类）：
-  - `UMCPToolPropertyString`：字符串；
-  - `UMCPToolPropertyNumber`：浮点数，带可选范围；
-  - `UMCPToolPropertyInt`：整数，带可选范围；
-  - `UMCPToolPropertyActorPtr`：Actor 指针（通过名称/Label 选择）；
-  - `UMCPToolPropertyComponentPtr`：组件指针（继承自 `UMcpExposableBaseComponent` 的组件）；
-  - `UMCPToolPropertyArray`：数组（包装任意子属性）。
+| 配置项 | 说明 |
+| --- | --- |
+| `LLM` | 当前使用的 LLM 提供方 |
+| `ShouldPrompt` | 是否在请求中附加系统提示词 |
+| `LLMPrompt` | 系统提示词 |
+| `LLMOllamaURL` | Ollama 接口地址 |
+| `LLMModel` | Ollama 模型枚举 |
+| `LLMAliyunURL` | 阿里云 LLM 接口地址 |
+| `LLMAliyunModel` | 阿里云模型枚举 |
+| `LLMAliyunAccessKey` | 阿里云访问密钥 |
+| `AgentChatURL` | NivaAgent 接口地址 |
+| `DefaultAgentID` | 默认 Agent ID |
+| `LLMRunnerURL` | Runner 接口地址 |
+| `LLMRunnerType` | Runner 请求类型 |
+| `LLMRunnerCallbackURL` | Runner 回调地址 |
 
-5.2 注册工具与处理回调
-- 注册 API：`UMCPTransportSubsystem::RegisterToolProperties(FMCPTool Tool, FMCPRouteDelegate Delegate)`
-- 回调签名：`FMCPRouteDelegate(const FString& Result, UMCPToolHandle* Handle, const FMCPTool& Tool)`
-  - `Result`：调用方上传的参数 JSON（字符串）；
-  - `Handle`：用于回传进度/最终结果的句柄；
-  - `Tool`：当前工具定义（含属性）。
+### 4.4 TTS 配置
 
-示例（注册两个查询工具，代码节选自插件）：
-```
-FMCPTool Tool1;
-Tool1.Name = TEXT("QueryObject");
-Tool1.Description = TEXT("根据对象查询所有可用工具");
-Tool1.Properties.Add(UMCPToolPropertyString::CreateStringProperty(TEXT("ObjectName"), TEXT("对象名称")));
+| 配置项 | 说明 |
+| --- | --- |
+| `TTSRequestType` | 当前使用的 TTS 提供方 |
+| `shouldTTSWait` | 是否等待 TTS 过程 |
+| `TTSURL` | Fish TTS 地址 |
+| `ReferenceID` | Fish 参考音色 ID |
+| `TTSFishAPIKey` | Fish API Key |
+| `MelotteTTSURL` | Melotte TTS 地址 |
+| `TTSAliyunAccessKey` | 阿里云 TTS Key |
+| `TTSAliyunURL` | 阿里云 TTS WebSocket 地址 |
+| `TTSAliyunVoice` | 阿里云音色 |
+| `TTSAliyunFormat` | 输出格式 |
+| `TTSAliyunSampleRate` | 输出采样率 |
+| `TTSAliyunVolume` | 音量 |
+| `TTSAliyunRate` | 语速 |
+| `TTSAliyunPitch` | 音调 |
+| `bEnableSSML` | 是否启用 SSML |
 
-FMCPRouteDelegate Delegate1;
-Delegate1.BindDynamic(this, &UMCPTransportSubsystem::OnToolRouteCallback);
-RegisterToolProperties(Tool1, Delegate1);
+---
 
-FMCPTool Tool2;
-Tool2.Name = TEXT("QueryTool");
-Tool2.Description = TEXT("根据工具查询所有可用对象");
-Tool2.Properties.Add(UMCPToolPropertyString::CreateStringProperty(TEXT("ToolName"), TEXT("工具名")));
+## 5. 蓝图环境下的主要节点与入口
 
-FMCPRouteDelegate Delegate2;
-Delegate2.BindDynamic(this, &UMCPTransportSubsystem::OnToolTargetsCallback);
-RegisterToolProperties(Tool2, Delegate2);
-```
+这一节重点面向蓝图使用者。
 
-在回调中返回数据
-- 使用 `UMCPToolHandle` 进行回传：
-```
-void UMCPTransportSubsystem::OnToolRouteCallback(const FString& Json, UMCPToolHandle* Handle, const FMCPTool& Tool)
-{
-    // 组装一个 JSON 字符串（或 FJsonObject）
-    Handle->ToolCallback(/*isError=*/false, TEXT("处理中..."));        // 中间态文本
-    Handle->ToolCallbackRaw(false, TEXT("{\"ok\":true}"), /*bFinal=*/true, 100, 100); // 最终态
-}
-```
+## 5.1 获取子系统的方式
 
-5.3 从属性 JSON 取值（蓝图/CPP）
-- 蓝图函数库 `UMCPToolBlueprintLibrary`：
-  - `GetStringValue/ GetNumberValue/ GetIntValue/ GetActorValue/ GetComponentValue`
-  - `AddProperty(FMCPTool& Tool, UMCPToolProperty* Property)`
-- 典型蓝图流程：
-  1) 拿到 `FMCPTool` 定义；
-  2) 从网络接收的参数 JSON（字符串）中，使用上述 `GetXXXValue` 提取；
-  3) 执行业务逻辑并通过 `UMCPToolHandle` 回发。
+NWC 的大多数能力都通过子系统或异步节点提供。
 
+### GameInstance Subsystem
 
-6. 蓝图节点与示例
-- 异步节点：`URefreshMCPClientAsyncAction::RefreshMCPClient(WorldContextObject)`
-  - 用于从外部地址拉取/刷新工具清单或进行连通性检查；
-  - 结果通过 `OnSuccess(int32 Result)` / `OnFailure(int32 Result)` 多播输出。
-- 结合工具属性：
-  - 在蓝图中可用 `UMCPToolPropertyXxx::CreateXxxProperty(...)` 组装 `FMCPTool` 参数定义；
-  - 使用 `UMCPToolBlueprintLibrary::GetXxxValue` 从调用 JSON 提取对应值。
+可通过蓝图获取：
 
+- `UNetworkCoreSubsystem`
+- `UNivaOnlineSubsystem`
 
-7. 客户端示例（curl/JS）
-- 建立 SSE 会话（建议先生成随机 `session_id`）
-```
-# 终端窗口 1：监听 SSE（保持长连接）
-curl -N "http://127.0.0.1:18081/sse?session_id=abc123"
-```
-- 发送 JSON‑RPC 请求
-```
-# 终端窗口 2：POST /message，服务器将通过 SSE 回结果
-curl -X POST "http://127.0.0.1:18081/message?session_id=abc123" \
-     -H "Content-Type: application/json" \
-     -d '{
-           "jsonrpc": "2.0",
-           "id": 1,
-           "method": "initialize",
-           "params": {}
-         }'
-```
-- 浏览器端 JS（最小示例）
-```
-const sid = 'abc123';
-const es = new EventSource(`http://127.0.0.1:18081/sse?session_id=${sid}`);
-es.addEventListener('message', (ev) => {
-  console.log('SSE message:', ev.data); // 一般为 JSON 字符串
-});
+### World Subsystem
 
-fetch(`http://127.0.0.1:18081/message?session_id=${sid}`, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })
-});
-```
+可通过蓝图获取：
 
+- `UTurnGridSubsystem`
+- `UAgentSystemSubsystem`（当前无明确蓝图接口，主要用于运行时条件控制）
 
-8. 常见问题与排查
-- 端口占用
-  - `Port`（HttpRouter）与 `MCPPort`（civetweb）必须可用；查看日志是否 `无法在端口 X 初始化 IHttpRouter` 或 `mg_start` 失败。
-- SSE 无消息
-  - 确认 `session_id` 一致；服务器日志若提示 `UNKNOW session`，说明未建立或已过期。
-- 工具列表为空
-  - 确认在 `StartMCPServer` 后调用了 `RegisterToolProperties`；
-  - 访问 `GET /tools` 确认 JSON 是否包含你的工具。
-- 参数解析失败
-  - 核对 `FMCPTool.Properties` 中各 `UMCPToolProperty` 的 `Name/Type` 与上传 JSON 的键/值类型一致；
-  - 对于 Actor/Component 指针，确保对象在当前关卡存在且可通过名称/唯一标识找到。
+---
 
+## 5.2 蓝图节点：`NWC LLM Chat`
 
-附注
-- 插件还包含 LLM/TTS 相关的 Async 节点与配置，这些能力与网络核心解耦，可按需使用；
-- 若要把 MCP 与项目中其他系统（例如 TaskWeaver）打通，可在工具回调里调用相应组件并用 `UMCPToolHandle` 上报进度与结果。
+对应入口：
+
+- `UBlueprintAsyncNode::LLMChat(...)`
+
+蓝图显示名：
+
+- `NWC LLM Chat`
+
+### 输入
+
+| 输入名 | 类型 | 说明 |
+| --- | --- | --- |
+| `Chatted` | `Map<String, String>` | 历史对话，通常表示 user → assistant 的历史映射 |
+| `Chat` | `String` | 当前输入文本 |
+
+### 输出事件
+
+| 事件 | 说明 |
+| --- | --- |
+| `ProgressDelegate` | 流式返回时持续触发 |
+| `CompleteDelegate` | 请求结束时触发 |
+
+### 行为说明
+
+- 节点会根据 `NivaNetworkCoreSettings` 中的 `LLM` 自动选择底层请求实现。
+- 如果当前选择的是流式模型，`ProgressDelegate` 会多次触发。
+- `CompleteDelegate` 通常用于拿最终完整结果或结束状态。
+
+### 适合的蓝图用法
+
+1. 在 UI 或控制器蓝图里调用 `NWC LLM Chat`
+2. 将 `Chat` 传入用户当前输入
+3. 将 `ProgressDelegate` 绑定到文本框增量显示
+4. 将 `CompleteDelegate` 绑定到最终 UI 状态收束逻辑
+
+### 注意事项
+
+- `Chatted` 是一个简单映射，不适合表达复杂多轮结构化消息。
+- 不同提供方返回内容格式会经过插件内部转换，但仍建议你在蓝图侧按字符串消费，而不要假定所有平台原始格式完全一致。
+
+---
+
+## 5.3 蓝图节点：`NWC Send TTS Request`
+
+对应入口：
+
+- `UTTSNode::SendTTSRequest(...)`
+
+蓝图显示名：
+
+- `NWC Send TTS Request`
+
+### 输入
+
+| 输入名 | 类型 | 说明 |
+| --- | --- | --- |
+| `Message` | `String` | 要合成的文本 |
+
+### 输出事件
+
+| 事件 | 说明 |
+| --- | --- |
+| `CompleteDelegate` | 请求结束时触发，返回音频字节数组与请求对象 |
+
+### 行为说明
+
+- 节点会根据 `TTSRequestType` 自动选择 Fish / Melotte / Aliyun。
+- Aliyun TTS 当前走 WebSocket。
+- 完成时返回的是 **`TArray<uint8>` 音频字节流**。
+
+### 适合的蓝图用法
+
+1. 在交互蓝图或 UI 蓝图中调用 `NWC Send TTS Request`
+2. 将文本传入 `Message`
+3. 在 `CompleteDelegate` 中检查返回的字节数组长度
+4. 如果需要播放音频：
+   - 可以在 C++ 中补一层字节转 `SoundWave`
+   - 或在后续流程中交给自定义音频处理模块
+
+### 注意事项
+
+- 该节点默认不是“直接播报节点”，而是“请求 + 返回音频数据节点”。
+- 如果你需要真正的一键播报链路，建议在项目层再封装一层蓝图工具函数或组件。
+
+---
+
+## 5.4 子系统：`UNetworkCoreSubsystem`
+
+主要蓝图可见函数：
+
+- `BindRoute`
+- `MakeResponse`
+- `UnitoString`
+
+### `BindRoute`
+
+作用：
+
+- 绑定一个 HTTP 路由到处理委托
+
+典型用途：
+
+- 给本地调试工具提供 HTTP 接口
+- 给局域网设备、脚本工具、自动化服务暴露简单 API
+
+### `MakeResponse`
+
+作用：
+
+- 快速构造 HTTP 响应
+
+常用参数：
+
+- 文本内容
+- Content-Type
+- 状态码
+
+### `UnitoString`
+
+作用：
+
+- 将 Unicode 转义字符串转换为普通字符串
+
+适用场景：
+
+- 后端返回了 `\uXXXX` 形式文本时做快速解码
+
+---
+
+## 5.5 子系统：`UNivaOnlineSubsystem`
+
+主要蓝图函数：
+
+- `SetDesiredPawn`
+- `GetDesiredPawn`
+- `SetIsServer`
+
+### 使用建议
+
+适合用来保存：
+
+- 玩家想要使用的 Pawn 名称
+- 当前是否作为服务端运行
+
+它不是完整登录系统，更像是项目内的运行时状态记录器。
+
+---
+
+## 5.6 子系统：`UTurnGridSubsystem`
+
+主要蓝图函数：
+
+- `GridSpawnActor`
+- `GenerateMazeWalls`
+- `FindPathAStar`
+- `getWayNodes`
+- `getWalkableWayNodes`
+
+### `GenerateMazeWalls`
+
+作用：
+
+- 按宽高生成迷宫墙体坐标
+- 同时输出可通行街道坐标
+
+### `FindPathAStar`
+
+作用：
+
+- 在当前图上做 A* 寻路
+
+### `getWayNodes`
+
+作用：
+
+- 获取当前关键路点及其邻接关系
+
+### `getWalkableWayNodes`
+
+作用：
+
+- 获取从指定起点出发，不跨越其他关键路点即可到达的节点列表
+
+### 蓝图典型用法
+
+1. 获取 `TurnGridSubsystem`
+2. 调用 `GenerateMazeWalls`
+3. 根据返回的墙体坐标生成关卡内容
+4. 使用 `FindPathAStar` 给角色或棋子计算路径
+5. 使用 `getWayNodes` / `getWalkableWayNodes` 做事件点或回合逻辑
+
+---
+
+## 6. 蓝图推荐使用流程
+
+## 6.1 LLM UI 对话流程
+
+推荐流程：
+
+1. 在 Widget 蓝图中采集输入文本
+2. 调用 `NWC LLM Chat`
+3. `ProgressDelegate` 中实时刷新聊天气泡
+4. `CompleteDelegate` 中做最终状态收尾
+
+适合：
+
+- AI 聊天
+- Agent 文本返回
+- 调试模型接入
+
+---
+
+## 6.2 文本转语音流程
+
+推荐流程：
+
+1. 调用 `NWC Send TTS Request`
+2. 在 `CompleteDelegate` 中拿到字节数组
+3. 把音频字节交给你自己的播放逻辑
+
+适合：
+
+- NPC 语音生成
+- 旁白生成
+- 文本播报队列
+
+---
+
+## 6.3 TurnGrid 回合网格流程
+
+推荐流程：
+
+1. 在 `TurnGridGame` 地图中获取 `TurnGridSubsystem`
+2. 调用 `GenerateMazeWalls`
+3. 记录返回的 `Street` 与 `WayNodes`
+4. 角色行动时调用 `FindPathAStar`
+5. 需要高层逻辑时再用 `getWalkableWayNodes`
+
+适合：
+
+- 回合制迷宫
+- 棋盘探索
+- 路点事件触发
+
+---
+
+## 7. 当前限制与注意事项
+
+### 7.1 TTS 默认输出不是 `SoundWave`
+
+当前 TTS 蓝图节点返回的是：
+
+- 音频字节数组
+- 请求对象
+
+如果项目需要“一步合成并播放”，建议在项目层补一层音频封装。
+
+### 7.2 `UAgentSystemSubsystem` 目前不是蓝图主入口
+
+它当前更像运行时条件子系统：
+
+- 地图必须是 `Rooms`
+- 且 `isServer = true`
+
+所以不建议把它当作主要蓝图 API 使用。
+
+### 7.3 `TurnGridSubsystem` 只在特定地图创建
+
+默认仅在：
+
+- `TurnGridGame`
+
+世界中创建。
+
+### 7.4 HTTP 路由更适合程序/高级蓝图场景
+
+`BindRoute` 虽然对蓝图可见，但更适合：
+
+- 有明确请求/响应结构设计的高级蓝图
+- 或直接由 C++ 管理
+
+---
+
+## 8. 与 MCPFramework 的边界
+
+如果你需要的是以下能力，请不要继续在 NWC 中寻找：
+
+- MCP 工具注册
+- MCP 参数模型
+- MCP 组件暴露
+- MCP 流式工具回调
+- MCP 进度与结果回传
+
+这些都已经属于：
+
+- `Plugins/MCPFramework`
+
+NWC 现在的职责重点是：
+
+- HTTP Router
+- LLM
+- TTS
+- Online 状态
+- TurnGrid
+
+---
+
+## 9. 源码索引
+
+### 核心子系统
+
+- `Source/NetworkCorePlugin/Public/NetworkCoreSubsystem.h`
+- `Source/NetworkCorePlugin/Private/NetworkCoreSubsystem.cpp`
+
+### 配置
+
+- `Source/NetworkCorePlugin/Public/NivaNetworkCoreSettings.h`
+- `Config/DefaultNetworkCorePlugin.ini`
+
+### LLM
+
+- `Source/NetworkCorePlugin/Public/AsyncNode/LLMAsyncNode.h`
+- `Source/NetworkCorePlugin/Private/AsyncNode/LLMAsyncNode.cpp`
+
+### TTS
+
+- `Source/NetworkCorePlugin/Public/AsyncNode/TTSAsyncNode.h`
+- `Source/NetworkCorePlugin/Private/AsyncNode/TTSAsyncNode.cpp`
+
+### Online / Agent
+
+- `Source/NetworkCorePlugin/Public/NivaOnlineSubsystem.h`
+- `Source/NetworkCorePlugin/Private/NivaOnlineSubsystem.cpp`
+
+### TurnGrid
+
+- `Source/NetworkCorePlugin/Public/TurnGridSubsystem.h`
+- `Source/NetworkCorePlugin/Private/TurnGridSubsystem.cpp`
+
+---
+
+## 10. 一句话总结
+
+现在的 `NetworkCorePlugin` 已经不再承担 MCP 的职责。  
+它当前是一套更聚焦的 Unreal 网络与蓝图辅助插件，主要提供：
+
+- HTTP 路由
+- LLM 异步节点
+- TTS 异步节点
+- Online/Agent 状态管理
+- TurnGrid 网格业务支持
+
+如果你接下来希望，我还可以继续为 NWC 再补一份：
+
+1. **纯蓝图用户速查表**
+2. **面向程序的接口与返回格式文档**

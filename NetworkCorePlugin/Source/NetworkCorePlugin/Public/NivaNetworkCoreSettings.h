@@ -250,12 +250,6 @@ public:
    */
   UPROPERTY(Config, EditAnywhere, Category = "Network", meta = (ClampMin = 1024, ClampMax = 65535))
   int Port = 9090;
-
-
-  UPROPERTY(Config, EditAnywhere, Category = "Network", meta = (ClampMin = 1024, ClampMax = 65535))
-  int MCPPort = 9091;
-
-
   UPROPERTY(Config, EditAnywhere, Category = "TurnGrid")
   TArray<FString> LocationDescriptions = {};
 
@@ -298,9 +292,6 @@ public:
   UPROPERTY(config, EditAnywhere, BlueprintReadOnly, Category = "Network|LLM|NivaAgent")
   FString DefaultAgentID = TEXT("test-agent-id");
 
-  // MCP 服务基础 URL（不要包含具体端点），用于拼接各接口
-  UPROPERTY(Config, EditAnywhere, BlueprintReadOnly, Category = "Network|LLM|NivaAgent")
-  FString MCPBaseURL = TEXT("http://localhost:8081");
 
   // Runner LLM 配置
   UPROPERTY(Config, EditAnywhere, Category = "Network|LLM|Runner")

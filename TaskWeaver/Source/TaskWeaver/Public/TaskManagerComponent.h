@@ -1,13 +1,12 @@
 ﻿#pragma once
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
+#include "MCPFramework/MCPToolCore.h"
+#include "MCPFramework/MCPToolHandle.h"
 #include "TaskBase.h"
 #include "Templates/SubclassOf.h"
 #include "TaskManagerComponent.generated.h"
 
-// 前置声明，避免在头文件引入外部插件头
-class UMCPToolHandle;
-struct FMCPTool;
 
 USTRUCT()
 struct FTaskCallbackContext

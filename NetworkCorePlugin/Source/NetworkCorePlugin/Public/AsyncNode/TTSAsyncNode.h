@@ -21,10 +21,8 @@
 #include "Engine/TimerHandle.h"
 #include "Interfaces/IHttpResponse.h" 
 #include "NivaNetworkCoreSettings.h"
-#include "UObject/NoExportTypes.h"
 #include "IWebSocket.h"
 #include "Modules/ModuleManager.h"
-#include "WebSocketsModule.h"
 #include "WebSocketsModule.h"
 #include "TTSAsyncNode.generated.h"
 
@@ -224,12 +222,14 @@ class NETWORKCOREPLUGIN_API UTTSNode : public UBlueprintAsyncActionBase
 {
 	GENERATED_BODY()
 
+	public:
+
 	// 完成
 	UPROPERTY(BlueprintAssignable)
 	FOnNivaTTSRequestComplete CompleteDelegate;
 
 	// 异步节点结果
-	UFUNCTION(BlueprintCallable, meta = (BlueprintInternalUseOnly = "true"))
+	UFUNCTION(BlueprintCallable, Category = "NWC|TTS", meta = (BlueprintInternalUseOnly = "true", DisplayName = "NWC Send TTS Request"))
 	static UTTSNode* SendTTSRequest(
 		const FString& Message
 	);

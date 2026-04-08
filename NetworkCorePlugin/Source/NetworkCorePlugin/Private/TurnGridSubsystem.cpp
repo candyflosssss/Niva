@@ -8,13 +8,12 @@
 #include "Misc/DateTime.h"           // FDateTime
 #include "Math/UnrealMathUtility.h"  // FMath, FRandomStream
 #include "Containers/Queue.h" // Add this include to use TPriorityQueue
-#include "Kismet/GameplayStatics.h"
 #include <NivaNetworkCoreSettings.h>
 
 void UTurnGridSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
-    UE_LOG(LogTemp, Log, TEXT("UMyLevelScopedSubsystem Initialized"));
+    UE_LOG(LogTemp, Log, TEXT("UTurnGridSubsystem Initialized"));
 
 
     
@@ -25,7 +24,7 @@ void UTurnGridSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 void UTurnGridSubsystem::Deinitialize()
 {
     Super::Deinitialize();
-    UE_LOG(LogTemp, Log, TEXT("UMyLevelScopedSubsystem Deinitialized"));
+    UE_LOG(LogTemp, Log, TEXT("UTurnGridSubsystem Deinitialized"));
 }
 
 // 重点：判断是否应该创建
@@ -71,6 +70,8 @@ TArray<FIntPoint> UTurnGridSubsystem::GenerateMazeWalls(int32 Width, int32 Heigh
 	// 清楚  Street
     Street.Empty();
     WalkablePoint.Empty();
+    Graph.Empty();
+    WayNodes.Empty();
     if (Width <= 0 || Height <= 0)
     {
         UE_LOG(LogTemp, Warning, TEXT("MazeGen: invaild size %d x %d"), Width, Height);
@@ -317,11 +318,7 @@ TArray<FWayNodes> UTurnGridSubsystem::FindNodes()
         // 1) 复制一份，保证不修改原数组
         TArray<FString> ShuffledArray = LocationDescriptions;
 
-        // 2) 生成随机流 ―― 截取 64 位 Ticks 的低 32 位作为种子
-        uint32 Seed = static_cast<uint32>(FDateTime::Now().GetTicks());
-        FRandomStream RandomStream(Seed);
-
-        // 3) 调用 UE 内置的随机打乱函数
+        // 2) 调用 UE 内置的随机打乱函数
         Algo::RandomShuffle(ShuffledArray);              // 使用 RandomShuffle
         // （如果想用自定义 RandomStream，可改成 Algo::RandomShuffle(ShuffledArray, RandomStream); 但 UE5.5 版本只接受无参版）
 
@@ -352,7 +349,7 @@ TArray<FWayNodes> UTurnGridSubsystem::FindNodes()
 		   Node.WayLocation = Nodes[i];
        }
        else {
-		   Node.WayName = Result[i];
+       Node.WayName = Result.IsValidIndex(i) ? Result[i] : FString::Printf(TEXT("node_%d_%d"), Nodes[i].X, Nodes[i].Y);
 		   Node.WayLocation = Nodes[i];
        }
        Location_WayNodeMap.Add(Node.WayLocation, Node);

@@ -2,7 +2,6 @@
 
 #include "CoreMinimal.h"
 #include "Modules/ModuleManager.h"
-#include "civetweb.h"    // CivetWeb 的 C API
 
 class FNetworkCorePluginModule : public IModuleInterface
 {

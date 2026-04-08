@@ -21,10 +21,8 @@
 #include "Engine/TimerHandle.h"
 #include "Interfaces/IHttpResponse.h" 
 #include "NivaNetworkCoreSettings.h"
-#include "UObject/NoExportTypes.h"
 #include "IWebSocket.h"
 #include "Modules/ModuleManager.h"
-#include "WebSocketsModule.h"
 #include "WebSocketsModule.h"
 #include "LLMAsyncNode.generated.h"
 
@@ -232,7 +230,7 @@ public:
 
 
 	// 异步节点结果
-	UFUNCTION(BlueprintCallable, meta = (BlueprintInternalUseOnly = "true"))
+	UFUNCTION(BlueprintCallable, Category = "NWC|LLM", meta = (BlueprintInternalUseOnly = "true", DisplayName = "NWC LLM Chat"))
 	static UBlueprintAsyncNode* LLMChat(
 		TMap<FString/*user*/, FString/*assistant*/> Chatted,
 		FString Chat

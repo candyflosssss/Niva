@@ -1,5 +1,6 @@
 ﻿#include "DelayTask.h"
-#include "NetworkCoreSubsystem.h"
+#include "MCPFramework/MCPToolCore.h"
+#include "MCPFramework/MCPToolProperty.h"
 
 void UDelayTask::BuildMcpTool(FMCPTool& Tool, UTaskManagerComponent* /*Manager*/) const
 {

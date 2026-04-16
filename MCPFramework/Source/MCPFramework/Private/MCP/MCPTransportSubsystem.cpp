@@ -13,6 +13,8 @@
 #include "Kismet/GameplayStatics.h"
 #include "Subsystems/McpComponentRegistrySubsystem.h"
 #include "Components/Base/McpExposableBaseComponent.h"
+#include "UObject/FieldIterator.h"
+#include "UObject/UnrealType.h"
 // CoreManager Log subsystem
 #if HAS_CORE_MANAGER
 #include "Log/CoreLogSubsystem.h"
@@ -128,6 +130,262 @@ namespace
 
         const int32 PayloadId = static_cast<int32>(JsonObject->GetNumberField(TEXT("id")));
         return PayloadId == ExpectedId && (JsonObject->HasField(TEXT("result")) || JsonObject->HasField(TEXT("error")));
+    }
+
+    inline FString StripToolPrefix(const FString& FunctionName, const FString& Prefix)
+    {
+        if (!Prefix.IsEmpty() && FunctionName.StartsWith(Prefix))
+        {
+            return FunctionName.RightChop(Prefix.Len());
+        }
+        return FunctionName;
+    }
+
+    inline FString ToSnakeCase(const FString& InValue)
+    {
+        FString Out;
+        Out.Reserve(InValue.Len() + 8);
+
+        auto AppendSeparator = [&Out]()
+        {
+            if (!Out.IsEmpty() && !Out.EndsWith(TEXT("_")))
+            {
+                Out.AppendChar(TEXT('_'));
+            }
+        };
+
+        for (int32 Index = 0; Index < InValue.Len(); ++Index)
+        {
+            const TCHAR Char = InValue[Index];
+            if (FChar::IsUpper(Char))
+            {
+                const bool bHasPrev = Index > 0;
+                const bool bPrevNeedsSeparator = bHasPrev && (FChar::IsLower(InValue[Index - 1]) || FChar::IsDigit(InValue[Index - 1]));
+                const bool bNextLower = (Index + 1 < InValue.Len()) && FChar::IsLower(InValue[Index + 1]);
+                if (bPrevNeedsSeparator || (bHasPrev && bNextLower))
+                {
+                    AppendSeparator();
+                }
+                Out.AppendChar(FChar::ToLower(Char));
+            }
+            else if (FChar::IsAlnum(Char))
+            {
+                Out.AppendChar(FChar::ToLower(Char));
+            }
+            else
+            {
+                AppendSeparator();
+            }
+        }
+
+        while (Out.StartsWith(TEXT("_")))
+        {
+            Out.RightChopInline(1, EAllowShrinking::No);
+        }
+        while (Out.EndsWith(TEXT("_")))
+        {
+            Out.LeftChopInline(1, EAllowShrinking::No);
+        }
+
+        return Out.IsEmpty() ? InValue.ToLower() : Out;
+    }
+
+    inline FString GetToolDescriptionFromFunction(const UFunction* Function, const FString& OverrideDescription)
+    {
+        if (!OverrideDescription.IsEmpty())
+        {
+            return OverrideDescription;
+        }
+        if (!Function)
+        {
+            return TEXT("");
+        }
+
+        const FString Tooltip = Function->GetMetaData(TEXT("ToolTip"));
+        if (!Tooltip.IsEmpty())
+        {
+            return Tooltip;
+        }
+
+        const FString DisplayName = Function->GetMetaData(TEXT("DisplayName"));
+        if (!DisplayName.IsEmpty())
+        {
+            return DisplayName;
+        }
+
+        return FName::NameToDisplayString(StripToolPrefix(Function->GetName(), TEXT("MCP_")), false);
+    }
+
+    inline FString GetToolParamDescription(const FProperty* Property)
+    {
+        if (!Property)
+        {
+            return TEXT("");
+        }
+
+        const FString Tooltip = Property->GetMetaData(TEXT("ToolTip"));
+        if (!Tooltip.IsEmpty())
+        {
+            return Tooltip;
+        }
+
+        const FString DisplayName = Property->GetMetaData(TEXT("DisplayName"));
+        if (!DisplayName.IsEmpty())
+        {
+            return DisplayName;
+        }
+
+        return FName::NameToDisplayString(Property->GetName(), Property->IsA<FBoolProperty>());
+    }
+
+    inline bool TryGetArgumentValue(const TSharedPtr<FJsonObject>& Arguments, const FString& FieldName, TSharedPtr<FJsonValue>& OutValue)
+    {
+        if (!Arguments.IsValid())
+        {
+            return false;
+        }
+
+        const TSharedPtr<FJsonValue>* FoundValue = Arguments->Values.Find(FieldName);
+        if (!FoundValue || !FoundValue->IsValid())
+        {
+            return false;
+        }
+
+        OutValue = *FoundValue;
+        return true;
+    }
+
+    inline bool ParseToolArguments(const FString& JsonString, TSharedPtr<FJsonObject>& OutArguments, FString& OutError)
+    {
+        TSharedPtr<FJsonObject> JsonObject;
+        TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonString);
+        if (!FJsonSerializer::Deserialize(Reader, JsonObject) || !JsonObject.IsValid())
+        {
+            OutError = TEXT("解析 JSON 失败");
+            return false;
+        }
+
+        if (!JsonObject->HasTypedField<EJson::Object>(TEXT("params")))
+        {
+            OutError = TEXT("JSON-RPC 缺少 params 对象");
+            return false;
+        }
+
+        const TSharedPtr<FJsonObject> ParamsObject = JsonObject->GetObjectField(TEXT("params"));
+        if (!ParamsObject.IsValid() || !ParamsObject->HasTypedField<EJson::Object>(TEXT("arguments")))
+        {
+            OutError = TEXT("JSON-RPC 缺少 arguments 对象");
+            return false;
+        }
+
+        OutArguments = ParamsObject->GetObjectField(TEXT("arguments"));
+        if (!OutArguments.IsValid())
+        {
+            OutError = TEXT("arguments 对象无效");
+            return false;
+        }
+
+        return true;
+    }
+
+    inline bool TryReadStringArgument(const TSharedPtr<FJsonObject>& Arguments, const FString& FieldName, FString& OutValue, FString& OutError)
+    {
+        TSharedPtr<FJsonValue> JsonValue;
+        if (!TryGetArgumentValue(Arguments, FieldName, JsonValue))
+        {
+            OutError = FString::Printf(TEXT("缺少参数：%s"), *FieldName);
+            return false;
+        }
+
+        switch (JsonValue->Type)
+        {
+        case EJson::String:
+            OutValue = JsonValue->AsString();
+            return true;
+        case EJson::Number:
+            OutValue = LexToString(JsonValue->AsNumber());
+            return true;
+        case EJson::Boolean:
+            OutValue = JsonValue->AsBool() ? TEXT("true") : TEXT("false");
+            return true;
+        default:
+            OutError = FString::Printf(TEXT("参数 %s 不是字符串"), *FieldName);
+            return false;
+        }
+    }
+
+    inline bool TryReadNumberArgument(const TSharedPtr<FJsonObject>& Arguments, const FString& FieldName, double& OutValue, FString& OutError)
+    {
+        TSharedPtr<FJsonValue> JsonValue;
+        if (!TryGetArgumentValue(Arguments, FieldName, JsonValue))
+        {
+            OutError = FString::Printf(TEXT("缺少参数：%s"), *FieldName);
+            return false;
+        }
+
+        switch (JsonValue->Type)
+        {
+        case EJson::Number:
+            OutValue = JsonValue->AsNumber();
+            return true;
+        case EJson::String:
+        {
+            const FString ValueAsString = JsonValue->AsString();
+            if (LexTryParseString(OutValue, *ValueAsString))
+            {
+                return true;
+            }
+            OutError = FString::Printf(TEXT("参数 %s 不是合法数字：%s"), *FieldName, *ValueAsString);
+            return false;
+        }
+        case EJson::Boolean:
+            OutValue = JsonValue->AsBool() ? 1.0 : 0.0;
+            return true;
+        default:
+            OutError = FString::Printf(TEXT("参数 %s 不是数字"), *FieldName);
+            return false;
+        }
+    }
+
+    inline bool TryReadBoolArgument(const TSharedPtr<FJsonObject>& Arguments, const FString& FieldName, bool& OutValue, FString& OutError)
+    {
+        TSharedPtr<FJsonValue> JsonValue;
+        if (!TryGetArgumentValue(Arguments, FieldName, JsonValue))
+        {
+            OutError = FString::Printf(TEXT("缺少参数：%s"), *FieldName);
+            return false;
+        }
+
+        switch (JsonValue->Type)
+        {
+        case EJson::Boolean:
+            OutValue = JsonValue->AsBool();
+            return true;
+        case EJson::Number:
+            OutValue = !FMath::IsNearlyZero(JsonValue->AsNumber());
+            return true;
+        case EJson::String:
+        {
+            FString ValueAsString = JsonValue->AsString();
+            ValueAsString.TrimStartAndEndInline();
+            ValueAsString = ValueAsString.ToLower();
+            if (ValueAsString == TEXT("true") || ValueAsString == TEXT("1") || ValueAsString == TEXT("yes"))
+            {
+                OutValue = true;
+                return true;
+            }
+            if (ValueAsString == TEXT("false") || ValueAsString == TEXT("0") || ValueAsString == TEXT("no"))
+            {
+                OutValue = false;
+                return true;
+            }
+            OutError = FString::Printf(TEXT("参数 %s 不是合法布尔值：%s"), *FieldName, *ValueAsString);
+            return false;
+        }
+        default:
+            OutError = FString::Printf(TEXT("参数 %s 不是布尔值"), *FieldName);
+            return false;
+        }
     }
 }
 
@@ -344,6 +602,647 @@ void UMCPTransportSubsystem::RegisterToolProperties(FMCPTool tool, FMCPRouteDele
     // message要显示具体的工具名称
     MCPLog(this, TEXT("Tools"), ECoreLogSeverity::Off, tool.Name + TEXT(" registered."), DetailLog);
 	}
+}
+
+int32 UMCPTransportSubsystem::AutoRegisterMCPTools(UObject* Target, FString Prefix)
+{
+    if (!IsValid(Target))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("AutoRegisterMCPTools failed: invalid target"));
+        return 0;
+    }
+
+    if (Prefix.IsEmpty())
+    {
+        Prefix = TEXT("MCP_");
+    }
+
+    UClass* TargetClass = Target->GetClass();
+    if (!TargetClass)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("AutoRegisterMCPTools failed: target %s has no class"), *GetNameSafe(Target));
+        return 0;
+    }
+
+    int32 RegisteredCount = 0;
+    for (TFieldIterator<UFunction> It(TargetClass, EFieldIteratorFlags::ExcludeSuper); It; ++It)
+    {
+        UFunction* Function = *It;
+        if (!Function)
+        {
+            continue;
+        }
+
+        const FString FunctionName = Function->GetName();
+        if (!FunctionName.StartsWith(Prefix))
+        {
+            continue;
+        }
+        if (!Function->HasAnyFunctionFlags(FUNC_BlueprintCallable | FUNC_BlueprintEvent))
+        {
+            continue;
+        }
+        if (Function->HasAnyFunctionFlags(FUNC_Static | FUNC_Delegate))
+        {
+            continue;
+        }
+
+        const FString DerivedToolName = ToSnakeCase(StripToolPrefix(FunctionName, Prefix));
+        const bool bAlreadyRegistered = AutoToolBindings.Contains(DerivedToolName);
+        if (RegisterFunctionAsMCPTool(Target, Function->GetFName(), DerivedToolName))
+        {
+            if (!bAlreadyRegistered)
+            {
+                ++RegisteredCount;
+            }
+        }
+    }
+
+    UE_LOG(LogTemp, Log, TEXT("AutoRegisterMCPTools: target=%s registered=%d prefix=%s"), *GetNameSafe(Target), RegisteredCount, *Prefix);
+    return RegisteredCount;
+}
+
+bool UMCPTransportSubsystem::RegisterFunctionAsMCPTool(UObject* Target, FName FunctionName, FString ToolNameOverride, FString ToolDescriptionOverride)
+{
+    if (!IsValid(Target))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("RegisterFunctionAsMCPTool failed: invalid target"));
+        return false;
+    }
+
+    UFunction* Function = Target->FindFunction(FunctionName);
+    if (!Function)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("RegisterFunctionAsMCPTool failed: function %s not found on %s"), *FunctionName.ToString(), *GetNameSafe(Target));
+        return false;
+    }
+
+    if (Function->HasAnyFunctionFlags(FUNC_Static | FUNC_Delegate))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("RegisterFunctionAsMCPTool skipped: %s is static or delegate"), *FunctionName.ToString());
+        return false;
+    }
+
+    const FString ToolName = !ToolNameOverride.IsEmpty()
+        ? ToolNameOverride
+        : ToSnakeCase(StripToolPrefix(Function->GetName(), TEXT("MCP_")));
+
+    if (ToolName.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("RegisterFunctionAsMCPTool failed: tool name is empty for function %s"), *FunctionName.ToString());
+        return false;
+    }
+
+    if (const FMCPAutoToolBinding* ExistingBinding = AutoToolBindings.Find(ToolName))
+    {
+        if (ExistingBinding->Target == Target && ExistingBinding->FunctionName == FunctionName)
+        {
+            UE_LOG(LogTemp, Verbose, TEXT("RegisterFunctionAsMCPTool skipped: tool %s already registered on %s"), *ToolName, *GetNameSafe(Target));
+            return true;
+        }
+
+        UE_LOG(LogTemp, Warning, TEXT("RegisterFunctionAsMCPTool failed: duplicate auto tool name %s"), *ToolName);
+        return false;
+    }
+
+    if (MCPTools.Contains(ToolName))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("RegisterFunctionAsMCPTool failed: tool name %s already exists"), *ToolName);
+        return false;
+    }
+
+    FMCPTool Tool;
+    Tool.Name = ToolName;
+    Tool.Description = GetToolDescriptionFromFunction(Function, ToolDescriptionOverride);
+
+    FMCPAutoToolBinding Binding;
+    Binding.Target = Target;
+    Binding.Function = Function;
+    Binding.FunctionName = FunctionName;
+
+    int32 HandleParamCount = 0;
+    FString ValidationError;
+
+    for (TFieldIterator<FProperty> It(Function); It; ++It)
+    {
+        FProperty* Property = *It;
+        if (!Property || !Property->HasAnyPropertyFlags(CPF_Parm))
+        {
+            continue;
+        }
+
+        if (Property->HasAnyPropertyFlags(CPF_ReturnParm))
+        {
+            ValidationError = FString::Printf(TEXT("函数 %s 不支持返回值"), *FunctionName.ToString());
+            break;
+        }
+
+        if (Property->HasAnyPropertyFlags(CPF_OutParm) && !Property->HasAnyPropertyFlags(CPF_ConstParm))
+        {
+            ValidationError = FString::Printf(TEXT("函数 %s 不支持 Out 参数：%s"), *FunctionName.ToString(), *Property->GetName());
+            break;
+        }
+
+        const FString ParamName = Property->GetName();
+        const FString ParamDescription = GetToolParamDescription(Property);
+
+        if (const FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(Property))
+        {
+            UClass* PropertyClass = ObjectProperty->PropertyClass;
+            if (PropertyClass && PropertyClass->IsChildOf(UMCPToolHandle::StaticClass()))
+            {
+                ++HandleParamCount;
+                if (HandleParamCount > 1)
+                {
+                    ValidationError = FString::Printf(TEXT("函数 %s 只能包含一个 MCPToolHandle 参数"), *FunctionName.ToString());
+                    break;
+                }
+
+                Binding.HandleParameterName = Property->GetFName();
+                continue;
+            }
+
+            if (PropertyClass && PropertyClass->IsChildOf(UMcpExposableBaseComponent::StaticClass()))
+            {
+                Tool.Properties.Add(UMCPToolPropertyComponentPtr::CreateComponentPtrProperty(ParamName, ParamDescription, PropertyClass));
+                continue;
+            }
+
+            if (PropertyClass && PropertyClass->IsChildOf(AActor::StaticClass()))
+            {
+                Tool.Properties.Add(UMCPToolPropertyActorPtr::CreateActorPtrProperty(ParamName, ParamDescription, PropertyClass));
+                continue;
+            }
+
+            ValidationError = FString::Printf(TEXT("函数 %s 包含不支持的对象参数类型：%s"), *FunctionName.ToString(), *GetNameSafe(PropertyClass));
+            break;
+        }
+
+        if (CastField<FStrProperty>(Property))
+        {
+            Tool.Properties.Add(UMCPToolPropertyString::CreateStringProperty(ParamName, ParamDescription));
+            continue;
+        }
+
+        if (CastField<FNameProperty>(Property))
+        {
+            Tool.Properties.Add(UMCPToolPropertyString::CreateStringProperty(ParamName, ParamDescription));
+            continue;
+        }
+
+        if (CastField<FIntProperty>(Property))
+        {
+            Tool.Properties.Add(UMCPToolPropertyInt::CreateIntProperty(ParamName, ParamDescription, TNumericLimits<int32>::Lowest(), TNumericLimits<int32>::Max()));
+            continue;
+        }
+
+        if (CastField<FFloatProperty>(Property) || CastField<FDoubleProperty>(Property))
+        {
+            Tool.Properties.Add(UMCPToolPropertyNumber::CreateNumberProperty(ParamName, ParamDescription, TNumericLimits<int32>::Lowest(), TNumericLimits<int32>::Max()));
+            continue;
+        }
+
+        if (CastField<FBoolProperty>(Property))
+        {
+            Tool.Properties.Add(UMCPToolPropertyBool::CreateBoolProperty(ParamName, ParamDescription));
+            continue;
+        }
+
+        ValidationError = FString::Printf(TEXT("函数 %s 包含不支持的参数类型：%s"), *FunctionName.ToString(), *Property->GetClass()->GetName());
+        break;
+    }
+
+    if (!ValidationError.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("RegisterFunctionAsMCPTool failed: %s"), *ValidationError);
+        return false;
+    }
+
+    if (HandleParamCount != 1)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("RegisterFunctionAsMCPTool failed: function %s must contain exactly one MCPToolHandle parameter"), *FunctionName.ToString());
+        return false;
+    }
+
+    FMCPRouteDelegate RouteDelegate;
+    RouteDelegate.BindDynamic(this, &UMCPTransportSubsystem::OnAutoToolDispatch);
+    RegisterToolProperties(Tool, RouteDelegate);
+    AutoToolBindings.Add(ToolName, Binding);
+
+    UE_LOG(LogTemp, Log, TEXT("RegisterFunctionAsMCPTool success: %s -> %s on %s"), *FunctionName.ToString(), *ToolName, *GetNameSafe(Target));
+    return true;
+}
+
+FString UMCPTransportSubsystem::BeginRegisterCustomTool(UObject* Target, FName FunctionName, const FString& ToolDescription)
+{
+    if (!IsValid(Target))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("BeginRegisterCustomTool failed: invalid target"));
+        return TEXT("");
+    }
+
+    UFunction* Function = Target->FindFunction(FunctionName);
+    if (!Function)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("BeginRegisterCustomTool failed: function %s not found on %s"), *FunctionName.ToString(), *GetNameSafe(Target));
+        return TEXT("");
+    }
+
+    if (Function->HasAnyFunctionFlags(FUNC_Static | FUNC_Delegate))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("BeginRegisterCustomTool skipped: %s is static or delegate"), *FunctionName.ToString());
+        return TEXT("");
+    }
+
+    const FString ToolName = ToSnakeCase(StripToolPrefix(Function->GetName(), TEXT("MCP_")));
+    if (ToolName.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("BeginRegisterCustomTool failed: derived tool name is empty for %s"), *FunctionName.ToString());
+        return TEXT("");
+    }
+
+    if (AutoToolBindings.Contains(ToolName) || MCPTools.Contains(ToolName))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("BeginRegisterCustomTool failed: tool name %s already registered"), *ToolName);
+        return TEXT("");
+    }
+
+    if (PendingToolRegistrations.Contains(ToolName))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("BeginRegisterCustomTool failed: tool name %s already pending"), *ToolName);
+        return TEXT("");
+    }
+
+    FMCPPendingToolRegistration Pending;
+    Pending.Target = Target;
+    Pending.Function = Function;
+    Pending.FunctionName = FunctionName;
+    Pending.ToolDescription = ToolDescription;
+
+    // Extract param order and find Handle parameter
+    int32 HandleCount = 0;
+    for (TFieldIterator<FProperty> It(Function); It; ++It)
+    {
+        FProperty* Property = *It;
+        if (!Property || !Property->HasAnyPropertyFlags(CPF_Parm) || Property->HasAnyPropertyFlags(CPF_ReturnParm))
+        {
+            continue;
+        }
+
+        if (const FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(Property))
+        {
+            if (ObjProp->PropertyClass && ObjProp->PropertyClass->IsChildOf(UMCPToolHandle::StaticClass()))
+            {
+                ++HandleCount;
+                Pending.HandleParameterName = Property->GetFName();
+                continue;
+            }
+        }
+        Pending.CppParamOrder.Add(Property->GetFName());
+    }
+
+    if (HandleCount != 1)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("BeginRegisterCustomTool failed: function %s must have exactly one UMCPToolHandle* param (found %d)"), *FunctionName.ToString(), HandleCount);
+        return TEXT("");
+    }
+
+    PendingToolRegistrations.Add(ToolName, MoveTemp(Pending));
+    UE_LOG(LogTemp, Log, TEXT("BeginRegisterCustomTool: started pending registration for %s (%d params)"), *ToolName, Pending.CppParamOrder.Num());
+    return ToolName;
+}
+
+void UMCPTransportSubsystem::AddCustomToolProperty(const FString& ToolName, UMCPToolProperty* Property)
+{
+    FMCPPendingToolRegistration* Pending = PendingToolRegistrations.Find(ToolName);
+    if (!Pending)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("AddCustomToolProperty failed: no pending registration for %s"), *ToolName);
+        return;
+    }
+    if (!Property)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("AddCustomToolProperty failed: null property for %s"), *ToolName);
+        return;
+    }
+    Pending->Properties.Add(Property);
+}
+
+bool UMCPTransportSubsystem::CommitCustomToolRegistration(const FString& ToolName)
+{
+    FMCPPendingToolRegistration* Pending = PendingToolRegistrations.Find(ToolName);
+    if (!Pending)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("CommitCustomToolRegistration failed: no pending registration for %s"), *ToolName);
+        return false;
+    }
+
+    if (Pending->Properties.Num() != Pending->CppParamOrder.Num())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("CommitCustomToolRegistration failed: property count (%d) != param count (%d) for %s"),
+            Pending->Properties.Num(), Pending->CppParamOrder.Num(), *ToolName);
+        PendingToolRegistrations.Remove(ToolName);
+        return false;
+    }
+
+    // Build ParamToArgName mapping: C++ param name → custom property name
+    FMCPAutoToolBinding Binding;
+    Binding.Target = Pending->Target;
+    Binding.Function = Pending->Function;
+    Binding.FunctionName = Pending->FunctionName;
+    Binding.HandleParameterName = Pending->HandleParameterName;
+
+    for (int32 i = 0; i < Pending->CppParamOrder.Num(); ++i)
+    {
+        if (Pending->Properties[i])
+        {
+            Binding.ParamToArgName.Add(Pending->CppParamOrder[i], Pending->Properties[i]->Name);
+        }
+    }
+
+    // Build FMCPTool
+    FMCPTool Tool;
+    Tool.Name = ToolName;
+    Tool.Description = Pending->ToolDescription;
+    Tool.Properties = Pending->Properties;
+
+    // Register
+    FMCPRouteDelegate RouteDelegate;
+    RouteDelegate.BindDynamic(this, &UMCPTransportSubsystem::OnAutoToolDispatch);
+    RegisterToolProperties(Tool, RouteDelegate);
+    AutoToolBindings.Add(ToolName, Binding);
+
+    PendingToolRegistrations.Remove(ToolName);
+    UE_LOG(LogTemp, Log, TEXT("CommitCustomToolRegistration success: %s on %s"), *ToolName, *GetNameSafe(Binding.Target.Get()));
+    return true;
+}
+
+TArray<FName> UMCPTransportSubsystem::GetEligibleMCPFunctions(UClass* InClass)
+{
+    TArray<FName> Result;
+    if (!InClass)
+    {
+        return Result;
+    }
+
+    for (TFieldIterator<UFunction> It(InClass, EFieldIteratorFlags::IncludeSuper); It; ++It)
+    {
+        UFunction* Function = *It;
+        if (!Function)
+        {
+            continue;
+        }
+
+        if (!Function->HasAnyFunctionFlags(FUNC_BlueprintCallable | FUNC_BlueprintEvent))
+        {
+            continue;
+        }
+        if (Function->HasAnyFunctionFlags(FUNC_Static | FUNC_Delegate))
+        {
+            continue;
+        }
+
+        int32 HandleCount = 0;
+        bool bHasUnsupported = false;
+        for (TFieldIterator<FProperty> PropIt(Function); PropIt; ++PropIt)
+        {
+            FProperty* Property = *PropIt;
+            if (!Property || !Property->HasAnyPropertyFlags(CPF_Parm))
+            {
+                continue;
+            }
+            if (Property->HasAnyPropertyFlags(CPF_ReturnParm))
+            {
+                bHasUnsupported = true;
+                break;
+            }
+            if (const FObjectPropertyBase* ObjProp = CastField<FObjectPropertyBase>(Property))
+            {
+                if (ObjProp->PropertyClass && ObjProp->PropertyClass->IsChildOf(UMCPToolHandle::StaticClass()))
+                {
+                    ++HandleCount;
+                }
+            }
+        }
+
+        if (!bHasUnsupported && HandleCount == 1)
+        {
+            Result.Add(Function->GetFName());
+        }
+    }
+
+    return Result;
+}
+
+void UMCPTransportSubsystem::OnAutoToolDispatch(const FString& Result, UMCPToolHandle* MCPToolHandle, const FMCPTool& MCPTool)
+{
+    if (!MCPToolHandle)
+    {
+        return;
+    }
+
+    FMCPAutoToolBinding* Binding = AutoToolBindings.Find(MCPTool.Name);
+    if (!Binding)
+    {
+        MCPToolHandle->ToolCallbackRaw(true, FString::Printf(TEXT("自动注册工具未找到绑定：%s"), *MCPTool.Name), true);
+        return;
+    }
+
+    UObject* Target = Binding->Target.Get();
+    if (!IsValid(Target))
+    {
+        MCPToolHandle->ToolCallbackRaw(true, FString::Printf(TEXT("自动注册工具的目标对象已失效：%s"), *MCPTool.Name), true);
+        return;
+    }
+
+    UFunction* Function = Target->FindFunction(Binding->FunctionName);
+    if (!Function)
+    {
+        Function = Binding->Function;
+    }
+    if (!Function)
+    {
+        MCPToolHandle->ToolCallbackRaw(true, FString::Printf(TEXT("自动注册工具未找到函数：%s"), *Binding->FunctionName.ToString()), true);
+        return;
+    }
+
+    TSharedPtr<FJsonObject> ArgumentsObject;
+    FString ParseError;
+    if (!ParseToolArguments(Result, ArgumentsObject, ParseError))
+    {
+        MCPToolHandle->ToolCallbackRaw(true, ParseError, true);
+        return;
+    }
+
+    TArray<uint8> ParamsBuffer;
+    ParamsBuffer.SetNumZeroed(Function->ParmsSize);
+    uint8* Buffer = ParamsBuffer.GetData();
+    Function->InitializeStruct(Buffer);
+
+    FString DispatchError;
+    bool bDispatchOk = true;
+
+    for (TFieldIterator<FProperty> It(Function); It; ++It)
+    {
+        FProperty* Property = *It;
+        if (!Property || !Property->HasAnyPropertyFlags(CPF_Parm) || Property->HasAnyPropertyFlags(CPF_ReturnParm))
+        {
+            continue;
+        }
+
+        const FString ParamName = Property->GetName();
+
+        // Use custom argument name if available (from custom tool registration)
+        const FString* CustomArgName = Binding->ParamToArgName.Find(Property->GetFName());
+        const FString ArgName = CustomArgName ? *CustomArgName : ParamName;
+
+        if (FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(Property))
+        {
+            UClass* PropertyClass = ObjectProperty->PropertyClass;
+            if (PropertyClass && PropertyClass->IsChildOf(UMCPToolHandle::StaticClass()))
+            {
+                ObjectProperty->SetObjectPropertyValue_InContainer(Buffer, MCPToolHandle);
+                continue;
+            }
+
+            FString LabelValue;
+            if (!TryReadStringArgument(ArgumentsObject, ArgName, LabelValue, DispatchError))
+            {
+                bDispatchOk = false;
+                break;
+            }
+
+            if (PropertyClass && PropertyClass->IsChildOf(AActor::StaticClass()))
+            {
+                AActor* ResolvedActor = nullptr;
+                if (UMCPToolPropertyActorPtr* ActorProperty = Cast<UMCPToolPropertyActorPtr>(UMCPToolBlueprintLibrary::GetProperty(MCPTool, ArgName)))
+                {
+                    ActorProperty->FindActors();
+                    ResolvedActor = ActorProperty->GetActor(LabelValue);
+                }
+
+                if (!ResolvedActor || !ResolvedActor->IsA(PropertyClass))
+                {
+                    DispatchError = FString::Printf(TEXT("参数 %s 无法解析为有效 Actor：%s"), *ParamName, *LabelValue);
+                    bDispatchOk = false;
+                    break;
+                }
+
+                ObjectProperty->SetObjectPropertyValue_InContainer(Buffer, ResolvedActor);
+                continue;
+            }
+
+            if (PropertyClass && PropertyClass->IsChildOf(UMcpExposableBaseComponent::StaticClass()))
+            {
+                UActorComponent* ResolvedComponent = nullptr;
+                if (UMCPToolPropertyComponentPtr* ComponentProperty = Cast<UMCPToolPropertyComponentPtr>(UMCPToolBlueprintLibrary::GetProperty(MCPTool, ArgName)))
+                {
+                    ComponentProperty->GetAvailableTargets();
+                    ResolvedComponent = ComponentProperty->GetComponentByLabel(LabelValue);
+                }
+
+                if (!ResolvedComponent || !ResolvedComponent->IsA(PropertyClass))
+                {
+                    DispatchError = FString::Printf(TEXT("参数 %s 无法解析为有效组件：%s"), *ParamName, *LabelValue);
+                    bDispatchOk = false;
+                    break;
+                }
+
+                ObjectProperty->SetObjectPropertyValue_InContainer(Buffer, ResolvedComponent);
+                continue;
+            }
+
+            DispatchError = FString::Printf(TEXT("参数 %s 的对象类型不受支持：%s"), *ParamName, *GetNameSafe(PropertyClass));
+            bDispatchOk = false;
+            break;
+        }
+
+        if (FStrProperty* StringProperty = CastField<FStrProperty>(Property))
+        {
+            FString Value;
+            if (!TryReadStringArgument(ArgumentsObject, ArgName, Value, DispatchError))
+            {
+                bDispatchOk = false;
+                break;
+            }
+            StringProperty->SetPropertyValue_InContainer(Buffer, Value);
+            continue;
+        }
+
+        if (FNameProperty* NameProperty = CastField<FNameProperty>(Property))
+        {
+            FString Value;
+            if (!TryReadStringArgument(ArgumentsObject, ArgName, Value, DispatchError))
+            {
+                bDispatchOk = false;
+                break;
+            }
+            NameProperty->SetPropertyValue_InContainer(Buffer, FName(*Value));
+            continue;
+        }
+
+        if (FIntProperty* IntProperty = CastField<FIntProperty>(Property))
+        {
+            double Value = 0.0;
+            if (!TryReadNumberArgument(ArgumentsObject, ArgName, Value, DispatchError))
+            {
+                bDispatchOk = false;
+                break;
+            }
+            IntProperty->SetPropertyValue_InContainer(Buffer, static_cast<int32>(Value));
+            continue;
+        }
+
+        if (FFloatProperty* FloatProperty = CastField<FFloatProperty>(Property))
+        {
+            double Value = 0.0;
+            if (!TryReadNumberArgument(ArgumentsObject, ArgName, Value, DispatchError))
+            {
+                bDispatchOk = false;
+                break;
+            }
+            *FloatProperty->ContainerPtrToValuePtr<float>(Buffer) = static_cast<float>(Value);
+            continue;
+        }
+
+        if (FDoubleProperty* DoubleProperty = CastField<FDoubleProperty>(Property))
+        {
+            double Value = 0.0;
+            if (!TryReadNumberArgument(ArgumentsObject, ArgName, Value, DispatchError))
+            {
+                bDispatchOk = false;
+                break;
+            }
+            *DoubleProperty->ContainerPtrToValuePtr<double>(Buffer) = Value;
+            continue;
+        }
+
+        if (FBoolProperty* BoolProperty = CastField<FBoolProperty>(Property))
+        {
+            bool Value = false;
+            if (!TryReadBoolArgument(ArgumentsObject, ArgName, Value, DispatchError))
+            {
+                bDispatchOk = false;
+                break;
+            }
+            BoolProperty->SetPropertyValue_InContainer(Buffer, Value);
+            continue;
+        }
+
+        DispatchError = FString::Printf(TEXT("参数 %s 的类型暂不支持自动注入"), *ParamName);
+        bDispatchOk = false;
+        break;
+    }
+
+    if (!bDispatchOk)
+    {
+        Function->DestroyStruct(Buffer);
+        MCPToolHandle->ToolCallbackRaw(true, DispatchError, true);
+        return;
+    }
+
+    Target->ProcessEvent(Function, Buffer);
+    Function->DestroyStruct(Buffer);
 }
 
 TSharedPtr<FJsonObject> UMCPTransportSubsystem::GetToolbyTarget(FString ActorName)
@@ -1511,6 +2410,55 @@ FString UMCPToolPropertyString::GetValue(FString InJson)
 
 }
 
+UMCPToolProperty* UMCPToolPropertyBool::CreateBoolProperty(FString InName, FString InDescription)
+{
+    UMCPToolPropertyBool* Property = NewObject<UMCPToolPropertyBool>();
+    Property->Name = InName;
+    Property->Type = EMCPJsonType::Boolean;
+    Property->Description = InDescription;
+    return Property;
+}
+
+TSharedPtr<FJsonObject> UMCPToolPropertyBool::GetJsonObject()
+{
+    TSharedPtr<FJsonObject> RootObject = MakeShareable(new FJsonObject);
+    RootObject->SetStringField("type", StaticEnum<EMCPJsonType>()->GetNameStringByValue(static_cast<int64>(Type)));
+    RootObject->SetStringField("description", Description);
+    RootObject->SetStringField("title", Name);
+    return RootObject;
+}
+
+bool UMCPToolPropertyBool::GetValue(FString InJson)
+{
+    TSharedPtr<FJsonObject> JsonObject;
+    TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(InJson);
+    if (FJsonSerializer::Deserialize(JsonReader, JsonObject))
+    {
+        TSharedPtr<FJsonObject> ParamsObject = JsonObject->GetObjectField(TEXT("params"));
+        if (ParamsObject.IsValid())
+        {
+            TSharedPtr<FJsonObject> ArgumentsObject = ParamsObject->GetObjectField(TEXT("arguments"));
+            if (ArgumentsObject.IsValid() && ArgumentsObject->HasField(Name))
+            {
+                if (ArgumentsObject->HasTypedField<EJson::Boolean>(Name))
+                {
+                    return ArgumentsObject->GetBoolField(Name);
+                }
+
+                if (ArgumentsObject->HasTypedField<EJson::String>(Name))
+                {
+                    FString Value = ArgumentsObject->GetStringField(Name);
+                    Value.TrimStartAndEndInline();
+                    Value = Value.ToLower();
+                    return Value == TEXT("true") || Value == TEXT("1") || Value == TEXT("yes");
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
 UMCPToolProperty* UMCPToolPropertyNumber::CreateNumberProperty(FString InName,FString InDescription, int InMin , int InMax )
 {
 	UMCPToolPropertyNumber* Property = NewObject<UMCPToolPropertyNumber>();
@@ -1828,6 +2776,18 @@ bool UMCPToolBlueprintLibrary::GetIntValue(const FMCPTool& MCPTool, const FStrin
 		
 	}
 	return false;
+}
+
+bool UMCPToolBlueprintLibrary::GetBoolValue(const FMCPTool& MCPTool, const FString& Name, const FString& InJson,
+    bool& OutValue)
+{
+    if (UMCPToolProperty* Property = GetProperty(MCPTool, Name)) {
+        if (UMCPToolPropertyBool* PropertyBool = Cast<UMCPToolPropertyBool>(Property)) {
+            OutValue = PropertyBool->GetValue(InJson);
+            return true;
+        }
+    }
+    return false;
 }
 
 bool UMCPToolBlueprintLibrary::GetStringValue(const FMCPTool& MCPTool, const FString& Name, const FString& InJson,

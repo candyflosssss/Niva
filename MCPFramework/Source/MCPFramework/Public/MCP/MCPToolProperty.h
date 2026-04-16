@@ -66,6 +66,20 @@ public:
 };
 
 UCLASS(BlueprintType)
+class MCPFRAMEWORK_API UMCPToolPropertyBool : public UMCPToolProperty
+{
+    GENERATED_BODY()
+public:
+    UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NetworkCore|MCP|Tool")
+    static UMCPToolProperty* CreateBoolProperty(FString InName, FString InDescription);
+
+    virtual TSharedPtr<FJsonObject> GetJsonObject() override;
+
+    UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NetworkCore|MCP|Tool")
+    bool GetValue(FString InJson);
+};
+
+UCLASS(BlueprintType)
 class MCPFRAMEWORK_API UMCPToolPropertyNumber : public UMCPToolProperty
 {
     GENERATED_BODY()

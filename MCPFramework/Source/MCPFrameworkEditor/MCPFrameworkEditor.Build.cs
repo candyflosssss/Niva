@@ -23,7 +23,10 @@ public class MCPFrameworkEditor : ModuleRules
             "ApplicationCore",
             "EditorFramework",
             "PropertyEditor",
-            "MCPFramework"
+            "MCPFramework",
+            "BlueprintGraph",
+            "KismetCompiler",
+            "GraphEditor"
         });
     }
 }

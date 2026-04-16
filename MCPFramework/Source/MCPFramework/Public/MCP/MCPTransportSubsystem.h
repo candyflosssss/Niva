@@ -25,7 +25,31 @@
 #include "MCP/MCPToolStorage.h"
 #include "MCP/MCPToolHandle.h"
 
+class UFunction;
+
 #include "MCPTransportSubsystem.generated.h"
+
+struct FMCPAutoToolBinding
+{
+    TWeakObjectPtr<UObject> Target;
+    UFunction* Function = nullptr;
+    FName FunctionName = NAME_None;
+    FName HandleParameterName = NAME_None;
+    // Custom property name mapping: C++ param FName → MCP argument name (empty map = use C++ names)
+    TMap<FName, FString> ParamToArgName;
+};
+
+// Pending registration state for builder pattern (BeginRegisterCustomTool → AddCustomToolProperty → CommitCustomToolRegistration)
+struct FMCPPendingToolRegistration
+{
+    TWeakObjectPtr<UObject> Target;
+    UFunction* Function = nullptr;
+    FName FunctionName = NAME_None;
+    FName HandleParameterName = NAME_None;
+    FString ToolDescription;
+    TArray<UMCPToolProperty*> Properties;
+    TArray<FName> CppParamOrder; // C++ param names in order (excluding Handle)
+};
 
 /**
  * MCP 传输子系统
@@ -89,6 +113,32 @@ public:
     UFUNCTION(BlueprintCallable, Category = "NetworkCore")
     void RegisterToolProperties(FMCPTool tool, FMCPRouteDelegate MCPRouteDelegate);
 
+    // 扫描 Target 上符合前缀规则的 Blueprint Function / Event，并自动注册成 MCP 工具
+    UFUNCTION(BlueprintCallable, Category = "NetworkCore|MCP|Blueprint", meta = (DefaultToSelf = "Target", AdvancedDisplay = "Prefix"))
+    int32 AutoRegisterMCPTools(UObject* Target, FString Prefix = TEXT("MCP_"));
+
+    // 将单个 Blueprint Function / Event 注册成 MCP 工具
+    UFUNCTION(BlueprintCallable, Category = "NetworkCore|MCP|Blueprint", meta = (DefaultToSelf = "Target", AdvancedDisplay = "ToolNameOverride,ToolDescriptionOverride"))
+    bool RegisterFunctionAsMCPTool(UObject* Target, FName FunctionName, FString ToolNameOverride = TEXT(""), FString ToolDescriptionOverride = TEXT(""));
+
+    // ---- Builder pattern: 3-step custom tool registration (used by K2Node) ----
+
+    // Step 1: Begin registration — validates function, returns derived tool name
+    UFUNCTION(BlueprintCallable, Category = "NetworkCore|MCP|Blueprint", meta = (BlueprintInternalUseOnly = "true", DefaultToSelf = "Target"))
+    FString BeginRegisterCustomTool(UObject* Target, FName FunctionName, const FString& ToolDescription);
+
+    // Step 2: Add one custom property (call once per non-Handle parameter, in order)
+    UFUNCTION(BlueprintCallable, Category = "NetworkCore|MCP|Blueprint", meta = (BlueprintInternalUseOnly = "true"))
+    void AddCustomToolProperty(const FString& ToolName, UMCPToolProperty* Property);
+
+    // Step 3: Finalize — builds param-name mapping, registers tool with auto-dispatch
+    UFUNCTION(BlueprintCallable, Category = "NetworkCore|MCP|Blueprint", meta = (BlueprintInternalUseOnly = "true"))
+    bool CommitCustomToolRegistration(const FString& ToolName);
+
+    // 获取指定类上所有可注册为 MCP 工具的函数名列表（需含恰好一个 UMCPToolHandle* 参数）
+    UFUNCTION(BlueprintCallable, Category = "NetworkCore|MCP|Blueprint", meta = (BlueprintInternalUseOnly = "true"))
+    static TArray<FName> GetEligibleMCPFunctions(UClass* InClass);
+
     // 工具查询：按目标对象名检索工具数据
     TSharedPtr<FJsonObject> GetToolbyTarget(FString ActorName);
 
@@ -140,6 +190,13 @@ public:
     // 线程安全版本（必要时切回游戏线程收集完整 targets）
     UFUNCTION(BlueprintCallable, Category = "NetworkCore|MCP|Introspect")
     FString GetAllRegisteredToolsJson_Safe();
+
+private:
+    TMap<FString, FMCPAutoToolBinding> AutoToolBindings;
+    TMap<FString, FMCPPendingToolRegistration> PendingToolRegistrations;
+
+    UFUNCTION()
+    void OnAutoToolDispatch(const FString& Result, UMCPToolHandle* MCPToolHandle, const FMCPTool& MCPTool);
 };
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnRefreshMCPComplete, bool, bSuccess, const FString&, Message);

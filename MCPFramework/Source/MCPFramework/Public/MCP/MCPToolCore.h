@@ -47,6 +47,9 @@ public:
     static bool GetIntValue(const FMCPTool& MCPTool, const FString& Name, const FString& InJson,int32& OutValue);
 
     UFUNCTION(BlueprintCallable, Category = "MCP Tool")
+    static bool GetBoolValue(const FMCPTool& MCPTool, const FString& Name, const FString& InJson, bool& OutValue);
+
+    UFUNCTION(BlueprintCallable, Category = "MCP Tool")
     static bool GetStringValue(const FMCPTool& MCPTool, const FString& Name, const FString& InJson, FString& OutValue);
 
     UFUNCTION(BlueprintCallable, Category = "MCP Tool")

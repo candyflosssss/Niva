@@ -1,0 +1,152 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CustomInputController 核心类速览</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; line-height: 1.6; color: #222; padding: 24px; }
+    h1, h2, h3 { line-height: 1.25; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .muted { color: #666; }
+    ul { margin-left: 1.2em; }
+    .block { background: #f6f8fa; border-radius: 6px; padding: 12px; }
+    .kv { margin: 6px 0; }
+    .kv b { display: inline-block; min-width: 8em; }
+  </style>
+</head>
+<body>
+  <h1>CustomInputController 核心类速览（先了解“是谁、干什么”）</h1>
+  <p>目标：先熟悉核心类和它们的职责与接口；等确认理解后，再进入“工作原理/执行流程”的说明。</p>
+
+  <h2>范围</h2>
+  <p>本文仅覆盖 <code>Plugins/CustomInputController</code> 中与“自定义输入/手部数据”直接相关的核心类。所有描述严格依据仓库当前代码，不引入不存在的功能。</p>
+
+  <hr />
+
+  <h2>1) FCustomInputControllerModule</h2>
+  <div class="block">
+    <div class="kv"><b>文件</b> Source/CustomInputController/Public/CustomInputController.h（实现见 Private/CustomInputController.cpp）</div>
+    <div class="kv"><b>基类</b> IInputDeviceModule</div>
+    <div class="kv"><b>职责</b> 插件模块入口：
+      <ul>
+        <li>StartupModule()：注册为输入设备模块特性；调用 FMyCustomInputKeys::AddKeys() 注册自定义键。</li>
+        <li>CreateInputDevice()：创建自定义输入设备实例（FUDPInputDevice）。</li>
+        <li>ShutdownModule()：反注册模块特性。</li>
+      </ul>
+    </div>
+    <div class="kv"><b>谁会创建/调用它</b> 引擎在加载插件时自动创建并调用。</div>
+  </div>
+
+  <h2>2) FMyCustomInputKeys</h2>
+  <div class="block">
+    <div class="kv"><b>文件</b> Source/CustomInputController/Public/CustomInputKey.h</div>
+    <div class="kv"><b>类型</b> 纯工具 struct（静态成员）</div>
+    <div class="kv"><b>职责</b> 定义并注册本插件的自定义输入键/轴：</div>
+    <ul>
+      <li>键/轴：GazeXYZ、Gaze_X、Gaze_Y、Gaze_Z、UDPButton1、UDPButton2</li>
+      <li>方法：AddKeys()、RemoveKeys()、LogAllKeys()、ValidateKeysRegistered()</li>
+      <li>内部状态：CurrentUDPVector（存储当前3D向量值）</li>
+    </ul>
+    <div class="kv"><b>谁会用到</b> 
+      <ul>
+        <li>模块在 StartupModule() 内调用 AddKeys() 完成注册。</li>
+        <li>FUDPInputDevice 在解析网络数据后，向这些键/轴写入数值并注入引擎输入路由。</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>3) FUDPInputDevice</h2>
+  <div class="block">
+    <div class="kv"><b>文件</b> Source/CustomInputController/Public/CustomInputKey.h（声明）</div>
+    <div class="kv"><b>基类</b> IInputDevice</div>
+    <div class="kv"><b>职责</b>
+      <ul>
+        <li>持有并管理 UDP 接收器（UUDPHandler* UDPHandler）。</li>
+        <li>在 OnUDPDataReceived(const FString&) 中解析文本，将值映射到 FMyCustomInputKeys 定义的键/轴。</li>
+        <li>通过 MessageHandler/SendControllerEvents() 将输入事件注入 UE 输入系统。</li>
+      </ul>
+    </div>
+    <div class="kv"><b>关键成员</b>
+      <ul>
+        <li>构造/析构、Tick()、SendControllerEvents()、SetMessageHandler()</li>
+        <li>ParseTextToXYZ(const FString&, float&, float&, float&)</li>
+        <li>线程安全状态：std::atomic&lt;float&gt; CurrentX/CurrentY/CurrentZ；FInputDeviceId DeviceId</li>
+      </ul>
+    </div>
+    <div class="kv"><b>谁创建它</b> FCustomInputControllerModule::CreateInputDevice()</div>
+  </div>
+
+  <h2>4) UUDPHandler</h2>
+  <div class="block">
+    <div class="kv"><b>文件</b> Source/CustomInputController/Public/UUDPHandler.h</div>
+    <div class="kv"><b>类型</b> UObject（BlueprintType, Blueprintable）</div>
+    <div class="kv"><b>职责</b> 封装 UDP 接收：
+      <ul>
+        <li>StartUDPReceiver(int32 Port = 8091)、StopUDPReceiver()、IsListening()</li>
+        <li>在内部使用 FSocket + FUdpSocketReceiver（见 cpp 实现）</li>
+        <li>收到消息后派发：
+          <ul>
+            <li>文本：FOnUDPDataReceived（C++多播），FOnUDPDataReceivedDynamic（蓝图多播）</li>
+            <li>二进制：FOnUDPBinaryReceived（C++多播，包含远端地址）</li>
+          </ul>
+        </li>
+      </ul>
+    </div>
+    <div class="kv"><b>谁会用到</b> FUDPInputDevice、UInputPlusSubsystem、以及音频子系统（例如 AudioStreamHttpWsSubsystem）会绑定它的回调。</div>
+  </div>
+
+  <h2>5) UInputPlusSubsystem</h2>
+  <div class="block">
+    <div class="kv"><b>文件</b> Source/CustomInputController/Public/InputPlusSubsystem.h</div>
+    <div class="kv"><b>基类</b> UGameInstanceSubsystem</div>
+    <div class="kv"><b>职责</b>
+      <ul>
+        <li>在 Initialize()/Deinitialize() 生命周期中创建/销毁并管理一个 UUDPHandler。</li>
+        <li>解析收到的手部关键点字符串，输出为左/右手 21 点数组。</li>
+        <li>事件：OnHandDataReceived（C++多播）、OnHandDataReceivedDynamic（蓝图多播）。</li>
+        <li>提供蓝图接口：ParseHandLandmarkData()、ParseSingleHandLandmarkData()、GetLatestHandData()。</li>
+      </ul>
+    </div>
+    <div class="kv"><b>谁会用到</b> 蓝图或 C++ 逻辑可直接订阅事件或调用获取最新数据。</div>
+  </div>
+
+  <h2>6) UHandDataListenerComponent</h2>
+  <div class="block">
+    <div class="kv"><b>文件</b> Source/CustomInputController/Public/HandDataListenerComponent.h</div>
+    <div class="kv"><b>基类</b> UActorComponent</div>
+    <div class="kv"><b>职责</b>
+      <ul>
+        <li>在 BeginPlay 绑定 UInputPlusSubsystem 的手部数据事件；在 EndPlay 解绑。</li>
+        <li>对双手 21 点做平滑/离群点过滤/姿态计算，并以 OnBothHands 广播或供蓝图拉取。</li>
+        <li>提供工具：getHandDir()、TransformToRotMap() 等。</li>
+      </ul>
+    </div>
+    <div class="kv"><b>主要可调参数</b>
+      <ul>
+        <li>平滑：bEnableSmoothing、SmoothingAlpha</li>
+        <li>离群过滤：bEnableOutlierFilter、OutlierJumpScale、DropFrameBadPointRatio、bDropFrameOnTooManyOutliers、WarmupAcceptedFrames、bAdaptiveJumpThreshold、TargetFrameRate、MaxAdaptiveThresholdScale</li>
+        <li>速度限幅：bVelocityClampEnabled、MaxSpeedScalePerSecond、bTreatReacquireAsBaseline</li>
+      </ul>
+    </div>
+  </div>
+
+  <hr />
+
+  <h2>相关但非本页核心（了解名词即可）</h2>
+  <ul>
+    <li><b>UNetMicWsSubsystem</b>（Source/CustomInputController/Public/NetMicWsSubsystem.h）：最小可用的“网络麦克风”子系统，HTTP 获取 ws 地址后建立 WebSocket，接收二进制音频帧并做环形暂存；暴露 OnAudioBinary 事件与一些转发接口（占位）。</li>
+    <li><b>MediaStreamPacket</b>（Source/CustomInputController/Public/MediaStreamPacket.h）：定义媒体包头/工具函数；主要被 AudioStreamHttpWsSubsystem.cpp 使用（控制/音频包解析与发送）。</li>
+  </ul>
+
+  <hr />
+
+  <h2>下一步建议</h2>
+  <ol>
+    <li>确认以上“核心类速览”是否清晰、是否还需补充字段/方法列表。</li>
+    <li>在此基础上，再阅读原理/执行流程文档：Docs/CustomInputController_Reference_And_Flow.html（已存在）。</li>
+  </ol>
+
+  <p class="muted">最后更新：2025-11-03</p>
+</body>
+</html>

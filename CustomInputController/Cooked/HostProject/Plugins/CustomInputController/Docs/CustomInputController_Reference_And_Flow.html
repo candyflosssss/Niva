@@ -1,0 +1,278 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CustomInputController 引用链与执行逻辑图</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; line-height: 1.6; color: #222; padding: 24px; }
+    h1, h2, h3 { line-height: 1.25; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow: auto; }
+    .note { background: #fff9e6; border-left: 4px solid #ffd24d; padding: 10px 12px; border-radius: 4px; }
+    .muted { color: #666; }
+    ul { margin-left: 1.2em; }
+  </style>
+</head>
+<body>
+  <h1>CustomInputController 引用链与执行逻辑图</h1>
+  <p>本文概述 <code>Plugins/CustomInputController</code> 模块的主要类、它们之间的引用关系（谁持有/调用谁），以及典型的运行时执行流程。并给出简要的流程/时序图，便于排查问题或对接蓝图。</p>
+
+  <h3>相关源码位置（部分）</h3>
+  <ul>
+    <li>模块入口
+      <ul>
+        <li>Source/CustomInputController/Public/CustomInputController.h</li>
+        <li>Source/CustomInputController/Private/CustomInputController.cpp</li>
+      </ul>
+    </li>
+    <li>自定义输入键与输入设备
+      <ul>
+        <li>Source/CustomInputController/Public/CustomInputKey.h</li>
+        <li>Source/CustomInputController/Private/CustomInputKey.cpp</li>
+      </ul>
+    </li>
+    <li>UDP 接收器（通用，可供 C++/蓝图）
+      <ul>
+        <li>Source/CustomInputController/Public/UUDPHandler.h</li>
+        <li>Source/CustomInputController/Private/UUDPHandler.cpp</li>
+      </ul>
+    </li>
+    <li>手部数据管线（蓝图友好）
+      <ul>
+        <li>Source/CustomInputController/Public/InputPlusSubsystem.h</li>
+        <li>Source/CustomInputController/Private/InputPlusSubsystem.cpp</li>
+        <li>Source/CustomInputController/Public/HandDataListenerComponent.h</li>
+        <li>Source/CustomInputController/Private/HandDataListenerComponent.cpp</li>
+      </ul>
+    </li>
+    <li>其他（音频/网络扩展，非本页核心）
+      <ul>
+        <li>Source/CustomInputController/Public/NetMicWsSubsystem.h</li>
+        <li>Source/CustomInputController/Public/StreamProcSoundWave.h</li>
+      </ul>
+    </li>
+  </ul>
+
+  <hr />
+
+  <h2>一、核心职责概览</h2>
+  <ul>
+    <li><strong>FCustomInputControllerModule（模块）</strong>
+      <ul>
+        <li>在 <code>StartupModule()</code> 时注册自己为一个 <code>IInputDeviceModule</code> 的特性提供者。</li>
+        <li>实现 <code>CreateInputDevice()</code>，用于生成自定义输入设备实例。</li>
+      </ul>
+    </li>
+    <li><strong>FUDPInputDevice（输入设备，IInputDevice）</strong>
+      <ul>
+        <li>内部持有 <code>UUDPHandler</code>，用于监听 UDP 数据。</li>
+        <li>将 UDP 文本/数值解析到自定义按键/轴（<code>FMyCustomInputKeys</code>）并经由 <code>MessageHandler</code> 注入到 UE 输入路由。</li>
+        <li>提供 <code>Tick</code>/<code>SendControllerEvents</code>/<code>SetMessageHandler</code> 等 IInputDevice 接口。</li>
+      </ul>
+    </li>
+    <li><strong>UUDPHandler（UDP 接收器，对外也可蓝图）</strong>
+      <ul>
+        <li>封装 Socket + <code>FUdpSocketReceiver</code> 线程。</li>
+        <li>暴露 <code>OnDataReceived</code>（文本）与 <code>OnBinaryReceived</code>（二进制）委托。</li>
+        <li><code>StartUDPReceiver()</code>/<code>StopUDPReceiver()</code> 控制生命周期（默认端口 8091）。</li>
+      </ul>
+    </li>
+    <li><strong>UInputPlusSubsystem（GameInstanceSubsystem，蓝图友好）</strong>
+      <ul>
+        <li>也持有一个 <code>UUDPHandler</code>，解析手势/手部关键点字符串。</li>
+        <li>解析后以 <code>OnHandDataReceived</code>/<code>OnHandDataReceivedDynamic</code> 对外广播。</li>
+        <li>提供 <code>ParseHandLandmarkData</code>/<code>GetLatestHandData</code> 等蓝图方法。</li>
+      </ul>
+    </li>
+    <li><strong>UHandDataListenerComponent（Actor 组件，蓝图友好）</strong>
+      <ul>
+        <li><code>BeginPlay</code> 时查找并绑定 <code>UInputPlusSubsystem</code> 的事件。</li>
+        <li>做平滑/离群点过滤/姿态计算等，将结果以 <code>OnBothHands</code> 广播或缓存供蓝图拉取。</li>
+      </ul>
+    </li>
+  </ul>
+
+  <hr />
+
+  <h2>二、引用链（谁引用/创建谁）</h2>
+  <p>以“创建/持有”关系为主线：</p>
+  <ul>
+    <li>Unreal Engine → 加载插件模块 <code>CustomInputController</code>（.uplugin 配置）
+      <ul>
+        <li><code>FCustomInputControllerModule::StartupModule()</code>
+          <ul>
+            <li><code>FMyCustomInputKeys::AddKeys()</code> 注册自定义键/轴</li>
+            <li><code>IModularFeatures::RegisterModularFeature(IInputDeviceModule::GetModularFeatureName(), this)</code>
+              <ul>
+                <li>引擎通过该模块回调 <code>CreateInputDevice()</code></li>
+                <li><code>CreateInputDevice()</code> → <code>new FUDPInputDevice(InMessageHandler)</code>
+                  <ul>
+                    <li>FUDPInputDevice 构造：创建并持有 <code>UUDPHandler</code>（<code>UDPHandler</code> 成员）</li>
+                    <li>绑定 <code>UUDPHandler::OnDataReceived</code> → <code>FUDPInputDevice::OnUDPDataReceived</code></li>
+                    <li>启动 UDP 监听（默认端口 8091）</li>
+                  </ul>
+                </li>
+              </ul>
+            </li>
+          </ul>
+        </li>
+      </ul>
+    </li>
+    <li>蓝图侧（手部数据链路）
+      <ul>
+        <li>关卡运行 → GameInstance 创建 <code>UInputPlusSubsystem</code>（引擎自动管理 Subsystem）
+          <ul>
+            <li><code>UInputPlusSubsystem::Initialize()</code>
+              <ul>
+                <li>创建并持有 <code>UUDPHandler</code></li>
+                <li>绑定 <code>UUDPHandler::OnDataReceived</code> → <code>UInputPlusSubsystem::OnUDPDataReceivedInternal</code></li>
+              </ul>
+            </li>
+          </ul>
+        </li>
+        <li>任意演员挂载 <code>UHandDataListenerComponent</code>：
+          <ul>
+            <li><code>BeginPlay</code> → 在 GameInstance 中查找 <code>UInputPlusSubsystem</code> 并绑定它的 <code>OnHandDataReceived</code> 事件</li>
+          </ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <p>可见：</p>
+  <ul>
+    <li>输入事件链（键/轴）：Engine → Module → FUDPInputDevice → UUDPHandler → FUDPInputDevice::OnUDPDataReceived → MessageHandler → UE 输入系统</li>
+    <li>手势/手部链：GameInstance → UInputPlusSubsystem → UUDPHandler → 解析 → OnHandDataReceived → UHandDataListenerComponent → 平滑/过滤/姿态 → 蓝图</li>
+  </ul>
+
+  <hr />
+
+  <h2>三、执行逻辑图</h2>
+  <h3>1) 模块与输入设备（键/轴）流程</h3>
+  <pre><code class="language-mermaid">sequenceDiagram
+  autonumber
+  participant UE as Unreal Engine
+  participant Mod as FCustomInputControllerModule
+  participant Dev as FUDPInputDevice
+  participant UDP as UUDPHandler
+  participant Route as UE MessageHandler
+
+  UE-&gt;&gt;Mod: 加载模块（StartupModule）
+  Mod-&gt;&gt;Mod: FMyCustomInputKeys::AddKeys()
+  Mod-&gt;&gt;UE: RegisterModularFeature("InputDevice")
+  UE-&gt;&gt;Mod: CreateInputDevice(InMessageHandler)
+  Mod--&gt;&gt;UE: 返回 Dev
+
+  Dev-&gt;&gt;UDP: 构造并 StartUDPReceiver()
+  UDP--&gt;&gt;Dev: OnDataReceived(文本/数据)
+  Dev-&gt;&gt;Dev: 解析数据 → 轴/按钮（FMyCustomInputKeys）
+  Dev-&gt;&gt;Route: SendControllerEvents() → 注入输入
+  Route--&gt;&gt;UE: 分发到输入映射/蓝图输入
+</code></pre>
+
+  <h3>2) 手部数据（蓝图链）流程</h3>
+  <pre><code class="language-mermaid">flowchart LR
+  GI[GameInstance]
+  subgraph Subsystem
+    IPS[UInputPlusSubsystem]
+    UDP2[UUDPHandler]
+  end
+  Comp[UHandDataListenerComponent]
+  BP[蓝图/游戏逻辑]
+
+  GI --&gt; IPS
+  IPS --&gt; UDP2
+  UDP2 --&gt;|OnDataReceived| IPS
+  IPS --&gt;|解析 Left/Right 21 点数组\n广播 OnHandDataReceived| Comp
+  Comp --&gt;|平滑/离群过滤/姿态| BP
+</code></pre>
+  <p class="note muted">提示：如需在浏览器中直接渲染以上 Mermaid 图，请在页面里引入 Mermaid.js 或使用支持 Mermaid 的阅读器；本仓库未附带渲染脚本。</p>
+
+  <hr />
+
+  <h2>四、关键类关系图（静态）</h2>
+  <pre><code class="language-mermaid">classDiagram
+  class FCustomInputControllerModule {
+    +StartupModule()
+    +ShutdownModule()
+    +CreateInputDevice()
+  }
+  class FUDPInputDevice {
+    -UUDPHandler* UDPHandler
+    -std::atomic&lt;float&gt; CurrentX/Y/Z
+    +SendControllerEvents()
+    +OnUDPDataReceived(FString)
+  }
+  class UUDPHandler {
+    +StartUDPReceiver(int Port)
+    +StopUDPReceiver()
+    +OnDataReceived: Multicast&lt;FString&gt;
+    +OnBinaryReceived: Multicast&lt;TArray&lt;uint8&gt;,Endpoint&gt;
+  }
+  class UInputPlusSubsystem {
+    -UUDPHandler* UDPHandler
+    +ParseHandLandmarkData()
+    +OnHandDataReceived
+  }
+  class UHandDataListenerComponent {
+    +OnBothHands
+    +GetLatestHandData()
+    -InputPlusSubsystem
+  }
+
+  FCustomInputControllerModule ..&gt; FUDPInputDevice : Create
+  FUDPInputDevice --&gt; UUDPHandler : owns
+  UInputPlusSubsystem --&gt; UUDPHandler : owns
+  UHandDataListenerComponent ..&gt; UInputPlusSubsystem : binds
+</code></pre>
+
+  <hr />
+
+  <h2>五、数据格式与映射（摘要）</h2>
+  <ul>
+    <li><strong>FUDPInputDevice 侧</strong>
+      <ul>
+        <li>期望文本数据可解析为 3D 向量或按钮状态（见 <code>CustomInputKey.cpp</code> 的解析实现）。</li>
+        <li>将值写入 <code>FMyCustomInputKeys</code> 定义的 Key/Axis（如 <code>Gaze_X</code>、<code>Gaze_Y</code>、<code>Gaze_Z</code>、<code>UDPButton1</code>、<code>UDPButton2</code>）。</li>
+      </ul>
+    </li>
+    <li><strong>UInputPlusSubsystem 侧</strong>
+      <ul>
+        <li>期望字符串中包含左右手 21 点坐标序列（具体分隔符/顺序见 <code>ParseHandLandmarkData</code>/<code>ParseSingleHandData</code> 实现）。</li>
+        <li>解析为 <code>TArray&lt;FVector&gt;</code>，并以委托广播，同时缓存供拉取。</li>
+      </ul>
+    </li>
+  </ul>
+
+  <hr />
+
+  <h2>六、典型调用与订阅（蓝图）</h2>
+  <ul>
+    <li>想要“输入映射层面的按键/轴”
+      <ul>
+        <li>在 Enhanced Input 或传统输入映射中绑定 <code>FMyCustomInputKeys</code> 中的键。</li>
+        <li>由 <code>FUDPInputDevice</code> 注入事件，无需蓝图直接订阅。</li>
+      </ul>
+    </li>
+    <li>想要“手部 21 点数据”
+      <ul>
+        <li>场景中添加 <code>HandDataListenerComponent</code>。</li>
+        <li>在蓝图中绑定 <code>OnBothHands</code> 或定时调用 <code>GetLatestHandData()</code>。</li>
+        <li>或直接在蓝图中访问 GameInstanceSubsystem: <code>InputPlusSubsystem</code> 提供的接口。</li>
+      </ul>
+    </li>
+  </ul>
+
+  <hr />
+
+  <h2>七、排错提示</h2>
+  <ul>
+    <li>模块未被调用 <code>CreateInputDevice</code>：检查 .uplugin 是否启用、<code>StartupModule</code> 是否成功 <code>RegisterModularFeature</code>。</li>
+    <li>收不到 UDP：确认端口、防火墙、<code>UUDPHandler::StartUDPReceiver</code> 返回值和日志。</li>
+    <li>蓝图侧无手部事件：确认 <code>UInputPlusSubsystem</code> 初始化、<code>UHandDataListenerComponent</code> 的 <code>BeginPlay</code> 是否绑定成功。</li>
+    <li>键未注册：检查 <code>FMyCustomInputKeys::AddKeys</code> 是否在 <code>StartupModule</code> 执行。</li>
+  </ul>
+
+  <p class="muted">最后更新：2025-11-03</p>
+</body>
+</html>

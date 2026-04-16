@@ -1,0 +1,123 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MediaStreamPacket 是什么？谁在用？</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; line-height: 1.6; color: #222; padding: 24px; }
+    h1, h2, h3 { line-height: 1.25; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow: auto; }
+    .muted { color: #666; }
+    ul { margin-left: 1.2em; }
+    .kv td { padding: 2px 6px; vertical-align: top; }
+    .kv td:first-child { color: #555; white-space: nowrap; }
+  </style>
+</head>
+<body>
+  <h1>MediaStreamPacket 是什么？谁在用？</h1>
+  <p><code>MediaStreamPacket</code> 是本插件内用于“媒体数据（主要是音频）”的<strong>自定义二进制包格式</strong>与工具函数集合，头文件在：</p>
+  <ul>
+    <li>Plugins/CustomInputController/Source/CustomInputController/Public/<strong>MediaStreamPacket.h</strong></li>
+  </ul>
+
+  <h2>一、它是什么</h2>
+  <p>该头文件定义了一个紧凑的包头 <code>FMediaPacketHeader</code>（24 字节，对齐为 1），以及枚举/标志与若干辅助函数，用于对媒体负载（payload）进行封包/解包：</p>
+  <ul>
+    <li>枚举 <code>EMediaPacketType : uint8</code>
+      <ul>
+        <li><code>Audio = 0</code>：音频帧（负载为音频帧字节，工程内使用 PCM16LE）。</li>
+        <li><code>Viseme = 1</code>：口型/表情数据（当前仓库未见具体发送/接收实现处使用）。</li>
+        <li><code>Control = 2</code>：控制消息（负载通常是 UTF-8 JSON，如 hello/format）。</li>
+      </ul>
+    </li>
+    <li>标志位 <code>EMediaPacketFlags</code>
+      <ul>
+        <li><code>Keyframe = 1&lt;&lt;0</code>：关键帧/首包标记（音频分发起始时可置位）。</li>
+        <li><code>Redundant = 1&lt;&lt;1</code>：冗余数据标记（当前仓库未见使用）。</li>
+      </ul>
+    </li>
+  </ul>
+
+  <h3>FMediaPacketHeader（二进制布局，24 字节）</h3>
+  <table class="kv">
+    <tr><td>Magic</td><td>2 字节，固定为 'A','S'</td></tr>
+    <tr><td>Version</td><td>1 字节，固定为 1</td></tr>
+    <tr><td>MediaType</td><td>1 字节，<code>EMediaPacketType</code></td></tr>
+    <tr><td>StreamId</td><td>2 字节，无符号，区分不同流</td></tr>
+    <tr><td>Seq</td><td>4 字节，帧序号（单调递增）</td></tr>
+    <tr><td>PtsUs</td><td>8 字节，播放时间戳（微秒，服务器时间线）</td></tr>
+    <tr><td>Flags</td><td>2 字节，见 <code>EMediaPacketFlags</code></td></tr>
+    <tr><td>PayloadLen</td><td>4 字节，负载长度（字节）</td></tr>
+  </table>
+  <p>帮助函数（均在 <code>MediaStreamPacket.h</code> 内联定义）：</p>
+  <ul>
+    <li><code>MSP_NowMicroseconds()</code>：返回当前时间（秒）换算的微秒值。</li>
+    <li><code>MSP_FillHeader(FMediaPacketHeader&)</code>：按参数填充一个包头。</li>
+    <li><code>MSP_ParseHeader(const TArray&lt;uint8&gt;&amp; Data, FMediaPacketHeader&amp; Out)</code>：从原始字节解析并校验包头（校验 Magic/Version/长度）。</li>
+  </ul>
+
+  <h2>二、谁在用（引用与实际调用）</h2>
+  <p>全仓库检索仅发现以下使用者：</p>
+  <ul>
+    <li><strong>AudioStreamHttpWsSubsystem</strong>
+      <ul>
+        <li>文件：Plugins/CustomInputController/Source/CustomInputController/Private/<strong>AudioStreamHttpWsSubsystem.cpp</strong></li>
+        <li>用途：
+          <ul>
+            <li><em>接收端（UDP监听）</em>：使用 <code>MSP_ParseHeader</code> 解析来自 UDP 的媒体包，依据 <code>MediaType</code> 分支处理：
+              <ul>
+                <li><code>Control</code>：把负载按 UTF-8 解析为 JSON，处理 <code>"op": "hello"</code>、<code>"format"</code> 等控制指令（登记客户端、告知采样率/声道/stream_id/服务器时间戳等）。参考函数：<code>HandleUdpBinary</code>、<code>HandleHelloUdp</code>。</li>
+                <li><code>Audio</code>：把负载作为音频帧插入客户端缓冲（<code>ClientInsertFrame</code>）。</li>
+              </ul>
+            </li>
+            <li><em>发送端（服务器分发）</em>：构造 <code>FMediaPacketHeader</code>，用 <code>MSP_FillHeader</code> 设置为 <code>Audio</code> 类型，并把音频帧负载拼接后通过 UDP 广播给已登记的客户端。参考函数：<code>ServerSendFrame</code>、<code>ServerDistributeAudio</code>。</li>
+          </ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <p class="muted">说明：仓库中虽定义了 <code>Viseme</code> 与 <code>Redundant</code> 标志，但在当前代码中未看到具体的发送/解析分支使用它们；本文不扩展未实现内容。</p>
+
+  <h2>三、最小用法（基于现有代码的实际片段）</h2>
+  <ul>
+    <li><strong>解析输入</strong>（见 <code>HandleUdpBinary</code>）：
+      <pre><code>// 伪代码化概览（与当前实现一致）
+FMediaPacketHeader H;
+if (!MSP_ParseHeader(Data, H)) return;         // 校验包头
+const uint8* Payload = Data.GetData() + sizeof(FMediaPacketHeader);
+if ((EMediaPacketType)H.MediaType == EMediaPacketType::Control) {
+    // 负载为 UTF-8 JSON：hello / format ...
+} else if ((EMediaPacketType)H.MediaType == EMediaPacketType::Audio) {
+    // 负载为音频帧字节：插入缓冲，后续按 PtsUs 播放
+}
+</code></pre>
+    </li>
+    <li><strong>构造输出</strong>（见 <code>ServerSendFrame</code>）：
+      <pre><code>FMediaPacketHeader H; 
+MSP_FillHeader(H, EMediaPacketType::Audio, StreamId, ++MediaSeq, PtsUs, 
+               bKeyframe ? EMediaPacketFlags::Keyframe : 0, (uint32)FrameBytes);
+TArray&lt;uint8&gt; Packet; Packet.AddUninitialized(sizeof(H) + FrameBytes);
+FMemory::Memcpy(Packet.GetData(), &H, sizeof(H));
+FMemory::Memcpy(Packet.GetData()+sizeof(H), FrameData, FrameBytes);
+// 然后通过 UDP SendTo 给每个客户端
+</code></pre>
+    </li>
+  </ul>
+
+  <h2>四、与工程内其他模块的关系</h2>
+  <ul>
+    <li><code>UUDPHandler</code>：提供通用 UDP 监听，<code>AudioStreamHttpWsSubsystem</code> 通过其 <code>OnBinaryReceived</code> 获取原始数据，再用 <code>MSP_ParseHeader</code> 解析为媒体包。</li>
+    <li><code>NetMicWsSubsystem</code>、<code>StreamProcSoundWave</code>：与媒体/音频相关，但并未直接包含/调用 <code>MediaStreamPacket.h</code>。</li>
+  </ul>
+
+  <h2>五、快速结论</h2>
+  <ul>
+    <li><strong>MediaStreamPacket 是什么</strong>：一个自定义的媒体包头格式与工具函数集合，用于在 UDP 上传输音频帧和控制消息。</li>
+    <li><strong>谁在用</strong>：当前仓库实际使用者为 <code>AudioStreamHttpWsSubsystem</code>（发送音频帧包、接收解析控制/音频包）。暂未发现其他文件直接引用。</li>
+  </ul>
+
+  <p class="muted">最后更新：2025-11-03</p>
+</body>
+</html>
